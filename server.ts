@@ -1,7 +1,5 @@
 import express from 'express';
 import cors from 'cors';
-import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import { initDatabase } from './server/db.js';
 import { authRouter } from './server/routes/authRoutes.js';
 import { mastersRouter } from './server/routes/mastersRoutes.js';
@@ -16,17 +14,26 @@ import { aiAndFeedbackRouter } from './server/routes/aiAndFeedbackRoutes.js';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = process.env.PORT || 3000;
 
   // Middleware
   app.use(cors());
-  app.use(express.json());
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
   // Initialize Database (MongoDB / Document Collections Engine)
   await initDatabase();
 
+  // Root endpoint
+  app.get('/', (_req, res) => {
+    res.json({
+      message: 'Employee Quarterly Review & Appraisal Management System API is running!',
+      timestamp: new Date().toISOString(),
+    });
+  });
+
   // Health check FIRST (unauthenticated)
-  app.get('/api/health', (req, res) => {
+  app.get('/api/health', (_req, res) => {
     res.json({
       status: 'ok',
       service: 'Employee Quarterly Review & Appraisal Management System',
@@ -47,23 +54,8 @@ async function startServer() {
   app.use('/api', aiAndFeedbackRouter);
   app.use('/api', authRouter); // Also maps /api/system/db-status
 
-  // Vite Middleware for development vs Static dist for production
-  if (process.env.NODE_ENV !== 'production') {
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
-  }
-
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Backend API running on http://localhost:${PORT}`);
+  app.listen(Number(PORT), '0.0.0.0', () => {
+    console.log(`Backend API running on http://0.0.0.0:${PORT}`);
   });
 }
 
