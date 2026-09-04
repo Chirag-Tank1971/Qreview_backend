@@ -301,9 +301,20 @@ reviewRouter.get('/reviews/:id', async (req: AuthenticatedRequest, res: Response
       return res.status(404).json({ error: 'Review not found.' });
     }
 
-    // Role check
+    // Role check: Strict IDOR Protection
     if (req.user?.role === 'EMPLOYEE' && review.employeeId !== req.user?.employeeId) {
       return res.status(403).json({ error: 'Unauthorized to view this performance review.' });
+    }
+    if (req.user?.role === 'MANAGER' && review.managerId !== req.user?.employeeId && review.employeeId !== req.user?.employeeId) {
+      return res.status(403).json({ error: 'Unauthorized to view performance reviews of other teams.' });
+    }
+    if (req.user?.role === 'HOD') {
+      const isDeptMatch =
+        (req.employeeProfile?.departmentId && review.departmentId === req.employeeProfile.departmentId) ||
+        (req.employeeProfile?.departmentName && review.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase());
+      if (review.hodId !== req.user?.employeeId && review.managerId !== req.user?.employeeId && review.employeeId !== req.user?.employeeId && !isDeptMatch) {
+        return res.status(403).json({ error: 'Unauthorized to view performance reviews outside your department.' });
+      }
     }
 
     res.json(review);
@@ -564,13 +575,17 @@ reviewRouter.put('/reviews/:id/score', async (req: AuthenticatedRequest, res: Re
       return res.status(400).json({ error: 'This quarterly review is closed and locked from further scoring changes.' });
     }
 
-    // Role check: Only assigned manager, HOD, HR, or Super Admin can score
-    const isManager = req.user?.employeeId === existing.managerId || req.user?.role === 'MANAGER';
-    const isHrOrAdmin = req.user?.role === 'HR' || req.user?.role === 'SUPER_ADMIN' || req.user?.role === 'HOD';
-    const isSelf = req.user?.employeeId === existing.employeeId;
+    // Role check: Only assigned reporting manager, departmental HOD, HR, or Super Admin can score
+    const isAssignedManager = req.user?.employeeId === existing.managerId;
+    const isSuperAdminOrHr = req.user?.role === 'SUPER_ADMIN' || req.user?.role === 'HR';
+    const isDeptHod =
+      req.user?.role === 'HOD' &&
+      (req.user?.employeeId === existing.hodId ||
+        req.employeeProfile?.departmentId === existing.departmentId ||
+        req.employeeProfile?.departmentName?.toLowerCase() === existing.departmentName?.toLowerCase());
 
-    if (!isManager && !isHrOrAdmin && !isSelf) {
-      return res.status(403).json({ error: 'Unauthorized to score or evaluate this review.' });
+    if (!isAssignedManager && !isSuperAdminOrHr && !isDeptHod) {
+      return res.status(403).json({ error: 'Unauthorized: Only the designated reporting manager, departmental HOD, or HR can evaluate and score this review.' });
     }
 
     // Calculate real-time weighted score: sum(rating * weight) / 100

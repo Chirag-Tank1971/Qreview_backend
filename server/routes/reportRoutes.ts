@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { getDbCollection } from '../db.js';
-import { AuthenticatedRequest, authenticateToken } from '../auth.js';
+import { AuthenticatedRequest, authenticateToken, requireRoles } from '../auth.js';
 import {
   Employee,
   Department,
@@ -13,6 +13,7 @@ import {
 
 export const reportRouter = Router();
 reportRouter.use(authenticateToken);
+reportRouter.use(requireRoles('SUPER_ADMIN', 'HR', 'HOD', 'MANAGER'));
 
 /**
  * 1. Quarterly Review Status Report (Section 16.1)

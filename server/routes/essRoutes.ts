@@ -17,12 +17,25 @@ export const essRouter = express.Router();
  */
 essRouter.get('/ess/overview/:employeeId?', authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
   try {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
     const requestedEmpId = req.params.employeeId;
     let targetEmployeeId = requestedEmpId;
 
     // If not explicitly requested in params or "me", use authenticated user's employeeId
     if (!targetEmployeeId || targetEmployeeId === 'me') {
-      targetEmployeeId = req.user?.employeeId || '';
+      targetEmployeeId = user.employeeId || '';
+    }
+
+    // Role-based IDOR enforcement:
+    if (user.role === 'EMPLOYEE') {
+      if (requestedEmpId && requestedEmpId !== 'me' && requestedEmpId !== user.employeeId) {
+        return res.status(403).json({ error: 'Access denied: Employees may only view their own ESS profile.' });
+      }
+      targetEmployeeId = user.employeeId;
     }
 
     const employeesCol = getDbCollection('employees');
@@ -32,18 +45,22 @@ essRouter.get('/ess/overview/:employeeId?', authenticateToken, async (req: Authe
       employee = await employeesCol.findOne({ id: targetEmployeeId });
     }
 
-    // If still null, fallback to first active employee (e.g. Siddharth Patel emp_dev_1)
     if (!employee) {
-      employee = await employeesCol.findOne({ id: 'emp_dev_1' });
+      return res.status(404).json({ error: 'Employee record not found.' });
     }
 
-    if (!employee) {
-      const allEmps = await (await employeesCol.find({ status: 'ACTIVE' })).toArray();
-      employee = allEmps[0] || null;
-    }
-
-    if (!employee) {
-      return res.status(404).json({ error: 'No employee record found.' });
+    // Manager / HOD IDOR Scope Verification
+    if (user.role === 'MANAGER') {
+      if (employee.id !== user.employeeId && employee.managerId !== user.employeeId) {
+        return res.status(403).json({ error: 'Access denied: Managers can only view ESS profiles of their direct reports.' });
+      }
+    } else if (user.role === 'HOD') {
+      const isDeptMatch =
+        (req.employeeProfile?.departmentId && employee.departmentId === req.employeeProfile.departmentId) ||
+        (req.employeeProfile?.departmentName && employee.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase());
+      if (employee.id !== user.employeeId && employee.hodId !== user.employeeId && employee.managerId !== user.employeeId && !isDeptMatch) {
+        return res.status(403).json({ error: 'Access denied: HODs can only view ESS profiles within their department.' });
+      }
     }
 
     // Ensure employee object has valid currentCtc and currency

@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { getDbCollection } from '../db.js';
-import { AuthenticatedRequest, authenticateToken } from '../auth.js';
+import { AuthenticatedRequest, authenticateToken, requireRoles } from '../auth.js';
 import { SEED_PHASE8_AUDIT_LOGS, SEED_COMPLIANCE_FLAGS } from '../seedAuditData.js';
 import {
   AuditLogEntry,
@@ -13,8 +13,9 @@ import {
 
 export const auditRouter = Router();
 
-// Apply authentication
+// Apply authentication and role check - Audit trails & compliance are restricted to Super Admin and HR
 auditRouter.use(authenticateToken);
+auditRouter.use(requireRoles('SUPER_ADMIN', 'HR'));
 
 // In-memory backing arrays initialized with seed data if DB collection doesn't contain entries yet
 let localAuditLogs: AuditLogEntry[] = [...SEED_PHASE8_AUDIT_LOGS];

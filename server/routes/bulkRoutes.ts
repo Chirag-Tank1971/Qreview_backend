@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { getDbCollection } from '../db.js';
-import { AuthenticatedRequest, authenticateToken } from '../auth.js';
+import { AuthenticatedRequest, authenticateToken, requireRoles } from '../auth.js';
 import {
   BulkDatasetType,
   BulkTemplateColumn,
@@ -12,8 +12,9 @@ import {
 
 export const bulkRouter = Router();
 
-// Apply auth to all bulk endpoints
+// Apply auth to all bulk endpoints - Bulk operations strictly restricted to Super Admin, HR, and HOD
 bulkRouter.use(authenticateToken);
+bulkRouter.use(requireRoles('SUPER_ADMIN', 'HR', 'HOD'));
 
 // ==========================================
 // 1. TEMPLATE SCHEMAS & SAMPLE DATA
