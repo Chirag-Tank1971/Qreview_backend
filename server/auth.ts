@@ -31,8 +31,37 @@ export async function verifyTokenString(token: string): Promise<User | null> {
   try {
     const decoded = jwt.verify(token, JWT_SECRET) as any;
     const usersCol = getDbCollection('users');
-    const user = await usersCol.findOne({ id: decoded.id });
-    if (!user || !user.active) return null;
+    let user = await usersCol.findOne({ id: decoded.id });
+    if (!user && decoded.email) {
+      user = await usersCol.findOne({ email: String(decoded.email).toLowerCase().trim() });
+    }
+    if (!user) {
+      const { SEED_USERS } = await import('./seedData.js');
+      user = SEED_USERS.find(
+        (u) =>
+          u.id === decoded.id ||
+          (decoded.email && u.email.toLowerCase() === String(decoded.email).toLowerCase().trim())
+      ) || null;
+    }
+    if (!user && (decoded.employeeId || decoded.id)) {
+      const employeesCol = getDbCollection('employees');
+      const emp = await employeesCol.findOne({
+        $or: [{ id: decoded.employeeId }, { id: decoded.id }, { email: decoded.email }],
+      });
+      if (emp) {
+        user = {
+          id: `usr_${emp.id}`,
+          employeeId: emp.id,
+          email: emp.email,
+          name: emp.name,
+          role: decoded.role || 'EMPLOYEE',
+          roleId: `role_${(decoded.role || 'employee').toLowerCase()}`,
+          active: emp.status !== 'INACTIVE',
+          createdAt: emp.createdAt || new Date().toISOString(),
+        };
+      }
+    }
+    if (!user || user.active === false) return null;
     return user;
   } catch (err) {
     return null;

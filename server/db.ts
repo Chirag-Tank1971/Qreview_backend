@@ -1,4 +1,7 @@
+import 'dotenv/config';
 import { MongoClient, Db } from 'mongodb';
+import fs from 'fs';
+import path from 'path';
 import {
   SEED_ROLES,
   SEED_DEPARTMENTS,
@@ -42,17 +45,63 @@ let mongoDb: Db | null = null;
 let dbMode: 'MONGODB' | 'EMBEDDED_COMPATIBLE' = 'EMBEDDED_COMPATIBLE';
 let dbUri: string | undefined = process.env.MONGODB_URI;
 
-// In-memory / document collections store with MongoDB-compatible API
+const STORAGE_FILE_PATH = path.join(process.cwd(), '.local_database_store.json');
+
+function saveToDisk(collectionName: string, itemsMap: Map<string, any>) {
+  try {
+    let store: Record<string, any[]> = {};
+    if (fs.existsSync(STORAGE_FILE_PATH)) {
+      try {
+        store = JSON.parse(fs.readFileSync(STORAGE_FILE_PATH, 'utf-8'));
+      } catch {
+        store = {};
+      }
+    }
+    store[collectionName] = Array.from(itemsMap.values());
+    fs.writeFileSync(STORAGE_FILE_PATH, JSON.stringify(store, null, 2), 'utf-8');
+  } catch (err) {
+    // quiet fallback
+  }
+}
+
+function loadFromDisk(collectionName: string): any[] | null {
+  try {
+    if (fs.existsSync(STORAGE_FILE_PATH)) {
+      const store = JSON.parse(fs.readFileSync(STORAGE_FILE_PATH, 'utf-8'));
+      if (Array.isArray(store[collectionName]) && store[collectionName].length > 0) {
+        return store[collectionName];
+      }
+    }
+  } catch {
+    // quiet fallback
+  }
+  return null;
+}
+
+// In-memory / document collections store with MongoDB-compatible API and disk persistence
 class InMemoryCollection<T extends { id?: string; _id?: any }> {
   private items: Map<string, T> = new Map();
   name: string;
 
   constructor(name: string, initialData: T[] = []) {
     this.name = name;
-    initialData.forEach((item) => {
+    const diskData = loadFromDisk(name);
+    const sourceData = diskData && diskData.length > 0 ? diskData : initialData;
+    
+    sourceData.forEach((item) => {
       const id = item.id || (item as any)._id || `id_${Math.random().toString(36).substr(2, 9)}`;
       this.items.set(String(id), { ...item, id: String(id), _id: String(id) });
     });
+
+    // If initial seed was updated with more items not yet in disk
+    if (diskData && diskData.length > 0 && initialData.length > 0) {
+      initialData.forEach((seedItem) => {
+        const id = seedItem.id || (seedItem as any)._id;
+        if (id && !this.items.has(String(id))) {
+          this.items.set(String(id), { ...seedItem, id: String(id), _id: String(id) });
+        }
+      });
+    }
   }
 
   async find(filter: any = {}): Promise<{ toArray: () => Promise<T[]> }> {
@@ -93,6 +142,7 @@ class InMemoryCollection<T extends { id?: string; _id?: any }> {
     const id = doc.id || (doc as any)._id || `doc_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
     const saved = { ...doc, id: String(id), _id: String(id) };
     this.items.set(String(id), saved);
+    saveToDisk(this.name, this.items);
     return { insertedId: String(id), acknowledged: true };
   }
 
@@ -116,6 +166,7 @@ class InMemoryCollection<T extends { id?: string; _id?: any }> {
 
     const id = String(target.id || (target as any)._id);
     this.items.set(id, updated);
+    saveToDisk(this.name, this.items);
     return { matchedCount: 1, modifiedCount: 1 };
   }
 
@@ -133,6 +184,7 @@ class InMemoryCollection<T extends { id?: string; _id?: any }> {
       this.items.set(id, updated);
       modifiedCount++;
     }
+    saveToDisk(this.name, this.items);
     return { matchedCount: targets.length, modifiedCount };
   }
 
@@ -144,6 +196,7 @@ class InMemoryCollection<T extends { id?: string; _id?: any }> {
       this.items.delete(id);
       deletedCount++;
     }
+    saveToDisk(this.name, this.items);
     return { deletedCount };
   }
 
@@ -152,6 +205,7 @@ class InMemoryCollection<T extends { id?: string; _id?: any }> {
     if (!target) return { deletedCount: 0 };
     const id = String(target.id || (target as any)._id);
     this.items.delete(id);
+    saveToDisk(this.name, this.items);
     return { deletedCount: 1 };
   }
 
@@ -191,23 +245,29 @@ export const memoryDb = {
 
 export async function initDatabase(): Promise<void> {
   const uri = process.env.MONGODB_URI;
+  dbUri = uri;
 
-  if (uri && !uri.includes('localhost:27017')) {
+  if (uri && uri.trim()) {
     try {
-      console.log(`[Database] Attempting connection to MongoDB at: ${uri.replace(/\/\/.*@/, '//***@')}`);
-      mongoClient = new MongoClient(uri, { serverSelectionTimeoutMS: 2500 });
+      console.log(`[Database] Connecting to MongoDB instance at: ${uri.replace(/\/\/.*@/, '//***@')}`);
+      mongoClient = new MongoClient(uri, { serverSelectionTimeoutMS: 4000, connectTimeoutMS: 4000 });
       await mongoClient.connect();
-      mongoDb = mongoClient.db('quarterly_appraisal_db');
+      
+      // If URI specifies a database (e.g. mongodb://localhost:27017/my_db), use it. Otherwise use 'quarterly_appraisal_db'
+      const clientDbName = (mongoClient as any)?.options?.dbName;
+      const targetDb = clientDbName && clientDbName !== 'test' ? clientDbName : 'quarterly_appraisal_db';
+      mongoDb = mongoClient.db(targetDb);
+      
       dbMode = 'MONGODB';
-      console.log('[Database] Connected to external MongoDB successfully');
+      console.log(`[Database] Connected to MongoDB database '${mongoDb.databaseName}' successfully`);
       await seedMongoCollectionsIfEmpty(mongoDb);
       return;
     } catch (err: any) {
-      console.warn(`[Database] MongoDB URI provided but connection timed out/failed (${err.message}). Using Embedded Document Mode for continuous availability.`);
+      console.warn(`[Database] MongoDB connection attempt failed: ${err.message}. Running in Persistent Embedded Mode.`);
       dbMode = 'EMBEDDED_COMPATIBLE';
     }
   } else {
-    console.log('[Database] Initialized in High-Performance Embedded Document Mode with MongoDB Compass Schemas.');
+    console.log('[Database] No MONGODB_URI found in environment. Initialized in High-Performance Embedded Persistent Document Mode.');
     dbMode = 'EMBEDDED_COMPATIBLE';
   }
 }

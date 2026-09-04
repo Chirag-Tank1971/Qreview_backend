@@ -26,6 +26,44 @@ authRouter.post('/login', async (req: Request, res: Response) => {
       user = SEED_USERS.find((u) => u.email.toLowerCase() === email.toLowerCase().trim()) || null;
     }
 
+    // If user record not found in users collection, check employees collection
+    if (!user) {
+      const employeesCol = getDbCollection('employees');
+      const emp = await employeesCol.findOne({
+        $or: [
+          { email: email.toLowerCase().trim() },
+          { employeeCode: email.toUpperCase().trim() },
+        ],
+      });
+
+      if (emp) {
+        let inferredRole: UserRole = 'EMPLOYEE';
+        const desigLower = (emp.designationName || '').toLowerCase();
+        if (desigLower.includes('hr manager') || desigLower.includes('hr lead')) inferredRole = 'HR';
+        else if (desigLower.includes('manager') || desigLower.includes('lead')) inferredRole = 'MANAGER';
+        else if (desigLower.includes('vp') || desigLower.includes('director') || desigLower.includes('hod')) inferredRole = 'HOD';
+
+        const defaultHash = bcrypt.hashSync('password123', 10);
+        user = {
+          id: `usr_${emp.id}`,
+          employeeId: emp.id,
+          email: emp.email,
+          name: emp.name,
+          role: inferredRole,
+          roleId: `role_${inferredRole.toLowerCase()}`,
+          active: emp.status !== 'INACTIVE',
+          passwordHash: defaultHash,
+          createdAt: emp.createdAt || new Date().toISOString(),
+        };
+
+        try {
+          await usersCol.insertOne(user);
+        } catch {
+          // quiet fallback
+        }
+      }
+    }
+
     if (!user) {
       return res.status(401).json({ error: 'Invalid email or password.' });
     }

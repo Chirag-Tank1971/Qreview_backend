@@ -1,7 +1,8 @@
 import express, { Response } from 'express';
+import bcrypt from 'bcryptjs';
 import { getDbCollection } from '../db.js';
 import { authenticateToken, requireRoles, recordAuditLog, AuthenticatedRequest } from '../auth.js';
-import { Employee, Department, Designation, Cycle, User } from '../../src/types.js';
+import { Employee, Department, Designation, Cycle, User, UserRole } from '../../src/types.js';
 
 export const mastersRouter = express.Router();
 
@@ -424,6 +425,34 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
     };
 
     await empCol.insertOne(newEmp);
+
+    // Auto-provision user account for login
+    try {
+      const usersCol = getDbCollection('users');
+      const existingUser = await usersCol.findOne({ email: newEmp.email });
+      if (!existingUser) {
+        let inferredRole: UserRole = 'EMPLOYEE';
+        const desigLower = (des?.name || '').toLowerCase();
+        if (desigLower.includes('hr manager') || desigLower.includes('hr lead')) inferredRole = 'HR';
+        else if (desigLower.includes('manager') || desigLower.includes('lead')) inferredRole = 'MANAGER';
+        else if (desigLower.includes('vp') || desigLower.includes('director') || desigLower.includes('hod')) inferredRole = 'HOD';
+
+        const defaultHash = bcrypt.hashSync('password123', 10);
+        await usersCol.insertOne({
+          id: `usr_${newEmp.id}`,
+          employeeId: newEmp.id,
+          email: newEmp.email,
+          name: newEmp.name,
+          role: inferredRole,
+          roleId: `role_${inferredRole.toLowerCase()}`,
+          active: true,
+          passwordHash: defaultHash,
+          createdAt: new Date().toISOString(),
+        });
+      }
+    } catch (userErr) {
+      console.warn('Could not auto-provision user login entry for employee:', userErr);
+    }
 
     if (req.user) {
       await recordAuditLog(
