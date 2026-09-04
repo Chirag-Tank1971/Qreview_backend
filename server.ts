@@ -2,7 +2,6 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
-import { createServer as createViteServer } from 'vite';
 import { initDatabase } from './server/db.js';
 import { authRouter } from './server/routes/authRoutes.js';
 import { mastersRouter } from './server/routes/mastersRoutes.js';
@@ -50,6 +49,7 @@ async function startServer() {
 
   // Vite Middleware for development vs Static dist for production
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
