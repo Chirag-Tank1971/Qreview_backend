@@ -2,7 +2,9 @@ import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
-import { initDatabase } from './server/db.js';
+import fs from 'fs';
+import rateLimit from 'express-rate-limit';
+import { initDatabase, getDatabaseStatus } from './server/db.js';
 import { authRouter } from './server/routes/authRoutes.js';
 import { mastersRouter } from './server/routes/mastersRoutes.js';
 import { kraRouter } from './server/routes/kraRoutes.js';
@@ -16,11 +18,26 @@ import { aiAndFeedbackRouter } from './server/routes/aiAndFeedbackRoutes.js';
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   // Middleware
   app.use(cors());
   app.use(express.json());
+
+  // Rate limiter: max 10 login attempts per IP per 15 minutes
+  const loginRateLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 10,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      error: 'Too many login attempts from this IP. Please wait 15 minutes and try again.',
+    },
+    // Only count failed requests (skip successful logins from the limit)
+    skipSuccessfulRequests: true,
+  });
+  // Apply rate limiter only to the login endpoint
+  app.use('/api/auth/login', loginRateLimiter);
 
   // Initialize Database (MongoDB / Document Collections Engine)
   await initDatabase();
@@ -34,6 +51,16 @@ async function startServer() {
     });
   });
 
+  // Dedicated system endpoint for db status
+  app.get('/api/system/db-status', async (_req, res) => {
+    try {
+      const status = await getDatabaseStatus();
+      res.json(status);
+    } catch (err: any) {
+      res.status(500).json({ error: 'Failed to retrieve database status' });
+    }
+  });
+
   // API Routes
   app.use('/api/auth', authRouter);
   app.use('/api', mastersRouter);
@@ -45,21 +72,21 @@ async function startServer() {
   app.use('/api/bulk', bulkRouter);
   app.use('/api/audit', auditRouter);
   app.use('/api', aiAndFeedbackRouter);
-  app.use('/api', authRouter); // Also maps /api/system/db-status
 
-  // Vite Middleware for development vs Static dist for production
-  if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
-    });
-    app.use(vite.middlewares);
-  } else {
-    const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
+  // Serve compiled frontend assets if available
+  const possibleDistPaths = [
+    path.resolve(process.cwd(), '../frontend/dist'),
+    path.resolve(process.cwd(), 'dist/public'),
+    path.resolve(process.cwd(), 'dist'),
+  ];
+  const frontendDist = possibleDistPaths.find(
+    (p) => fs.existsSync(path.join(p, 'index.html'))
+  );
+
+  if (frontendDist) {
+    app.use(express.static(frontendDist));
     app.get('*', (_req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(path.join(frontendDist, 'index.html'));
     });
   }
 

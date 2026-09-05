@@ -1,6 +1,7 @@
 import { Router, Response } from 'express';
 import { getDbCollection } from '../db.js';
 import { authenticateToken, requireRoles, AuthenticatedRequest, recordAuditLog } from '../auth.js';
+import { syncAllActiveEmployees } from '../syncHelpers.js';
 import {
   Appraisal,
   AppraisalQuarterRecord,
@@ -13,7 +14,7 @@ import {
   Notification,
   User,
   Designation,
-} from '../../../src/types.js';
+} from '../../src/types.js';
 
 export const appraisalRouter = Router();
 
@@ -64,35 +65,60 @@ appraisalRouter.get('/appraisals', async (req: AuthenticatedRequest, res: Respon
       return res.status(401).json({ error: 'Authentication required' });
     }
 
+    // Strict RBAC data scoping on high-speed indexed read
     const { cycleId, year, month, departmentId, status, search, onlyMine, managerId } = req.query;
 
     const appraisalsCol = getDbCollection('appraisals');
+    const employeesCol = getDbCollection('employees');
+
     let appraisals: Appraisal[] = await (await appraisalsCol.find({})).toArray();
+    const allEmployees: Employee[] = await (await employeesCol.find({})).toArray();
+    const empMap = new Map<string, Employee>();
+    allEmployees.forEach((e) => empMap.set(e.id, e));
 
     // Strict RBAC Scoping:
     if (user.role === 'EMPLOYEE') {
       // Employees can STRICTLY ONLY view their own appraisal record
       appraisals = appraisals.filter((a) => a.employeeId === user.employeeId);
     } else if (user.role === 'MANAGER') {
-      // Managers can only view their direct reports or their own record
-      appraisals = appraisals.filter(
-        (a) => a.managerId === user.employeeId || a.employeeId === user.employeeId
-      );
+      // Managers can view their direct reports or their own record
+      appraisals = appraisals.filter((a) => {
+        const empRecord = empMap.get(a.employeeId);
+        return (
+          a.managerId === user.employeeId ||
+          a.employeeId === user.employeeId ||
+          empRecord?.managerId === user.employeeId ||
+          (user.email && empRecord?.managerName?.toLowerCase() === user.name.toLowerCase())
+        );
+      });
     } else if (user.role === 'HOD') {
-      // HODs can only view their department roll-ups, direct reports, or their own record
-      appraisals = appraisals.filter(
-        (a) =>
+      // HODs can view their department roll-ups, direct reports, or their own record
+      appraisals = appraisals.filter((a) => {
+        const empRecord = empMap.get(a.employeeId);
+        const userDeptId = req.employeeProfile?.departmentId;
+        const userDeptName = req.employeeProfile?.departmentName?.toLowerCase();
+        return (
           a.hodId === user.employeeId ||
           a.managerId === user.employeeId ||
           a.employeeId === user.employeeId ||
-          (req.employeeProfile?.departmentId && a.departmentId === req.employeeProfile.departmentId) ||
-          (req.employeeProfile?.departmentName && a.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase())
-      );
+          empRecord?.hodId === user.employeeId ||
+          empRecord?.managerId === user.employeeId ||
+          (userDeptId && a.departmentId === userDeptId) ||
+          (userDeptId && empRecord?.departmentId === userDeptId) ||
+          (userDeptName && a.departmentName?.toLowerCase() === userDeptName)
+        );
+      });
     }
     // HR, SUPER_ADMIN, MANAGEMENT have organization-wide access
 
     if (onlyMine === 'true' && user.employeeId) {
-      appraisals = appraisals.filter((a) => a.managerId === user.employeeId && a.employeeId !== user.employeeId);
+      appraisals = appraisals.filter((a) => {
+        const empRecord = empMap.get(a.employeeId);
+        return (
+          (a.managerId === user.employeeId || empRecord?.managerId === user.employeeId) &&
+          a.employeeId !== user.employeeId
+        );
+      });
     }
 
     // Query Filters
@@ -140,12 +166,38 @@ appraisalRouter.get('/appraisals', async (req: AuthenticatedRequest, res: Respon
       return b.averageQuarterlyScore - a.averageQuarterlyScore;
     });
 
-    res.json(appraisals);
+    // Enrich with real-time employee employment status
+    const enrichedAppraisals = appraisals.map((a) => {
+      const empRecord = empMap.get(a.employeeId);
+      return {
+        ...a,
+        employeeStatus: empRecord?.status || a.employeeStatus || 'ACTIVE',
+      };
+    });
+
+    res.json(enrichedAppraisals);
   } catch (err: any) {
     console.error('Error in GET /api/appraisals:', err);
     res.status(500).json({ error: 'Failed to fetch appraisals' });
   }
 });
+
+/**
+ * POST /api/appraisals/sync
+ * Manually trigger synchronization of active employees, reviews, and appraisals (Restricted to HR / Admin)
+ */
+appraisalRouter.post(
+  '/appraisals/sync',
+  requireRoles('SUPER_ADMIN', 'HR'),
+  async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      await syncAllActiveEmployees();
+      res.json({ success: true, message: 'All active employees and appraisals successfully synchronized.' });
+    } catch (err: any) {
+      res.status(500).json({ error: 'Failed to synchronize appraisals: ' + err.message });
+    }
+  }
+);
 
 /**
  * GET /api/appraisals/stats
@@ -159,18 +211,39 @@ appraisalRouter.get(
       const user = req.user;
       const { cycleId, year, departmentId } = req.query;
       const appraisalsCol = getDbCollection('appraisals');
+      const employeesCol = getDbCollection('employees');
+
       let appraisals: Appraisal[] = await (await appraisalsCol.find({})).toArray();
+      const allEmployees: Employee[] = await (await employeesCol.find({})).toArray();
+      const empMap = new Map<string, Employee>();
+      allEmployees.forEach((e) => empMap.set(e.id, e));
 
       // Role-based scope
       if (user?.role === 'MANAGER') {
-        appraisals = appraisals.filter((a) => a.managerId === user.employeeId || a.employeeId === user.employeeId);
+        appraisals = appraisals.filter((a) => {
+          const empRecord = empMap.get(a.employeeId);
+          return (
+            a.managerId === user.employeeId ||
+            a.employeeId === user.employeeId ||
+            empRecord?.managerId === user.employeeId
+          );
+        });
       } else if (user?.role === 'HOD') {
-        appraisals = appraisals.filter(
-          (a) =>
+        appraisals = appraisals.filter((a) => {
+          const empRecord = empMap.get(a.employeeId);
+          const userDeptId = req.employeeProfile?.departmentId;
+          const userDeptName = req.employeeProfile?.departmentName?.toLowerCase();
+          return (
             a.hodId === user.employeeId ||
             a.managerId === user.employeeId ||
-            (req.employeeProfile?.departmentId && a.departmentId === req.employeeProfile.departmentId)
-        );
+            a.employeeId === user.employeeId ||
+            empRecord?.hodId === user.employeeId ||
+            empRecord?.managerId === user.employeeId ||
+            (userDeptId && a.departmentId === userDeptId) ||
+            (userDeptId && empRecord?.departmentId === userDeptId) ||
+            (userDeptName && a.departmentName?.toLowerCase() === userDeptName)
+          );
+        });
       }
 
       if (cycleId && cycleId !== 'ALL') {
@@ -539,24 +612,46 @@ appraisalRouter.get('/appraisals/:id', async (req: AuthenticatedRequest, res: Re
     }
 
     // Ownership & Role Verification (IDOR Protection)
+    const employeesCol = getDbCollection('employees');
+    const empRecord = await employeesCol.findOne({ id: appraisal.employeeId });
+
     if (user.role === 'EMPLOYEE') {
       if (appraisal.employeeId !== user.employeeId) {
         return res.status(403).json({ error: 'Access denied: You can only view your own appraisal record.' });
       }
     } else if (user.role === 'MANAGER') {
-      if (appraisal.managerId !== user.employeeId && appraisal.employeeId !== user.employeeId) {
+      const isManagerMatch =
+        appraisal.managerId === user.employeeId ||
+        appraisal.employeeId === user.employeeId ||
+        empRecord?.managerId === user.employeeId ||
+        (user.name && empRecord?.managerName?.toLowerCase() === user.name.toLowerCase());
+
+      if (!isManagerMatch) {
         return res.status(403).json({ error: 'Access denied: You can only view appraisals for your direct reports.' });
       }
     } else if (user.role === 'HOD') {
       const isDeptMatch =
         (req.employeeProfile?.departmentId && appraisal.departmentId === req.employeeProfile.departmentId) ||
-        (req.employeeProfile?.departmentName && appraisal.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase());
-      if (appraisal.hodId !== user.employeeId && appraisal.managerId !== user.employeeId && appraisal.employeeId !== user.employeeId && !isDeptMatch) {
+        (req.employeeProfile?.departmentName && appraisal.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase()) ||
+        (req.employeeProfile?.departmentId && empRecord?.departmentId === req.employeeProfile.departmentId);
+
+      const isHodMatch =
+        appraisal.hodId === user.employeeId ||
+        appraisal.managerId === user.employeeId ||
+        appraisal.employeeId === user.employeeId ||
+        empRecord?.hodId === user.employeeId ||
+        empRecord?.managerId === user.employeeId ||
+        isDeptMatch;
+
+      if (!isHodMatch) {
         return res.status(403).json({ error: 'Access denied: You can only view appraisals within your department.' });
       }
     }
 
-    res.json(appraisal);
+    res.json({
+      ...appraisal,
+      employeeStatus: empRecord?.status || appraisal.employeeStatus || 'ACTIVE',
+    });
   } catch (err: any) {
     console.error('Error in GET /api/appraisals/:id:', err);
     res.status(500).json({ error: 'Failed to fetch appraisal' });
@@ -764,6 +859,16 @@ appraisalRouter.put(
         return res.status(400).json({ error: 'Cannot modify a locked appraisal record' });
       }
 
+      // Safeguard: Check employee status
+      const employeesCol = getDbCollection('employees');
+      const empRecord = await employeesCol.findOne({ id: appraisal.employeeId });
+      if (empRecord && empRecord.status === 'INACTIVE') {
+        return res.status(400).json({ error: 'Cannot submit recommendation: Employee is INACTIVE (Offboarded/Exited).' });
+      }
+      if (empRecord && empRecord.status === 'NOTICE') {
+        return res.status(400).json({ error: 'Cannot submit recommendation: Employee is currently serving NOTICE period and ineligible for annual increment/promotion.' });
+      }
+
       // Role check: If caller is MANAGER, verify they are the assigned reporting manager
       if (user?.role === 'MANAGER' && appraisal.managerId !== user.employeeId) {
         return res.status(403).json({ error: 'Unauthorized: You can only submit recommendations for your assigned direct reports.' });
@@ -865,6 +970,16 @@ appraisalRouter.put(
         return res.status(400).json({ error: 'Cannot modify a locked appraisal record' });
       }
 
+      // Safeguard: Check employee status
+      const employeesCol = getDbCollection('employees');
+      const empRecord = await employeesCol.findOne({ id: appraisal.employeeId });
+      if (empRecord && empRecord.status === 'INACTIVE') {
+        return res.status(400).json({ error: 'Cannot calibrate appraisal: Employee is INACTIVE (Offboarded/Exited).' });
+      }
+      if (empRecord && empRecord.status === 'NOTICE') {
+        return res.status(400).json({ error: 'Cannot calibrate appraisal: Employee is currently serving NOTICE period and ineligible for annual increment/promotion.' });
+      }
+
       // HOD Department Verification
       if (user?.role === 'HOD') {
         const isDeptMatch =
@@ -960,6 +1075,16 @@ appraisalRouter.put(
 
       if (!appraisal) {
         return res.status(404).json({ error: 'Appraisal record not found' });
+      }
+
+      // Safeguard: Check employee status
+      const employeesCol = getDbCollection('employees');
+      const empRecord = await employeesCol.findOne({ id: appraisal.employeeId });
+      if (empRecord && empRecord.status === 'INACTIVE') {
+        return res.status(400).json({ error: 'Cannot approve appraisal: Employee is INACTIVE (Offboarded/Exited).' });
+      }
+      if (empRecord && empRecord.status === 'NOTICE') {
+        return res.status(400).json({ error: 'Cannot approve appraisal: Employee is currently serving NOTICE period and ineligible for annual increment/promotion.' });
       }
 
       const currentCtc = appraisal.currentCtc;

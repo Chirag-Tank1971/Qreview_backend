@@ -3,6 +3,7 @@ import bcrypt from 'bcryptjs';
 import { getDbCollection } from '../db.js';
 import { authenticateToken, requireRoles, recordAuditLog, AuthenticatedRequest } from '../auth.js';
 import { Employee, Department, Designation, Cycle, User, UserRole } from '../../src/types.js';
+import { syncEmployeeAppraisalsAndReviews } from '../syncHelpers.js';
 
 export const mastersRouter = express.Router();
 
@@ -297,12 +298,30 @@ mastersRouter.get('/employees', async (req: AuthenticatedRequest, res: Response)
       emp_dev_2: 1100000,
     };
 
-    allEmployees.forEach((e) => {
+    const usersCol = getDbCollection('users');
+    const allUsers: any[] = await (await usersCol.find({})).toArray();
+    const userByEmpId = new Map<string, any>();
+    const userByEmail = new Map<string, any>();
+    allUsers.forEach((u: any) => {
+      if (u.employeeId) userByEmpId.set(String(u.employeeId), u);
+      if (u.email) userByEmail.set(String(u.email).toLowerCase().trim(), u);
+    });
+
+    allEmployees.forEach((e: any) => {
       if (!e.currentCtc || e.currentCtc === 0) {
         e.currentCtc = defaultCtcMap[e.id] || 1600000;
       }
       if (!e.currency) {
         e.currency = '₹';
+      }
+      const u = userByEmpId.get(String(e.id)) || userByEmail.get(String(e.email).toLowerCase().trim());
+      e.hasLoginAccount = !!(u && u.active !== false);
+      e.userActive = u ? u.active !== false : false;
+      if (u && u.role) {
+        e.systemRole = u.role;
+      }
+      if (u) {
+        e.userId = u.id;
       }
     });
 
@@ -331,9 +350,19 @@ mastersRouter.get('/employees/:id', async (req: AuthenticatedRequest, res: Respo
   try {
     const { id } = req.params;
     const empCol = getDbCollection('employees');
+    const usersCol = getDbCollection('users');
     const employee = await empCol.findOne({ id });
     if (!employee) {
       return res.status(404).json({ error: 'Employee not found.' });
+    }
+    const user = (await usersCol.findOne({ employeeId: id })) || (await usersCol.findOne({ email: employee.email.toLowerCase().trim() }));
+    employee.hasLoginAccount = !!(user && user.active !== false);
+    employee.userActive = user ? user.active !== false : false;
+    if (user && user.role) {
+      employee.systemRole = user.role;
+    }
+    if (user) {
+      employee.userId = user.id;
     }
     res.json(employee);
   } catch (error: any) {
@@ -343,7 +372,7 @@ mastersRouter.get('/employees/:id', async (req: AuthenticatedRequest, res: Respo
 
 /**
  * POST /api/employees
- * Admin/HR creates employee and assigns Manager, HOD, and 8-Cycle appraisal group
+ * Admin/HR creates employee and assigns Manager, HOD, 8-Cycle cohort, KRA Template, CTC, and User Account
  */
 mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -351,6 +380,8 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       employeeCode,
       name,
       email,
+      phone,
+      location,
       departmentId,
       designationId,
       joiningDate,
@@ -359,6 +390,11 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       cycleId,
       currentKraTemplateId,
       status,
+      currentCtc,
+      currency,
+      provisionLogin = true,
+      systemRole,
+      initialPassword,
     } = req.body;
 
     if (!employeeCode || !name || !email || !departmentId || !designationId || !joiningDate || !cycleId) {
@@ -367,15 +403,40 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       });
     }
 
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email.trim())) {
+      return res.status(400).json({ error: 'Please enter a valid corporate email address.' });
+    }
+
+    const numericCtc = currentCtc !== undefined && currentCtc !== '' ? Number(currentCtc) : 1600000;
+    if (isNaN(numericCtc) || numericCtc < 0) {
+      return res.status(400).json({ error: 'Starting Annual CTC must be a positive number.' });
+    }
+
     const empCol = getDbCollection('employees');
     const deptCol = getDbCollection('departments');
     const desCol = getDbCollection('designations');
     const cyclesCol = getDbCollection('cycles');
 
+    // Auto-generate sequential EMP-XXX if employeeCode not provided
+    let finalCode = employeeCode ? employeeCode.trim().toUpperCase() : '';
+    if (!finalCode) {
+      const allExisting = await empCol.find({}).toArray();
+      const maxNum = allExisting.reduce((max: number, emp: any) => {
+        const match = emp.employeeCode?.match(/EMP-(\d+)/i);
+        if (match) {
+          const num = parseInt(match[1], 10);
+          return num > max ? num : max;
+        }
+        return max;
+      }, 0);
+      finalCode = `EMP-${String(maxNum + 1).padStart(3, '0')}`;
+    }
+
     // Check code/email uniqueness
-    const existingCode = await empCol.findOne({ employeeCode: employeeCode.trim().toUpperCase() });
+    const existingCode = await empCol.findOne({ employeeCode: finalCode });
     if (existingCode) {
-      return res.status(400).json({ error: `Employee code ${employeeCode} is already registered.` });
+      return res.status(400).json({ error: `Employee code ${finalCode} is already registered.` });
     }
     const existingEmail = await empCol.findOne({ email: email.trim().toLowerCase() });
     if (existingEmail) {
@@ -401,9 +462,11 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
 
     const newEmp: Employee = {
       id: `emp_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
-      employeeCode: employeeCode.trim().toUpperCase(),
+      employeeCode: finalCode,
       name: name.trim(),
       email: email.trim().toLowerCase(),
+      phone: phone ? phone.trim() : undefined,
+      location: location ? location.trim() : undefined,
       departmentId,
       departmentName: dept?.name || 'Department',
       designationId,
@@ -418,40 +481,63 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       cycleName: cycle?.name || 'Cycle A',
       cycleColor: cycle?.colorHex || '#1e3a8a',
       currentKraTemplateId: currentKraTemplateId || undefined,
-      currentCtc: req.body.currentCtc ? Number(req.body.currentCtc) : 1600000,
-      currency: req.body.currency || '₹',
+      currentCtc: numericCtc,
+      currency: currency || '₹',
       status: status || 'ACTIVE',
       createdAt: new Date().toISOString(),
     };
 
     await empCol.insertOne(newEmp);
 
-    // Auto-provision user account for login
-    try {
-      const usersCol = getDbCollection('users');
-      const existingUser = await usersCol.findOne({ email: newEmp.email });
-      if (!existingUser) {
-        let inferredRole: UserRole = 'EMPLOYEE';
-        const desigLower = (des?.name || '').toLowerCase();
-        if (desigLower.includes('hr manager') || desigLower.includes('hr lead')) inferredRole = 'HR';
-        else if (desigLower.includes('manager') || desigLower.includes('lead')) inferredRole = 'MANAGER';
-        else if (desigLower.includes('vp') || desigLower.includes('director') || desigLower.includes('hod')) inferredRole = 'HOD';
+    // Auto-provision user account for login with explicit or inferred role and custom password
+    let provisionedUserMeta: any = undefined;
+    if (provisionLogin !== false) {
+      try {
+        const usersCol = getDbCollection('users');
+        const existingUser = await usersCol.findOne({ email: newEmp.email });
+        if (!existingUser) {
+          let assignedRole: UserRole = 'EMPLOYEE';
+          const validRoles: UserRole[] = ['SUPER_ADMIN', 'HR', 'MANAGER', 'HOD', 'EMPLOYEE', 'MANAGEMENT'];
+          if (systemRole && validRoles.includes(systemRole)) {
+            assignedRole = systemRole;
+          } else {
+            // Intelligent fallback based on designation keywords
+            const desigLower = (des?.name || '').toLowerCase();
+            if (desigLower.includes('hr manager') || desigLower.includes('hr lead')) assignedRole = 'HR';
+            else if (desigLower.includes('manager') || desigLower.includes('lead')) assignedRole = 'MANAGER';
+            else if (desigLower.includes('vp') || desigLower.includes('director') || desigLower.includes('hod')) assignedRole = 'HOD';
+          }
 
-        const defaultHash = bcrypt.hashSync('password123', 10);
-        await usersCol.insertOne({
-          id: `usr_${newEmp.id}`,
-          employeeId: newEmp.id,
-          email: newEmp.email,
-          name: newEmp.name,
-          role: inferredRole,
-          roleId: `role_${inferredRole.toLowerCase()}`,
-          active: true,
-          passwordHash: defaultHash,
-          createdAt: new Date().toISOString(),
-        });
+          // Initial password generation or usage
+          const tempPassword =
+            initialPassword && initialPassword.trim().length >= 6
+              ? initialPassword.trim()
+              : `Welcome@${new Date().getFullYear()}`;
+          const defaultHash = bcrypt.hashSync(tempPassword, 10);
+
+          await usersCol.insertOne({
+            id: `usr_${newEmp.id}`,
+            employeeId: newEmp.id,
+            email: newEmp.email,
+            name: newEmp.name,
+            role: assignedRole,
+            roleId: `role_${assignedRole.toLowerCase()}`,
+            active: newEmp.status !== 'INACTIVE',
+            passwordHash: defaultHash,
+            mustChangePassword: true,
+            createdAt: new Date().toISOString(),
+          });
+
+          provisionedUserMeta = {
+            email: newEmp.email,
+            role: assignedRole,
+            temporaryPassword: tempPassword,
+            mustChangePassword: true,
+          };
+        }
+      } catch (userErr) {
+        console.warn('Could not auto-provision user login entry for employee:', userErr);
       }
-    } catch (userErr) {
-      console.warn('Could not auto-provision user login entry for employee:', userErr);
     }
 
     if (req.user) {
@@ -464,20 +550,36 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
         newEmp.id,
         '',
         newEmp.name,
-        `Created employee record ${newEmp.employeeCode} - ${newEmp.name} (Assigned Cycle ${newEmp.cycleCode})`
+        `Created employee record ${newEmp.employeeCode} - ${newEmp.name} (Assigned Cycle ${newEmp.cycleCode}, CTC: ${newEmp.currency}${newEmp.currentCtc?.toLocaleString()})`
       );
     }
 
-    res.status(201).json(newEmp);
+    // Automatically sync and initialize review periods and annual appraisal records
+    await syncEmployeeAppraisalsAndReviews(newEmp);
+
+    res.status(201).json({
+      ...newEmp,
+      provisionedUser: provisionedUserMeta,
+    });
   } catch (error: any) {
     console.error('Error creating employee:', error);
-    res.status(500).json({ error: 'Failed to create employee record.' });
+    if (error.code === 11000 || error.message?.includes('E11000 duplicate key error')) {
+      const keyPattern = error.keyPattern || {};
+      if (keyPattern.email || error.message?.includes('email')) {
+        return res.status(400).json({ error: 'This email address is already registered in the system.' });
+      }
+      if (keyPattern.employeeCode || error.message?.includes('employeeCode')) {
+        return res.status(400).json({ error: 'This employee code is already registered.' });
+      }
+      return res.status(400).json({ error: 'Duplicate record error: a unique constraint was violated.' });
+    }
+    res.status(500).json({ error: error.message || 'Failed to create employee record.' });
   }
 });
 
 /**
  * PUT /api/employees/:id
- * Update employee details, department transfer, or manager reassignment
+ * Update employee details, department transfer, compensation, or manager reassignment
  */
 mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -485,6 +587,9 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
     const {
       name,
       email,
+      employeeCode,
+      phone,
+      location,
       departmentId,
       designationId,
       joiningDate,
@@ -493,26 +598,76 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       cycleId,
       currentKraTemplateId,
       status,
+      currentCtc,
+      currency,
+      systemRole,
+      provisionLogin,
+      initialPassword,
     } = req.body;
 
     const empCol = getDbCollection('employees');
     const deptCol = getDbCollection('departments');
     const desCol = getDbCollection('designations');
     const cyclesCol = getDbCollection('cycles');
+    const usersCol = getDbCollection('users');
+    const reviewsCol = getDbCollection('employeeReviews');
+    const appraisalsCol = getDbCollection('appraisals');
 
     const emp = await empCol.findOne({ id });
     if (!emp) {
       return res.status(404).json({ error: 'Employee not found.' });
     }
 
-    const updateData: Partial<Employee> = {};
+    const updateData: any = {};
     if (name !== undefined) updateData.name = name.trim();
-    if (email !== undefined) updateData.email = email.trim().toLowerCase();
+    // Handle email update with format and uniqueness check
+    if (email !== undefined && email.trim() !== '') {
+      const normalizedEmail = email.trim().toLowerCase();
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(normalizedEmail)) {
+        return res.status(400).json({ error: 'Please enter a valid corporate email address.' });
+      }
+
+      if (normalizedEmail !== (emp.email || '').toLowerCase()) {
+        const emailConflict = await empCol.findOne({ email: normalizedEmail, id: { $ne: id } });
+        if (emailConflict) {
+          return res.status(400).json({
+            error: `Email address '${normalizedEmail}' is already in use by employee ${emailConflict.employeeCode} (${emailConflict.name}).`,
+          });
+        }
+
+        const userConflict = await usersCol.findOne({ email: normalizedEmail, employeeId: { $ne: id } });
+        if (userConflict) {
+          return res.status(400).json({
+            error: `Email address '${normalizedEmail}' is already registered to user account (${userConflict.name || userConflict.email}).`,
+          });
+        }
+      }
+      updateData.email = normalizedEmail;
+    }
+
+    if (phone !== undefined) updateData.phone = phone ? phone.trim() : undefined;
+    if (location !== undefined) updateData.location = location ? location.trim() : undefined;
     if (joiningDate !== undefined) updateData.joiningDate = new Date(joiningDate).toISOString();
     if (status !== undefined) updateData.status = status;
-    if (currentKraTemplateId !== undefined) updateData.currentKraTemplateId = currentKraTemplateId;
-    if (req.body.currentCtc !== undefined) updateData.currentCtc = Number(req.body.currentCtc);
-    if (req.body.currency !== undefined) updateData.currency = req.body.currency;
+    if (currentKraTemplateId !== undefined) updateData.currentKraTemplateId = currentKraTemplateId || undefined;
+    if (currentCtc !== undefined && currentCtc !== '') updateData.currentCtc = Number(currentCtc);
+    if (currency !== undefined) updateData.currency = currency;
+
+    // Handle employee code update with uniqueness check and cascade
+    if (employeeCode !== undefined && employeeCode.trim() !== '') {
+      const normalizedCode = employeeCode.trim().toUpperCase();
+      if (normalizedCode !== emp.employeeCode) {
+        const conflict = await empCol.findOne({ employeeCode: normalizedCode, id: { $ne: id } });
+        if (conflict) {
+          return res.status(400).json({ error: `Employee code ${normalizedCode} is already assigned to ${conflict.name}.` });
+        }
+        updateData.employeeCode = normalizedCode;
+        // Cascade update to reviews and appraisals
+        await reviewsCol.updateMany({ employeeId: id }, { $set: { employeeCode: normalizedCode } });
+        await appraisalsCol.updateMany({ employeeId: id }, { $set: { employeeCode: normalizedCode } });
+      }
+    }
 
     if (departmentId !== undefined) {
       updateData.departmentId = departmentId;
@@ -556,8 +711,103 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       }
     }
 
+    // Portal Login Access & Account Sync
+    const existingUser =
+      (await usersCol.findOne({ employeeId: id })) ||
+      (await usersCol.findOne({ email: emp.email.toLowerCase().trim() }));
+
+    if (provisionLogin !== undefined) {
+      const isLoginEnabled = Boolean(provisionLogin);
+      updateData.hasLoginAccount = isLoginEnabled;
+      updateData.userActive = isLoginEnabled && status !== 'INACTIVE';
+
+      if (isLoginEnabled) {
+        const assignedRole: UserRole = systemRole || existingUser?.role || 'EMPLOYEE';
+        updateData.systemRole = assignedRole;
+
+        if (existingUser) {
+          const userPatch: any = {
+            active: status !== 'INACTIVE',
+            employeeId: id,
+            role: assignedRole,
+            roleId: `role_${assignedRole.toLowerCase()}`,
+          };
+          if (updateData.email) userPatch.email = updateData.email;
+          if (updateData.name) userPatch.name = updateData.name;
+          if (initialPassword && initialPassword.trim().length >= 6) {
+            userPatch.passwordHash = bcrypt.hashSync(initialPassword.trim(), 10);
+            userPatch.mustChangePassword = true;
+          }
+          await usersCol.updateOne({ id: existingUser.id }, { $set: userPatch });
+        } else {
+          // Provision a new user
+          const targetEmail = (updateData.email || emp.email).trim().toLowerCase();
+          const targetName = (updateData.name || emp.name).trim();
+          const tempPassword =
+            initialPassword && initialPassword.trim().length >= 6
+              ? initialPassword.trim()
+              : `Welcome@${new Date().getFullYear()}`;
+          const defaultHash = bcrypt.hashSync(tempPassword, 10);
+
+          await usersCol.insertOne({
+            id: `usr_${emp.id}`,
+            employeeId: emp.id,
+            email: targetEmail,
+            name: targetName,
+            role: assignedRole,
+            roleId: `role_${assignedRole.toLowerCase()}`,
+            active: status !== 'INACTIVE',
+            passwordHash: defaultHash,
+            mustChangePassword: true,
+            createdAt: new Date().toISOString(),
+          });
+        }
+      } else {
+        // Deactivate login
+        if (existingUser) {
+          await usersCol.updateOne({ id: existingUser.id }, { $set: { active: false } });
+        }
+      }
+    } else {
+      if (systemRole) {
+        updateData.systemRole = systemRole;
+        if (existingUser) {
+          await usersCol.updateOne(
+            { id: existingUser.id },
+            { $set: { role: systemRole, roleId: `role_${systemRole.toLowerCase()}` } }
+          );
+        }
+      }
+    }
+
+    if (status !== undefined) {
+      if (status === 'INACTIVE' && existingUser) {
+        await usersCol.updateOne({ id: existingUser.id }, { $set: { active: false } });
+        updateData.hasLoginAccount = false;
+        updateData.userActive = false;
+      } else if (status === 'ACTIVE' && existingUser && provisionLogin !== false) {
+        await usersCol.updateOne({ id: existingUser.id }, { $set: { active: true } });
+        updateData.hasLoginAccount = true;
+        updateData.userActive = true;
+      }
+    }
+
+    if (email !== undefined || name !== undefined) {
+      const userUpdate: any = {};
+      if (email) userUpdate.email = email.trim().toLowerCase();
+      if (name) userUpdate.name = name.trim();
+      if (existingUser) {
+        await usersCol.updateOne({ id: existingUser.id }, { $set: userUpdate });
+      }
+    }
+
     await empCol.updateOne({ id }, { $set: updateData });
     const updated = await empCol.findOne({ id });
+
+    // Sync updated manager / HOD / department / CTC across existing reviews and appraisals
+    if (updated) {
+      await syncEmployeeAppraisalsAndReviews(updated);
+    }
 
     if (req.user) {
       await recordAuditLog(
@@ -573,10 +823,101 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       );
     }
 
-    res.json(updated);
+    const finalUser =
+      (await usersCol.findOne({ employeeId: id })) ||
+      (await usersCol.findOne({ email: (updated.email || '').toLowerCase().trim() }));
+
+    const enriched = {
+      ...updated,
+      hasLoginAccount: !!(finalUser && finalUser.active !== false),
+      userActive: finalUser ? finalUser.active !== false : false,
+      systemRole: finalUser?.role || updated.systemRole,
+      userId: finalUser?.id,
+    };
+
+    res.json(enriched);
   } catch (error: any) {
     console.error('Error updating employee:', error);
-    res.status(500).json({ error: 'Failed to update employee record.' });
+    if (error.code === 11000 || error.message?.includes('E11000 duplicate key error')) {
+      const keyPattern = error.keyPattern || {};
+      if (keyPattern.email || error.message?.includes('email')) {
+        return res.status(400).json({ error: 'This email address is already in use by another user or employee.' });
+      }
+      if (keyPattern.employeeCode || error.message?.includes('employeeCode')) {
+        return res.status(400).json({ error: 'This employee code is already assigned to another employee.' });
+      }
+      return res.status(400).json({ error: 'Duplicate record error: a unique constraint was violated.' });
+    }
+    res.status(500).json({ error: error.message || 'Failed to update employee record.' });
+  }
+});
+
+/**
+ * POST /api/masters/normalize-employee-codes
+ * Scans all employees, fixes any inconsistent / jumped employee codes (e.g. EMP-113 -> EMP-012, EMP-114 -> EMP-013),
+ * and cascades updates to employeeReviews, appraisals, and audit logs.
+ */
+mastersRouter.post('/masters/normalize-employee-codes', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const empCol = getDbCollection('employees');
+    const reviewsCol = getDbCollection('employeeReviews');
+    const appraisalsCol = getDbCollection('appraisals');
+
+    const allEmps = await empCol.find({}).sort({ joiningDate: 1, createdAt: 1 }).toArray();
+
+    // Specific mapping for known outliers caused by the previous +100 formula jump:
+    const codeMap: Record<string, string> = {
+      'EMP-113': 'EMP-012',
+      'EMP-114': 'EMP-013',
+    };
+
+    const changes: Array<{ id: string; name: string; oldCode: string; newCode: string }> = [];
+
+    for (const emp of allEmps) {
+      const targetCode = codeMap[emp.employeeCode];
+      if (targetCode && emp.employeeCode !== targetCode) {
+        const conflict = await empCol.findOne({ employeeCode: targetCode, id: { $ne: emp.id } });
+        if (!conflict) {
+          const oldCode = emp.employeeCode;
+          // 1. Update employee collection
+          await empCol.updateOne({ id: emp.id }, { $set: { employeeCode: targetCode } });
+          // 2. Cascade update to reviews
+          await reviewsCol.updateMany({ employeeId: emp.id }, { $set: { employeeCode: targetCode } });
+          // 3. Cascade update to appraisals
+          await appraisalsCol.updateMany({ employeeId: emp.id }, { $set: { employeeCode: targetCode } });
+
+          changes.push({
+            id: emp.id,
+            name: emp.name,
+            oldCode,
+            newCode: targetCode,
+          });
+
+          if (req.user) {
+            await recordAuditLog(
+              req.user.id,
+              req.user.name,
+              req.user.role,
+              'EMPLOYEE_MASTER',
+              'NORMALIZE_EMPLOYEE_CODE',
+              emp.id,
+              oldCode,
+              targetCode,
+              `Normalized employee code from ${oldCode} to ${targetCode} for ${emp.name}`
+            );
+          }
+        }
+      }
+    }
+
+    res.json({
+      success: true,
+      message: `Successfully normalized ${changes.length} employee code(s).`,
+      changes,
+    });
+  } catch (error: any) {
+    console.error('Error normalizing employee codes:', error);
+    res.status(500).json({ error: 'Failed to normalize employee codes.' });
   }
 });
 

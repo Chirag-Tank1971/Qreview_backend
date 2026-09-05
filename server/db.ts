@@ -47,18 +47,34 @@ let dbUri: string | undefined = process.env.MONGODB_URI;
 
 const STORAGE_FILE_PATH = path.join(process.cwd(), '.local_database_store.json');
 
+let fullDiskStore: Record<string, any[]> | null = null;
+let saveDebounceTimer: NodeJS.Timeout | null = null;
+
 function saveToDisk(collectionName: string, itemsMap: Map<string, any>) {
   try {
-    let store: Record<string, any[]> = {};
-    if (fs.existsSync(STORAGE_FILE_PATH)) {
-      try {
-        store = JSON.parse(fs.readFileSync(STORAGE_FILE_PATH, 'utf-8'));
-      } catch {
-        store = {};
+    if (!fullDiskStore) {
+      if (fs.existsSync(STORAGE_FILE_PATH)) {
+        try {
+          fullDiskStore = JSON.parse(fs.readFileSync(STORAGE_FILE_PATH, 'utf-8'));
+        } catch {
+          fullDiskStore = {};
+        }
+      } else {
+        fullDiskStore = {};
       }
     }
-    store[collectionName] = Array.from(itemsMap.values());
-    fs.writeFileSync(STORAGE_FILE_PATH, JSON.stringify(store, null, 2), 'utf-8');
+    fullDiskStore[collectionName] = Array.from(itemsMap.values());
+
+    if (saveDebounceTimer) {
+      clearTimeout(saveDebounceTimer);
+    }
+    saveDebounceTimer = setTimeout(() => {
+      try {
+        fs.writeFile(STORAGE_FILE_PATH, JSON.stringify(fullDiskStore), 'utf-8', () => {});
+      } catch (_e) {
+        // quiet fallback
+      }
+    }, 150);
   } catch (err) {
     // quiet fallback
   }
@@ -253,9 +269,17 @@ export async function initDatabase(): Promise<void> {
       mongoClient = new MongoClient(uri, { serverSelectionTimeoutMS: 4000, connectTimeoutMS: 4000 });
       await mongoClient.connect();
       
-      // If URI specifies a database (e.g. mongodb://localhost:27017/my_db), use it. Otherwise use 'quarterly_appraisal_db'
-      const clientDbName = (mongoClient as any)?.options?.dbName;
-      const targetDb = clientDbName && clientDbName !== 'test' ? clientDbName : 'quarterly_appraisal_db';
+      // Parse target database name directly from the URI path (e.g. review_appraisal_db)
+      let targetDb = 'review_appraisal_db';
+      try {
+        const urlParsed = new URL(uri.replace('mongodb+srv://', 'https://').replace('mongodb://', 'http://'));
+        const pathDb = urlParsed.pathname.replace(/^\//, '').split('?')[0];
+        if (pathDb && pathDb !== 'test') {
+          targetDb = pathDb;
+        }
+      } catch {
+        // fallback
+      }
       mongoDb = mongoClient.db(targetDb);
       
       dbMode = 'MONGODB';
@@ -293,9 +317,19 @@ async function seedMongoCollectionsIfEmpty(db: Db): Promise<void> {
   
   const upsertCollection = async (collectionKey: keyof typeof memoryDb, seedData: any[]) => {
     const col = getDbCollection(collectionKey);
-    for (const doc of seedData) {
-      if (doc && doc.id) {
-        await col.updateOne({ id: doc.id }, { $set: doc }, { upsert: true });
+    const count = await col.countDocuments();
+    if (count === 0 && seedData.length > 0) {
+      const ops = seedData
+        .filter((doc) => doc && doc.id)
+        .map((doc) => ({
+          updateOne: {
+            filter: { id: doc.id },
+            update: { $set: doc },
+            upsert: true,
+          },
+        }));
+      if (ops.length > 0) {
+        await col.bulkWrite(ops, { ordered: false });
       }
     }
   };
@@ -331,7 +365,15 @@ async function seedMongoCollectionsIfEmpty(db: Db): Promise<void> {
   } catch (_e) {
     // Ignore
   }
-  await upsertCollection('reviewPeriods', SEED_REVIEW_PERIODS);
+
+  try {
+    const periodCol = getDbCollection('reviewPeriods');
+    for (const p of SEED_REVIEW_PERIODS) {
+      await periodCol.updateOne({ id: p.id }, { $set: p }, { upsert: true });
+    }
+  } catch (_e) {
+    await upsertCollection('reviewPeriods', SEED_REVIEW_PERIODS);
+  }
   await upsertCollection('employeeReviews', SEED_EMPLOYEE_REVIEWS);
   try {
     const revCol = getDbCollection('employeeReviews');
@@ -379,8 +421,30 @@ async function seedMongoCollectionsIfEmpty(db: Db): Promise<void> {
   }
 
   try {
-    await getDbCollection('employeeReviews').createIndex({ employeeId: 1, reviewPeriodId: 1 }, { unique: true });
-    await getDbCollection('employees').createIndex({ employeeCode: 1 }, { unique: true });
+    const revCol = getDbCollection('employeeReviews');
+    await revCol.createIndex({ employeeId: 1, reviewPeriodId: 1 }, { unique: true });
+    await revCol.createIndex({ employeeId: 1 });
+    await revCol.createIndex({ managerId: 1 });
+    await revCol.createIndex({ status: 1 });
+    await revCol.createIndex({ reviewPeriodId: 1 });
+
+    const appCol = getDbCollection('appraisals');
+    await appCol.createIndex({ employeeId: 1 });
+    await appCol.createIndex({ status: 1 });
+    await appCol.createIndex({ appraisalYear: 1 });
+    await appCol.createIndex({ cycleId: 1 });
+
+    const empCol = getDbCollection('employees');
+    await empCol.createIndex({ employeeCode: 1 }, { unique: true });
+    await empCol.createIndex({ id: 1 });
+    await empCol.createIndex({ departmentId: 1 });
+    await empCol.createIndex({ managerId: 1 });
+    await empCol.createIndex({ status: 1 });
+
+    const notifCol = getDbCollection('notifications');
+    await notifCol.createIndex({ userId: 1 });
+    await notifCol.createIndex({ isRead: 1 });
+
     await getDbCollection('users').createIndex({ email: 1 }, { unique: true });
   } catch (err) {
     // Indexes might already exist
@@ -408,7 +472,7 @@ export async function getDatabaseStatus(): Promise<DbStatus> {
     connected: true,
     mode: dbMode,
     uri: dbUri,
-    databaseName: 'quarterly_appraisal_db',
+    databaseName: mongoDb ? mongoDb.databaseName : 'review_appraisal_db',
     collections: counts,
   };
 }

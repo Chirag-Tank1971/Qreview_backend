@@ -84,37 +84,36 @@ essRouter.get('/ess/overview/:employeeId?', authenticateToken, async (req: Authe
 
     const empId = employee.id;
 
-    // 1. Fetch all quarterly reviews for this employee
     const reviewsCol = getDbCollection('employeeReviews');
-    const reviews: EmployeeReview[] = await (
-      await reviewsCol.find({ employeeId: empId })
-    ).toArray();
+    const appraisalsCol = getDbCollection('appraisals');
+    const kraTemplatesCol = getDbCollection('kraTemplates');
+    const periodsCol = getDbCollection('reviewPeriods');
 
-    // Sort reviews by reviewPeriod or createdAt
+    const templateInitialPromise = employee.currentKraTemplateId
+      ? kraTemplatesCol.findOne({ id: employee.currentKraTemplateId })
+      : employee.designationId
+      ? kraTemplatesCol.findOne({ designationId: employee.designationId })
+      : Promise.resolve(null);
+
+    // Parallel execution of all sub-queries
+    const [reviewsRes, appraisalsRes, initialTemplate, periods] = await Promise.all([
+      (await reviewsCol.find({ employeeId: empId })).toArray(),
+      (await appraisalsCol.find({ employeeId: empId })).toArray(),
+      templateInitialPromise,
+      (await periodsCol.find({})).toArray(),
+    ]);
+
+    const reviews: EmployeeReview[] = reviewsRes;
     reviews.sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
 
-    // 2. Fetch latest appraisal for this employee
-    const appraisalsCol = getDbCollection('appraisals');
-    const appraisals: Appraisal[] = await (
-      await appraisalsCol.find({ employeeId: empId })
-    ).toArray();
-
+    const appraisals: Appraisal[] = appraisalsRes;
     appraisals.sort((a, b) => b.appraisalYear - a.appraisalYear);
     const activeAppraisal = appraisals[0] || null;
 
-    // 3. Fetch active KRA template
-    const kraTemplatesCol = getDbCollection('kraTemplates');
-    let activeKraTemplate: KraTemplate | null = null;
-    if (employee.currentKraTemplateId) {
-      activeKraTemplate = await kraTemplatesCol.findOne({ id: employee.currentKraTemplateId });
-    }
+    let activeKraTemplate: KraTemplate | null = initialTemplate;
     if (!activeKraTemplate && employee.designationId) {
       activeKraTemplate = await kraTemplatesCol.findOne({ designationId: employee.designationId });
     }
-
-    // 4. Fetch review periods to cross-reference
-    const periodsCol = getDbCollection('reviewPeriods');
-    const periods: ReviewPeriod[] = await (await periodsCol.find({})).toArray();
 
     // 5. Calculate longitudinal performance trajectory
     const performanceHistory = reviews

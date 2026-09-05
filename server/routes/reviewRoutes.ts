@@ -109,6 +109,16 @@ reviewRouter.put(
         return res.status(404).json({ error: 'Review period not found.' });
       }
 
+      if (updates.status === 'ACTIVE') {
+        // Only one period should normally be ACTIVE at any given time. Transition any existing ACTIVE period to LOCKED.
+        const allActive = await (await periodCol.find({ status: 'ACTIVE' })).toArray();
+        for (const act of allActive) {
+          if (act.id !== id) {
+            await periodCol.updateOne({ id: act.id }, { $set: { status: 'LOCKED' } });
+          }
+        }
+      }
+
       const updated = { ...existing, ...updates };
       await periodCol.updateOne({ id }, { $set: updated });
 
@@ -144,27 +154,57 @@ reviewRouter.put(
 reviewRouter.get('/reviews', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { periodId, departmentId, managerId, employeeId, status, search, onlyMine } = req.query;
+
     const reviewCol = getDbCollection('employeeReviews');
+    const employeesCol = getDbCollection('employees');
+
     let reviews: EmployeeReview[] = await (await reviewCol.find({})).toArray();
+    const allEmployees: Employee[] = await (await employeesCol.find({})).toArray();
+    const empMap = new Map<string, Employee>();
+    allEmployees.forEach((e) => empMap.set(e.id, e));
 
     // Strict RBAC Role-based visibility filtering
     if (req.user?.role === 'EMPLOYEE') {
       reviews = reviews.filter((r) => r.employeeId === req.user?.employeeId);
     } else if (req.user?.role === 'MANAGER') {
-      // Managers can strictly ONLY see their direct reports (or themselves)
-      reviews = reviews.filter(
-        (r) => r.managerId === req.user?.employeeId || r.employeeId === req.user?.employeeId
-      );
+      // Managers can see their direct reports (or themselves)
+      reviews = reviews.filter((r) => {
+        const empRecord = empMap.get(r.employeeId);
+        return (
+          r.managerId === req.user?.employeeId ||
+          r.employeeId === req.user?.employeeId ||
+          empRecord?.managerId === req.user?.employeeId ||
+          (req.user?.name && empRecord?.managerName?.toLowerCase() === req.user.name.toLowerCase())
+        );
+      });
     } else if (req.user?.role === 'HOD') {
-      // HODs can strictly ONLY see their department roll-ups, direct reports, or themselves
-      reviews = reviews.filter(
-        (r) => r.hodId === req.user?.employeeId || r.managerId === req.user?.employeeId || r.employeeId === req.user?.employeeId
-      );
+      // HODs can see their department roll-ups, direct reports, or themselves
+      reviews = reviews.filter((r) => {
+        const empRecord = empMap.get(r.employeeId);
+        const userDeptId = req.employeeProfile?.departmentId;
+        const userDeptName = req.employeeProfile?.departmentName?.toLowerCase();
+        return (
+          r.hodId === req.user?.employeeId ||
+          r.managerId === req.user?.employeeId ||
+          r.employeeId === req.user?.employeeId ||
+          empRecord?.hodId === req.user?.employeeId ||
+          empRecord?.managerId === req.user?.employeeId ||
+          (userDeptId && r.departmentId === userDeptId) ||
+          (userDeptId && empRecord?.departmentId === userDeptId) ||
+          (userDeptName && r.departmentName?.toLowerCase() === userDeptName)
+        );
+      });
     }
     // SUPER_ADMIN and HR can see everything.
 
     if (onlyMine === 'true' && req.user?.employeeId) {
-      reviews = reviews.filter((r) => r.managerId === req.user?.employeeId && r.employeeId !== req.user?.employeeId);
+      reviews = reviews.filter((r) => {
+        const empRecord = empMap.get(r.employeeId);
+        return (
+          (r.managerId === req.user?.employeeId || empRecord?.managerId === req.user?.employeeId) &&
+          r.employeeId !== req.user?.employeeId
+        );
+      });
     }
 
     if (periodId && periodId !== 'ALL' && periodId !== 'undefined') {
@@ -201,14 +241,23 @@ reviewRouter.get('/reviews', async (req: AuthenticatedRequest, res: Response) =>
           r.employeeCode.toLowerCase().includes(q) ||
           r.departmentName.toLowerCase().includes(q) ||
           r.designationName.toLowerCase().includes(q) ||
-          r.managerName.toLowerCase().includes(q)
+          r.managerName?.toLowerCase().includes(q)
       );
     }
 
     // Sort: most recently updated first
     reviews.sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime());
 
-    res.json(reviews);
+    // Enrich with real-time employee employment status
+    const enrichedReviews = reviews.map((r) => {
+      const empRecord = empMap.get(r.employeeId);
+      return {
+        ...r,
+        employeeStatus: empRecord?.status || r.employeeStatus || 'ACTIVE',
+      };
+    });
+
+    res.json(enrichedReviews);
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to fetch employee reviews.' });
   }
@@ -222,19 +271,42 @@ reviewRouter.get('/reviews/stats', async (req: AuthenticatedRequest, res: Respon
   try {
     const { periodId, departmentId } = req.query;
     const reviewCol = getDbCollection('employeeReviews');
+    const employeesCol = getDbCollection('employees');
+
     let reviews: EmployeeReview[] = await (await reviewCol.find({})).toArray();
+    const allEmployees: Employee[] = await (await employeesCol.find({})).toArray();
+    const empMap = new Map<string, Employee>();
+    allEmployees.forEach((e) => empMap.set(e.id, e));
 
     // Strict RBAC Role-based visibility filtering
     if (req.user?.role === 'EMPLOYEE') {
       reviews = reviews.filter((r) => r.employeeId === req.user?.employeeId);
     } else if (req.user?.role === 'MANAGER') {
-      reviews = reviews.filter(
-        (r) => r.managerId === req.user?.employeeId || r.employeeId === req.user?.employeeId
-      );
+      reviews = reviews.filter((r) => {
+        const empRecord = empMap.get(r.employeeId);
+        return (
+          r.managerId === req.user?.employeeId ||
+          r.employeeId === req.user?.employeeId ||
+          empRecord?.managerId === req.user?.employeeId ||
+          (req.user?.name && empRecord?.managerName?.toLowerCase() === req.user.name.toLowerCase())
+        );
+      });
     } else if (req.user?.role === 'HOD') {
-      reviews = reviews.filter(
-        (r) => r.hodId === req.user?.employeeId || r.managerId === req.user?.employeeId || r.employeeId === req.user?.employeeId
-      );
+      reviews = reviews.filter((r) => {
+        const empRecord = empMap.get(r.employeeId);
+        const userDeptId = req.employeeProfile?.departmentId;
+        const userDeptName = req.employeeProfile?.departmentName?.toLowerCase();
+        return (
+          r.hodId === req.user?.employeeId ||
+          r.managerId === req.user?.employeeId ||
+          r.employeeId === req.user?.employeeId ||
+          empRecord?.hodId === req.user?.employeeId ||
+          empRecord?.managerId === req.user?.employeeId ||
+          (userDeptId && r.departmentId === userDeptId) ||
+          (userDeptId && empRecord?.departmentId === userDeptId) ||
+          (userDeptName && r.departmentName?.toLowerCase() === userDeptName)
+        );
+      });
     }
 
     if (periodId && periodId !== 'ALL') {
@@ -302,22 +374,46 @@ reviewRouter.get('/reviews/:id', async (req: AuthenticatedRequest, res: Response
     }
 
     // Role check: Strict IDOR Protection
+    const employeesCol = getDbCollection('employees');
+    const empRecord = await employeesCol.findOne({ id: review.employeeId });
+
     if (req.user?.role === 'EMPLOYEE' && review.employeeId !== req.user?.employeeId) {
       return res.status(403).json({ error: 'Unauthorized to view this performance review.' });
     }
-    if (req.user?.role === 'MANAGER' && review.managerId !== req.user?.employeeId && review.employeeId !== req.user?.employeeId) {
-      return res.status(403).json({ error: 'Unauthorized to view performance reviews of other teams.' });
+    if (req.user?.role === 'MANAGER') {
+      const isManagerMatch =
+        review.managerId === req.user?.employeeId ||
+        review.employeeId === req.user?.employeeId ||
+        empRecord?.managerId === req.user?.employeeId ||
+        (req.user?.name && empRecord?.managerName?.toLowerCase() === req.user.name.toLowerCase());
+
+      if (!isManagerMatch) {
+        return res.status(403).json({ error: 'Unauthorized to view performance reviews of other teams.' });
+      }
     }
     if (req.user?.role === 'HOD') {
       const isDeptMatch =
         (req.employeeProfile?.departmentId && review.departmentId === req.employeeProfile.departmentId) ||
-        (req.employeeProfile?.departmentName && review.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase());
-      if (review.hodId !== req.user?.employeeId && review.managerId !== req.user?.employeeId && review.employeeId !== req.user?.employeeId && !isDeptMatch) {
+        (req.employeeProfile?.departmentName && review.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase()) ||
+        (req.employeeProfile?.departmentId && empRecord?.departmentId === req.employeeProfile.departmentId);
+      
+      const isHodMatch =
+        review.hodId === req.user?.employeeId ||
+        review.managerId === req.user?.employeeId ||
+        review.employeeId === req.user?.employeeId ||
+        empRecord?.hodId === req.user?.employeeId ||
+        empRecord?.managerId === req.user?.employeeId ||
+        isDeptMatch;
+
+      if (!isHodMatch) {
         return res.status(403).json({ error: 'Unauthorized to view performance reviews outside your department.' });
       }
     }
 
-    res.json(review);
+    res.json({
+      ...review,
+      employeeStatus: empRecord?.status || review.employeeStatus || 'ACTIVE',
+    });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to fetch review details.' });
   }
@@ -573,6 +669,13 @@ reviewRouter.put('/reviews/:id/score', async (req: AuthenticatedRequest, res: Re
 
     if (existing.isClosed) {
       return res.status(400).json({ error: 'This quarterly review is closed and locked from further scoring changes.' });
+    }
+
+    // Safeguard: Check if employee is inactive
+    const employeesCol = getDbCollection('employees');
+    const empRecord = await employeesCol.findOne({ id: existing.employeeId });
+    if (empRecord && empRecord.status === 'INACTIVE') {
+      return res.status(400).json({ error: 'Cannot score review: This employee is marked INACTIVE (Offboarded/Exited).' });
     }
 
     // Role check: Only assigned reporting manager, departmental HOD, HR, or Super Admin can score

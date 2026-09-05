@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
-import { memoryDb } from '../db.js';
+import { getDbCollection } from '../db.js';
+import { authenticateToken, AuthenticatedRequest } from '../auth.js';
 import {
   FeedbackEntry,
   PipRecord,
@@ -16,6 +17,7 @@ import {
 } from '../../src/types.js';
 
 export const aiAndFeedbackRouter = Router();
+aiAndFeedbackRouter.use(authenticateToken);
 
 // Initialize Gemini Client (lazy helper to ensure process.env is read)
 function getGeminiClient(): GoogleGenAI | null {
@@ -487,7 +489,8 @@ Provide:
 aiAndFeedbackRouter.get('/feedback', async (req, res) => {
   try {
     const { employeeId, department, type } = req.query;
-    let list = memoryDb.feedback.getAll();
+    const fbCol = getDbCollection('feedback');
+    let list: FeedbackEntry[] = await (await fbCol.find({})).toArray();
 
     if (employeeId) {
       list = list.filter((f) => f.toEmployeeId === String(employeeId) || f.fromUserId === String(employeeId));
@@ -532,7 +535,8 @@ aiAndFeedbackRouter.post('/feedback', async (req, res) => {
       createdAt: new Date().toISOString(),
     };
 
-    await memoryDb.feedback.insertOne(newEntry);
+    const fbCol = getDbCollection('feedback');
+    await fbCol.insertOne(newEntry);
     res.status(201).json(newEntry);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -544,7 +548,8 @@ aiAndFeedbackRouter.post('/feedback/:id/react', async (req, res) => {
   try {
     const { id } = req.params;
     const { userId } = req.body;
-    const entry = await memoryDb.feedback.findOne({ id });
+    const fbCol = getDbCollection('feedback');
+    const entry = await fbCol.findOne({ id });
     if (!entry) {
       return res.status(404).json({ error: 'Feedback entry not found' });
     }
@@ -564,7 +569,7 @@ aiAndFeedbackRouter.post('/feedback/:id/react', async (req, res) => {
       likesCount: likedBy.length,
     };
 
-    await memoryDb.feedback.updateOne({ id }, updated);
+    await fbCol.updateOne({ id }, { $set: updated });
     res.json(updated);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -576,12 +581,16 @@ aiAndFeedbackRouter.post('/feedback/:id/react', async (req, res) => {
 // -------------------------------------------------------------
 
 // GET all PIPs
-aiAndFeedbackRouter.get('/pips', async (req, res) => {
+aiAndFeedbackRouter.get('/pips', async (req: AuthenticatedRequest, res) => {
   try {
     const { employeeId, status } = req.query;
-    let list = memoryDb.pips.getAll();
+    const pipsCol = getDbCollection('pips');
+    let list: PipRecord[] = await (await pipsCol.find({})).toArray();
 
-    if (employeeId) {
+    // If EMPLOYEE role, restrict to their own PIP record
+    if (req.userRole === 'EMPLOYEE' && req.user?.employeeId) {
+      list = list.filter((p) => p.employeeId === req.user?.employeeId);
+    } else if (employeeId) {
       list = list.filter((p) => p.employeeId === String(employeeId));
     }
     if (status && status !== 'ALL') {
@@ -620,7 +629,8 @@ aiAndFeedbackRouter.post('/pips', async (req, res) => {
       updatedAt: new Date().toISOString(),
     };
 
-    await memoryDb.pips.insertOne(newPip);
+    const pipsCol = getDbCollection('pips');
+    await pipsCol.insertOne(newPip);
     res.status(201).json(newPip);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -631,7 +641,8 @@ aiAndFeedbackRouter.post('/pips', async (req, res) => {
 aiAndFeedbackRouter.put('/pips/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const target = await memoryDb.pips.findOne({ id });
+    const pipsCol = getDbCollection('pips');
+    const target = await pipsCol.findOne({ id });
     if (!target) {
       return res.status(404).json({ error: 'PIP record not found' });
     }
@@ -642,7 +653,7 @@ aiAndFeedbackRouter.put('/pips/:id', async (req, res) => {
       updatedAt: new Date().toISOString(),
     };
 
-    await memoryDb.pips.updateOne({ id }, updated);
+    await pipsCol.updateOne({ id }, { $set: updated });
     res.json(updated);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -653,7 +664,8 @@ aiAndFeedbackRouter.put('/pips/:id', async (req, res) => {
 aiAndFeedbackRouter.post('/pips/:id/checkin', async (req, res) => {
   try {
     const { id } = req.params;
-    const target = await memoryDb.pips.findOne({ id });
+    const pipsCol = getDbCollection('pips');
+    const target = await pipsCol.findOne({ id });
     if (!target) {
       return res.status(404).json({ error: 'PIP record not found' });
     }
@@ -682,7 +694,7 @@ aiAndFeedbackRouter.post('/pips/:id/checkin', async (req, res) => {
       updatedAt: new Date().toISOString(),
     };
 
-    await memoryDb.pips.updateOne({ id }, updated);
+    await pipsCol.updateOne({ id }, { $set: updated });
     res.json(updated);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -694,9 +706,14 @@ aiAndFeedbackRouter.post('/pips/:id/checkin', async (req, res) => {
 // -------------------------------------------------------------
 
 // GET all talent records
-aiAndFeedbackRouter.get('/talent-records', async (_req, res) => {
+aiAndFeedbackRouter.get('/talent-records', async (req: AuthenticatedRequest, res) => {
   try {
-    const records = memoryDb.talentRecords.getAll();
+    const talentCol = getDbCollection('talentRecords');
+    let records: TalentRecord[] = await (await talentCol.find({})).toArray();
+    // If EMPLOYEE role, restrict to their own talent record
+    if (req.userRole === 'EMPLOYEE' && req.user?.employeeId) {
+      records = records.filter((r) => r.employeeId === req.user?.employeeId);
+    }
     res.json(records);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
@@ -707,7 +724,8 @@ aiAndFeedbackRouter.get('/talent-records', async (_req, res) => {
 aiAndFeedbackRouter.put('/talent-records/:id', async (req, res) => {
   try {
     const { id } = req.params;
-    const target = await memoryDb.talentRecords.findOne({ id });
+    const talentCol = getDbCollection('talentRecords');
+    const target = await talentCol.findOne({ id });
     if (!target) {
       return res.status(404).json({ error: 'Talent record not found' });
     }
@@ -718,7 +736,7 @@ aiAndFeedbackRouter.put('/talent-records/:id', async (req, res) => {
       lastAssessedDate: new Date().toISOString().split('T')[0],
     };
 
-    await memoryDb.talentRecords.updateOne({ id }, updated);
+    await talentCol.updateOne({ id }, { $set: updated });
     res.json(updated);
   } catch (err: any) {
     res.status(500).json({ error: err.message });

@@ -12,8 +12,8 @@ import {
 } from '../../src/types.js';
 
 export const reportRouter = Router();
-reportRouter.use(authenticateToken);
-reportRouter.use(requireRoles('SUPER_ADMIN', 'HR', 'HOD', 'MANAGER'));
+reportRouter.use('/reports', authenticateToken);
+reportRouter.use('/reports', requireRoles('SUPER_ADMIN', 'HR', 'HOD', 'MANAGER'));
 
 /**
  * 1. Quarterly Review Status Report (Section 16.1)
