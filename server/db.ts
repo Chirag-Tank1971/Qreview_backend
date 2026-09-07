@@ -20,6 +20,7 @@ import {
   SEED_PIPS,
   SEED_TALENT_RECORDS,
 } from './seedData.js';
+import { SEED_COMPLIANCE_FLAGS } from './seedAuditData.js';
 import {
   User,
   Role,
@@ -37,6 +38,7 @@ import {
   FeedbackEntry,
   PipRecord,
   TalentRecord,
+  ComplianceFlag,
   DbStatus,
 } from '../src/types.js';
 
@@ -115,6 +117,19 @@ class InMemoryCollection<T extends { id?: string; _id?: any }> {
         const id = seedItem.id || (seedItem as any)._id;
         if (id && !this.items.has(String(id))) {
           this.items.set(String(id), { ...seedItem, id: String(id), _id: String(id) });
+        }
+      });
+    }
+
+    // Ensure departments have budgetCapPercent populated for backward compatibility
+    if (name === 'departments') {
+      this.items.forEach((dept: any, id: string) => {
+        if (typeof dept.budgetCapPercent !== 'number') {
+          let cap = 12.0;
+          if (dept.code === 'ENG' || dept.id === 'dept_eng') cap = 14.0;
+          else if (dept.code === 'SLS' || dept.id === 'dept_sales') cap = 10.0;
+          else if (dept.code === 'HR' || dept.id === 'dept_hr') cap = 8.5;
+          this.items.set(id, { ...dept, budgetCapPercent: cap });
         }
       });
     }
@@ -257,6 +272,7 @@ export const memoryDb = {
   feedback: new InMemoryCollection<FeedbackEntry>('feedback', SEED_FEEDBACK),
   pips: new InMemoryCollection<PipRecord>('pips', SEED_PIPS),
   talentRecords: new InMemoryCollection<TalentRecord>('talent_records', SEED_TALENT_RECORDS),
+  complianceFlags: new InMemoryCollection<ComplianceFlag>('compliance_flags', SEED_COMPLIANCE_FLAGS),
 };
 
 export async function initDatabase(): Promise<void> {
@@ -302,6 +318,7 @@ const MONGO_COLLECTION_MAP: Record<string, string> = {
   kraTemplates: 'kra_templates',
   auditLogs: 'audit_logs',
   talentRecords: 'talent_records',
+  complianceFlags: 'compliance_flags',
 };
 
 export function getDbCollection<T extends { id?: string; _id?: any }>(collectionName: keyof typeof memoryDb): any {
@@ -335,90 +352,34 @@ async function seedMongoCollectionsIfEmpty(db: Db): Promise<void> {
   };
 
   await upsertCollection('users', SEED_USERS);
-  try {
-    const usersCol = getDbCollection('users');
-    await usersCol.deleteOne({ id: 'usr_hr_persona' });
-    await usersCol.deleteOne({ email: 'hr.admin@company.com' });
-    await usersCol.deleteMany({ role: 'HR', id: { $ne: 'usr_mgr_hr' } });
-    await usersCol.deleteOne({ id: 'usr_mgr_ta' });
-    await usersCol.deleteOne({ email: 'leo.hiring@company.com' });
-  } catch (_e) {
-    // Ignore if not present
-  }
   await upsertCollection('roles', SEED_ROLES);
   await upsertCollection('departments', SEED_DEPARTMENTS);
   await upsertCollection('designations', SEED_DESIGNATIONS);
-  try {
-    const desCol = getDbCollection('designations');
-    await desCol.deleteOne({ id: 'des_hr_ta' });
-  } catch (_e) {
-    // Ignore
-  }
   await upsertCollection('cycles', SEED_CYCLES);
   await upsertCollection('kras', SEED_KRAS);
   await upsertCollection('kraTemplates', SEED_KRA_TEMPLATES);
   await upsertCollection('employees', SEED_EMPLOYEES);
-  try {
-    const empCol = getDbCollection('employees');
-    await empCol.deleteOne({ id: 'emp_mgr_ta' });
-    await empCol.deleteOne({ email: 'leo.hiring@company.com' });
-  } catch (_e) {
-    // Ignore
-  }
 
   try {
     const periodCol = getDbCollection('reviewPeriods');
-    for (const p of SEED_REVIEW_PERIODS) {
-      await periodCol.updateOne({ id: p.id }, { $set: p }, { upsert: true });
+    const periodCount = await periodCol.countDocuments();
+    if (periodCount === 0) {
+      for (const p of SEED_REVIEW_PERIODS) {
+        await periodCol.updateOne({ id: p.id }, { $set: p }, { upsert: true });
+      }
     }
   } catch (_e) {
     await upsertCollection('reviewPeriods', SEED_REVIEW_PERIODS);
   }
+
   await upsertCollection('employeeReviews', SEED_EMPLOYEE_REVIEWS);
-  try {
-    const revCol = getDbCollection('employeeReviews');
-    await revCol.deleteMany({ employeeId: 'emp_mgr_ta' });
-  } catch (_e) {
-    // Ignore
-  }
   await upsertCollection('appraisals', SEED_APPRAISALS);
-  try {
-    const appCol = getDbCollection('appraisals');
-    await appCol.deleteMany({ employeeId: 'emp_mgr_ta' });
-    await appCol.deleteOne({ id: 'app_2026_leo' });
-  } catch (_e) {
-    // Ignore
-  }
   await upsertCollection('notifications', SEED_NOTIFICATIONS);
-  try {
-    const notifsCol = getDbCollection('notifications');
-    await notifsCol.deleteMany({ userId: 'usr_mgr_ta' });
-    await notifsCol.deleteOne({ id: 'notif_mgr_ta_1' });
-    await notifsCol.updateOne(
-      { id: 'notif_mgr_eng_1' },
-      { $set: { metadata: { periodId: 'period_2026_q1', status: 'MANAGER_PENDING' } } }
-    );
-  } catch (_e) {
-    // Ignore
-  }
   await upsertCollection('auditLogs', SEED_AUDIT_LOGS);
   await upsertCollection('feedback', SEED_FEEDBACK);
-  try {
-    const fbCol = getDbCollection('feedback');
-    await fbCol.deleteMany({ toEmployeeId: 'emp_mgr_ta' });
-    await fbCol.deleteOne({ id: 'fb_5' });
-  } catch (_e) {
-    // Ignore
-  }
   await upsertCollection('pips', SEED_PIPS);
   await upsertCollection('talentRecords', SEED_TALENT_RECORDS);
-  try {
-    const talCol = getDbCollection('talentRecords');
-    await talCol.deleteMany({ employeeId: 'emp_mgr_ta' });
-    await talCol.deleteOne({ id: 'tal_leo' });
-  } catch (_e) {
-    // Ignore
-  }
+  await upsertCollection('complianceFlags', SEED_COMPLIANCE_FLAGS);
 
   try {
     const revCol = getDbCollection('employeeReviews');

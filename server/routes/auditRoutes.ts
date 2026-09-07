@@ -17,15 +17,60 @@ export const auditRouter = Router();
 auditRouter.use(authenticateToken);
 auditRouter.use(requireRoles('SUPER_ADMIN', 'HR'));
 
-// In-memory backing arrays initialized with seed data if DB collection doesn't contain entries yet
-let localAuditLogs: AuditLogEntry[] = [...SEED_PHASE8_AUDIT_LOGS];
-let localComplianceFlags: ComplianceFlag[] = [...SEED_COMPLIANCE_FLAGS];
+// Database-backed collections for persistent compliance and audit trails
+async function ensureAuditDataInitialized(): Promise<void> {
+  const auditLogsCol = getDbCollection('auditLogs');
+  const complianceFlagsCol = getDbCollection('complianceFlags');
+
+  const auditCount = await auditLogsCol.countDocuments({});
+  if (auditCount === 0) {
+    await auditLogsCol.insertMany(SEED_PHASE8_AUDIT_LOGS as any[]);
+  }
+
+  const flagsCount = await complianceFlagsCol.countDocuments({});
+  if (flagsCount === 0) {
+    await complianceFlagsCol.insertMany(SEED_COMPLIANCE_FLAGS as any[]);
+  }
+}
+
+function normalizeAuditLog(doc: any): AuditLogEntry {
+  const action = doc.actionType || (doc.action ? String(doc.action).toUpperCase() : 'SYSTEM_ACTION');
+  return {
+    id: doc.id || (doc._id ? String(doc._id) : `aud_${Date.now()}`),
+    timestamp: doc.timestamp || doc.createdAt || new Date().toISOString(),
+    actionType: action as any,
+    module: doc.module || 'CYCLE_ADMIN',
+    severity: doc.severity || 'INFO',
+    actorId: doc.actorId || doc.userId || 'usr_system',
+    actorName: doc.actorName || doc.userName || 'System',
+    actorRole: doc.actorRole || doc.userRole || 'HR',
+    actorEmail: doc.actorEmail,
+    targetEmployeeId: doc.targetEmployeeId,
+    targetEmployeeName: doc.targetEmployeeName,
+    targetDepartment: doc.targetDepartment,
+    cycleId: doc.cycleId,
+    cycleName: doc.cycleName,
+    description: doc.description || doc.details || `${action} on ${doc.module || 'record'}`,
+    previousValue: doc.previousValue ?? doc.oldValue,
+    newValue: doc.newValue ?? doc.newValue,
+    diffSummary: doc.diffSummary,
+    ipAddress: doc.ipAddress || '127.0.0.1',
+    userAgent: doc.userAgent,
+    isFlaggedCompliance: doc.isFlaggedCompliance || false,
+    metadata: doc.metadata,
+  };
+}
 
 // ==========================================
 // 1. GET AUDIT LOGS WITH ADVANCED FILTERING
 // ==========================================
 auditRouter.get('/logs', async (req: AuthenticatedRequest, res: Response) => {
   try {
+    await ensureAuditDataInitialized();
+    const auditLogsCol = getDbCollection('auditLogs');
+    const rawLogs = await (await auditLogsCol.find({})).toArray();
+    let filtered: AuditLogEntry[] = rawLogs.map(normalizeAuditLog);
+
     const {
       searchTerm,
       module,
@@ -38,8 +83,6 @@ auditRouter.get('/logs', async (req: AuthenticatedRequest, res: Response) => {
       endDate,
       isFlaggedOnly,
     } = req.query;
-
-    let filtered = [...localAuditLogs];
 
     // Filter by Search Term
     if (searchTerm && typeof searchTerm === 'string' && searchTerm.trim() !== '') {
@@ -117,29 +160,37 @@ auditRouter.get('/logs', async (req: AuthenticatedRequest, res: Response) => {
 // ==========================================
 auditRouter.get('/summary', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const totalLogs = localAuditLogs.length;
+    await ensureAuditDataInitialized();
+    const auditLogsCol = getDbCollection('auditLogs');
+    const complianceFlagsCol = getDbCollection('complianceFlags');
+
+    const rawLogs = await (await auditLogsCol.find({})).toArray();
+    const logs: AuditLogEntry[] = rawLogs.map(normalizeAuditLog);
+    const flags: ComplianceFlag[] = await (await complianceFlagsCol.find({})).toArray();
+
+    const totalLogs = logs.length;
     
     // Count today's logs (or within last 48 hrs for active demo dataset)
     const now = new Date();
-    const todayLogsCount = localAuditLogs.filter((log) => {
+    const todayLogsCount = logs.filter((log) => {
       const logDate = new Date(log.timestamp);
       return (now.getTime() - logDate.getTime()) < 48 * 60 * 60 * 1000;
     }).length;
 
-    const calibrationsCount = localAuditLogs.filter(
+    const calibrationsCount = logs.filter(
       (log) => log.actionType === 'HOD_CALIBRATION_OVERRIDE'
     ).length;
 
-    const letterAcknowledgementsCount = localAuditLogs.filter(
+    const letterAcknowledgementsCount = logs.filter(
       (log) => log.actionType === 'LETTER_ACKNOWLEDGED'
     ).length;
 
-    const flaggedAnomaliesCount = localComplianceFlags.filter((f) => !f.isResolved).length;
+    const flaggedAnomaliesCount = flags.filter((f) => !f.isResolved).length;
 
     // Calculate enterprise compliance index (0 to 100%)
     // Base 100 minus active critical and warning flags
-    const activeCritical = localComplianceFlags.filter((f) => !f.isResolved && f.severity === 'CRITICAL').length;
-    const activeWarning = localComplianceFlags.filter((f) => !f.isResolved && f.severity === 'WARNING').length;
+    const activeCritical = flags.filter((f) => !f.isResolved && f.severity === 'CRITICAL').length;
+    const activeWarning = flags.filter((f) => !f.isResolved && f.severity === 'WARNING').length;
     const deduction = (activeCritical * 12) + (activeWarning * 6);
     const complianceScore = Math.max(50, Math.min(100, 100 - deduction));
 
@@ -218,134 +269,99 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
       },
       {
         id: `tl_${employeeId}_4`,
-        stageName: 'Quarter 3 Review',
+        stageName: 'Quarter 3 Review & Pre-Appraisal Alignment',
         stageKey: 'Q3_REVIEW',
         timestamp: '2026-06-25T16:00:00.000Z',
         actorName: employee.managerName || 'Reporting Manager',
         actorRole: 'MANAGER',
         status: 'COMPLETED',
         title: 'Q3 Evaluation Submitted',
-        description: 'Quarterly review completed with leadership initiative on key platform feature.',
+        description: 'Consistent performance on key architecture milestones with zero SLA breaches.',
         scoreBefore: 4.25,
-        scoreAfter: 4.40,
-        details: { rating: 'OUTSTANDING', onTimeSubmission: true },
+        scoreAfter: 4.30,
+        details: { rating: 'EXCEEDS_EXPECTATIONS', onTimeSubmission: true },
       },
       {
         id: `tl_${employeeId}_5`,
-        stageName: 'Quarter 4 Review & Rolling 4Q Rollup',
+        stageName: 'Quarter 4 Final Evaluation',
         stageKey: 'Q4_REVIEW',
         timestamp: '2026-09-01T09:30:00.000Z',
         actorName: employee.managerName || 'Reporting Manager',
         actorRole: 'MANAGER',
         status: 'COMPLETED',
-        title: 'Q4 Review & 4-Quarter Rollup Computed',
-        description: 'Completed final quarter evaluation. Rolling 4-quarter weighted aggregate score calculated at 4.35 / 5.0.',
-        scoreBefore: 4.40,
+        title: 'Q4 Evaluation Completed',
+        description: 'Annual evaluation completed. Aggregate year score computed at 4.35.',
+        scoreBefore: 4.30,
         scoreAfter: 4.35,
-        details: { annualScore: 4.35, status: 'MANAGER_RECOMMENDED' },
+        details: { rating: 'OUTSTANDING', onTimeSubmission: true },
+      },
+      {
+        id: `tl_${employeeId}_6`,
+        stageName: 'HOD Cross-Departmental Calibration',
+        stageKey: 'CALIBRATION',
+        timestamp: '2026-09-02T14:10:00.000Z',
+        actorName: 'Alice Johnson',
+        actorRole: 'HOD',
+        status: 'OVERRIDDEN',
+        title: 'HOD Bell-Curve Calibration Applied',
+        description: 'Score calibrated to 4.30 to meet departmental bell curve and quota distribution guidelines.',
+        scoreBefore: 4.35,
+        scoreAfter: 4.30,
+        changeReason: 'Alignment with 15% top-tier quota guidelines across the Engineering division.',
+        details: { variance: -0.05, justificationLogged: true },
+      },
+      {
+        id: `tl_${employeeId}_7`,
+        stageName: 'HR & Executive Increment Decision',
+        stageKey: 'INCREMENT_DECISION',
+        timestamp: '2026-09-03T11:45:00.000Z',
+        actorName: 'Frank HR Manager',
+        actorRole: 'HR',
+        status: 'COMPLETED',
+        title: 'Increment & Band Approved',
+        description: 'Recommended 12.5% salary increment with Band A promotional progression.',
+        details: { recommendedIncrement: 12.5, proposedPromotion: false },
+      },
+      {
+        id: `tl_${employeeId}_8`,
+        stageName: 'Appraisal Letter Release',
+        stageKey: 'LETTER_RELEASE',
+        timestamp: '2026-09-04T10:00:00.000Z',
+        actorName: 'Priya Sundaram',
+        actorRole: 'HR',
+        status: 'COMPLETED',
+        title: 'Digital Letter Dispatched to ESS Portal',
+        description: 'Formal appraisal letter issued and notification triggered to employee.',
+        details: { documentHash: 'sha256_e891bca7', deliveryChannel: 'ESS_IN_APP' },
       },
     ];
 
-    // If this employee had a calibration override (e.g. Rohan Gupta), add calibration diff event
-    if (employeeId === 'emp_dev_2') {
-      events.push({
-        id: `tl_${employeeId}_6`,
-        stageName: 'Department HOD Calibration & Normalization',
-        stageKey: 'CALIBRATION',
-        timestamp: '2026-09-01T11:45:00.000Z',
-        actorName: 'Vikram Mehta',
-        actorRole: 'HOD',
-        status: 'OVERRIDDEN',
-        title: 'Score Calibrated & Adjusted by HOD',
-        description: 'HOD adjusted normalized rating from 4.20 to 3.20 (-1.00 score delta) during departmental bell-curve calibration.',
-        scoreBefore: 4.20,
-        scoreAfter: 3.20,
-        changeReason: 'Major Q4 production incident on payment gateway not accounted for in manager draft evaluation.',
-        details: { overrideDelta: -1.0, flagId: 'flag_001' },
-      });
-    } else {
-      events.push({
-        id: `tl_${employeeId}_6`,
-        stageName: 'Department HOD Calibration & Normalization',
-        stageKey: 'CALIBRATION',
-        timestamp: '2026-09-01T11:15:00.000Z',
-        actorName: 'Vikram Mehta',
-        actorRole: 'HOD',
-        status: 'COMPLETED',
-        title: 'Bell Curve Calibration Confirmed',
-        description: 'Department Head reviewed and validated performance bucket alignment within 15% top-tier quota.',
-        scoreBefore: 4.35,
-        scoreAfter: 4.35,
-      });
-    }
-
-    // Increment Decision
-    events.push({
-      id: `tl_${employeeId}_7`,
-      stageName: 'Annual Increment & Merit Band Decision',
-      stageKey: 'INCREMENT_DECISION',
-      timestamp: '2026-09-01T15:20:00.000Z',
-      actorName: 'Priya Sundaram',
-      actorRole: 'HR',
-      status: 'COMPLETED',
-      title: 'Salary Revision & Promotion Formulated',
-      description: employeeId === 'emp_dev_2' 
-        ? 'Allocated 7.5% merit hike (₹82,500 increment) aligned with calibrated Meets Expectations band.'
-        : 'Approved 18.6% increment with Fast-Track Promotion to Senior Software Engineer (Band L4).',
-      details: { 
-        oldCtc: employee.baseSalary || 1450000, 
-        newCtc: employeeId === 'emp_dev_2' ? 1182500 : 1720000,
-        incrementPercent: employeeId === 'emp_dev_2' ? 7.5 : 18.6 
-      },
-    });
-
-    // Letter Release & Acknowledgement
-    if (employeeId === 'emp_sales_2') {
-      events.push({
-        id: `tl_${employeeId}_8`,
-        stageName: 'Digital Appraisal Letter Release',
-        stageKey: 'LETTER_RELEASE',
-        timestamp: '2026-08-15T10:00:00.000Z',
-        actorName: 'Priya Sundaram',
-        actorRole: 'HR',
-        status: 'FLAGGED',
-        title: 'Letter Published - Signature Pending',
-        description: 'Appraisal letter published to employee portal. Overdue for digital signature (>18 days).',
-      });
+    // If employee is in acknowledged state, add final stage
+    if (employee.id === 'emp_dev_1' || employee.id === 'emp_com_1') {
       events.push({
         id: `tl_${employeeId}_9`,
         stageName: 'Employee Digital Acknowledgement',
         stageKey: 'ACKNOWLEDGEMENT',
-        timestamp: 'PENDING',
-        actorName: 'Priya Iyer',
-        actorRole: 'EMPLOYEE',
-        status: 'PENDING',
-        title: 'Awaiting Employee Signature',
-        description: 'Employee has not yet submitted digital sign-off and OTP verification.',
-      });
-    } else {
-      events.push({
-        id: `tl_${employeeId}_8`,
-        stageName: 'Digital Appraisal Letter Release',
-        stageKey: 'LETTER_RELEASE',
-        timestamp: '2026-09-01T16:00:00.000Z',
-        actorName: 'Priya Sundaram',
-        actorRole: 'HR',
-        status: 'COMPLETED',
-        title: 'Appraisal Letter Released #AL-2026-CYF-001',
-        description: 'Official digital appraisal letter generated and sealed with corporate verification code.',
-      });
-      events.push({
-        id: `tl_${employeeId}_9`,
-        stageName: 'Employee Digital Acknowledgement',
-        stageKey: 'ACKNOWLEDGEMENT',
-        timestamp: '2026-09-01T17:45:15.000Z',
+        timestamp: '2026-09-04T15:20:00.000Z',
         actorName: employee.fullName,
         actorRole: 'EMPLOYEE',
         status: 'COMPLETED',
-        title: 'Digitally Acknowledged & Signed',
-        description: 'Employee confirmed and accepted revised terms via authenticated mobile session (IP: 49.36.128.45).',
-        details: { signatureHash: 'a7f89b...e21', ipAddress: '49.36.128.45' },
+        title: 'Letter Electronically Acknowledged',
+        description: 'Employee confirmed receipt and accepted terms digitally via ESS portal.',
+        details: { ipAddress: '192.168.1.108', method: 'DIGITAL_SIGNATURE' },
+      });
+    } else {
+      events.push({
+        id: `tl_${employeeId}_9`,
+        stageName: 'Employee Digital Acknowledgement',
+        stageKey: 'ACKNOWLEDGEMENT',
+        timestamp: '2026-09-05T00:00:00.000Z',
+        actorName: employee.fullName,
+        actorRole: 'EMPLOYEE',
+        status: 'PENDING',
+        title: 'Awaiting Employee Acknowledgement',
+        description: 'Letter published. Employee has not yet confirmed receipt.',
+        details: { reminderSentCount: 1 },
       });
     }
 
@@ -371,19 +387,27 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
 // ==========================================
 auditRouter.get('/compliance-health', async (_req: AuthenticatedRequest, res: Response) => {
   try {
-    const activeFlags = localComplianceFlags.filter((f) => !f.isResolved);
+    await ensureAuditDataInitialized();
+    const auditLogsCol = getDbCollection('auditLogs');
+    const complianceFlagsCol = getDbCollection('complianceFlags');
+
+    const flags: ComplianceFlag[] = await (await complianceFlagsCol.find({})).toArray();
+    const rawLogs = await (await auditLogsCol.find({})).toArray();
+    const logs: AuditLogEntry[] = rawLogs.map(normalizeAuditLog);
+
+    const activeFlags = flags.filter((f) => !f.isResolved);
     const criticalCount = activeFlags.filter((f) => f.severity === 'CRITICAL').length;
     const warningCount = activeFlags.filter((f) => f.severity === 'WARNING').length;
 
-    const overriddenScoresCount = localAuditLogs.filter(
+    const overriddenScoresCount = logs.filter(
       (log) => log.actionType === 'HOD_CALIBRATION_OVERRIDE'
     ).length;
 
-    const unacknowledgedLettersCount = localComplianceFlags.filter(
+    const unacknowledgedLettersCount = flags.filter(
       (f) => !f.isResolved && f.flagType === 'UNACKNOWLEDGED_LETTER'
     ).length;
 
-    const overdueSubmissionsCount = localComplianceFlags.filter(
+    const overdueSubmissionsCount = flags.filter(
       (f) => !f.isResolved && f.flagType === 'SUBMISSION_OVERDUE'
     ).length;
 
@@ -425,7 +449,7 @@ auditRouter.get('/compliance-health', async (_req: AuthenticatedRequest, res: Re
       overriddenScoresCount,
       unacknowledgedLettersCount,
       overdueSubmissionsCount,
-      flags: localComplianceFlags,
+      flags,
       departmentRiskBreakdown,
     };
 
@@ -443,46 +467,60 @@ auditRouter.get('/compliance-health', async (_req: AuthenticatedRequest, res: Re
 // ==========================================
 auditRouter.post('/flags/:flagId/resolve', async (req: AuthenticatedRequest, res: Response) => {
   try {
+    await ensureAuditDataInitialized();
+    const complianceFlagsCol = getDbCollection('complianceFlags');
+    const auditLogsCol = getDbCollection('auditLogs');
+
     const { flagId } = req.params;
     const { resolutionNote } = req.body;
 
-    const flagIndex = localComplianceFlags.findIndex((f) => f.id === flagId);
-    if (flagIndex === -1) {
+    const existingFlag = await complianceFlagsCol.findOne({ id: flagId });
+    if (!existingFlag) {
       return res.status(404).json({ success: false, error: `Compliance flag ${flagId} not found` });
     }
 
     const resolvedBy = req.user ? `${req.user.name} (${req.user.role})` : 'HR Compliance Officer';
-    localComplianceFlags[flagIndex] = {
-      ...localComplianceFlags[flagIndex],
-      isResolved: true,
-      resolvedAt: new Date().toISOString(),
-      resolvedBy,
-      resolutionNote: resolutionNote || 'Reviewed and approved by compliance administration.',
-    };
+    const now = new Date().toISOString();
+    const note = resolutionNote || 'Reviewed and approved by compliance administration.';
+
+    await complianceFlagsCol.updateOne(
+      { id: flagId },
+      {
+        $set: {
+          isResolved: true,
+          resolvedAt: now,
+          resolvedBy,
+          resolutionNote: note,
+        },
+      }
+    );
+
+    const updatedFlag = await complianceFlagsCol.findOne({ id: flagId });
 
     // Also add an audit log entry for this resolution
     const resolveLog: AuditLogEntry = {
       id: `aud_${Date.now()}`,
-      timestamp: new Date().toISOString(),
-      actionType: 'SECURITY_ROLE_CHANGED', // Or custom admin governance
+      timestamp: now,
+      actionType: 'SECURITY_ROLE_CHANGED',
       module: 'CYCLE_ADMIN',
       severity: 'INFO',
       actorId: req.user?.id || 'usr_admin',
       actorName: req.user?.name || 'Administrator',
       actorRole: req.user?.role || 'SUPER_ADMIN',
       actorEmail: req.user?.email,
-      description: `Resolved Compliance Flag [${localComplianceFlags[flagIndex].title}]: ${resolutionNote || 'Marked as compliant.'}`,
+      description: `Resolved Compliance Flag [${existingFlag.title}]: ${note}`,
       diffSummary: `Flag ${flagId} marked as RESOLVED by ${resolvedBy}`,
       ipAddress: req.ip || '127.0.0.1',
       userAgent: req.headers['user-agent'],
       isFlaggedCompliance: false,
     };
-    localAuditLogs.unshift(resolveLog);
+
+    await auditLogsCol.insertOne(resolveLog);
 
     res.json({
       success: true,
       message: 'Compliance flag resolved successfully',
-      flag: localComplianceFlags[flagIndex],
+      flag: updatedFlag,
     });
   } catch (error: any) {
     res.status(500).json({ success: false, error: error.message });
@@ -494,6 +532,9 @@ auditRouter.post('/flags/:flagId/resolve', async (req: AuthenticatedRequest, res
 // ==========================================
 auditRouter.post('/log', async (req: AuthenticatedRequest, res: Response) => {
   try {
+    await ensureAuditDataInitialized();
+    const auditLogsCol = getDbCollection('auditLogs');
+
     const body = req.body;
     const newEntry: AuditLogEntry = {
       id: `aud_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
@@ -520,7 +561,7 @@ auditRouter.post('/log', async (req: AuthenticatedRequest, res: Response) => {
       metadata: body.metadata,
     };
 
-    localAuditLogs.unshift(newEntry);
+    await auditLogsCol.insertOne(newEntry);
 
     res.json({
       success: true,
@@ -536,9 +577,13 @@ auditRouter.post('/log', async (req: AuthenticatedRequest, res: Response) => {
 // ==========================================
 auditRouter.get('/export', async (req: AuthenticatedRequest, res: Response) => {
   try {
+    await ensureAuditDataInitialized();
+    const auditLogsCol = getDbCollection('auditLogs');
     const { format = 'json', module } = req.query;
 
-    let dataset = [...localAuditLogs];
+    const rawLogs = await (await auditLogsCol.find({})).toArray();
+    let dataset: AuditLogEntry[] = rawLogs.map(normalizeAuditLog);
+
     if (module && module !== 'ALL') {
       dataset = dataset.filter((d) => d.module === module);
     }

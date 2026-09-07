@@ -1,4 +1,5 @@
 import { Router, Response } from 'express';
+import bcrypt from 'bcryptjs';
 import { getDbCollection } from '../db.js';
 import { AuthenticatedRequest, authenticateToken, requireRoles } from '../auth.js';
 import {
@@ -441,18 +442,21 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
           const desigObj = await findOrCreateDesig(row.designation, deptObj.id);
           const cycleId = mapCycleCodeToId(row.cycleCode);
 
+          const numericCtc = Number(row.baseSalary || row.currentCtc) || 1200000;
           const empPayload: any = {
             employeeCode: code,
             name,
             email,
             joiningDate: row.joiningDate || new Date().toISOString().split('T')[0],
             cycleId,
+            cycleCode: row.cycleCode?.replace('CYCLE_', '') || 'A',
             departmentId: deptObj.id,
             departmentName: deptObj.name,
             designationId: desigObj.id,
             designationName: desigObj.title || desigObj.name,
             managerEmployeeCode: row.managerCode ? String(row.managerCode).trim().toUpperCase() : undefined,
-            baseSalary: Number(row.baseSalary) || 1200000,
+            currentCtc: numericCtc,
+            currency: '₹',
             status: (row.status || 'ACTIVE').toUpperCase(),
             phone: row.phone || row.phoneNumber || '+91 98765 43210',
             updatedAt: new Date().toISOString(),
@@ -468,19 +472,28 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
             await employeesCol.insertOne(empPayload);
 
             // Also provision user login record
-            const role: UserRole = (row.role && ['EMPLOYEE', 'MANAGER', 'HOD', 'HR_ADMIN', 'CXO'].includes(row.role.toUpperCase()))
-              ? (row.role.toUpperCase() as UserRole)
-              : 'EMPLOYEE';
+            const candidateRole = row.role ? String(row.role).toUpperCase().replace(/[\s\-_]+/g, '') : '';
+            let role: UserRole = 'EMPLOYEE';
+            if (candidateRole === 'HR' || candidateRole === 'HRADMIN') role = 'HR';
+            else if (candidateRole === 'MANAGER' || candidateRole === 'MGR') role = 'MANAGER';
+            else if (candidateRole === 'HOD') role = 'HOD';
+            else if (candidateRole === 'SUPERADMIN' || candidateRole === 'ADMIN') role = 'SUPER_ADMIN';
+            else if (candidateRole === 'MANAGEMENT' || candidateRole === 'CXO') role = 'MANAGEMENT';
+
+            const tempPassword = `Welcome@${new Date().getFullYear()}`;
+            const passwordHash = bcrypt.hashSync(tempPassword, 10);
 
             await usersCol.insertOne({
               id: `usr_${Math.random().toString(36).substr(2, 9)}`,
               name,
               email,
               role,
+              roleId: `role_${role.toLowerCase()}`,
               departmentId: deptObj.id,
               employeeId: newId,
-              passwordHash: '$2a$10$w8.3hJgM3v/Zz1a2b3c4d5e6f7g8h9i0j1k2l3m4n5o6p7q8r9s0t', // seeded hash for testing
-              isActive: true,
+              passwordHash,
+              active: true,
+              mustChangePassword: true,
               createdAt: new Date().toISOString(),
             });
 
@@ -510,38 +523,47 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
             departmentId: deptObj.id,
             designationId: desigObj.id,
             cycleId,
-            weightage,
-            targetMetric: {
-              type: row.measurementUnit || 'PERCENTAGE',
-              targetValue: String(row.targetValue || '100'),
-              unit: row.measurementUnit || '%',
-              description: row.targetDescription || '',
-            },
-            status: 'ACTIVE',
+            metricType: row.measurementUnit || 'PERCENTAGE',
+            targetUnit: row.measurementUnit || '%',
+            active: true,
             createdAt: new Date().toISOString(),
           };
 
           await krasCol.insertOne(newKra);
 
-          // Find or create template grouping
+          // Find or create template grouping with standard KraItem structure
+          const kraItem = {
+            id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+            kraId,
+            title: kTitle,
+            description: row.targetDescription || `Target for ${kTitle}`,
+            target: String(row.targetValue || '100% Target SLA'),
+            weight: weightage,
+            measurementCriteria: row.measurementCriteria || `${row.measurementUnit || '%'}: 1=Below, 3=Meets, 5=Exceeds`,
+          };
+
           let existingTemplate = await kraTemplatesCol.findOne({ title: tTitle, departmentId: deptObj.id });
           if (existingTemplate) {
-            const currentKras = existingTemplate.kras || [];
-            currentKras.push(newKra);
-            await kraTemplatesCol.updateOne({ id: existingTemplate.id }, { $set: { kras: currentKras, updatedAt: new Date().toISOString() } });
+            const currentItems = existingTemplate.items || [];
+            currentItems.push(kraItem);
+            const totalWeight = currentItems.reduce((sum: number, it: any) => sum + (Number(it.weight) || 0), 0);
+            await kraTemplatesCol.updateOne(
+              { id: existingTemplate.id },
+              { $set: { items: currentItems, totalWeight, updatedAt: new Date().toISOString() } }
+            );
             updatedCount++;
           } else {
             const newTemplate = {
               id: `kratpl_${Math.random().toString(36).substr(2, 9)}`,
               title: tTitle,
               departmentId: deptObj.id,
+              departmentName: deptObj.name,
               designationId: desigObj.id,
+              designationName: desigObj.title || desigObj.name,
               cycleId,
-              description: `Bulk imported template for ${tTitle}`,
-              totalWeightage: weightage,
-              kras: [newKra],
-              status: 'PUBLISHED',
-              version: 1,
+              totalWeight: weightage,
+              items: [kraItem],
+              active: true,
               createdAt: new Date().toISOString(),
             };
             await kraTemplatesCol.insertOne(newTemplate);
@@ -560,7 +582,7 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
             continue;
           }
 
-          // Update or insert quarterly review
+          // Update or insert quarterly review with canonical field names
           const periodCode = String(row.periodCode || 'Q1_2026').trim().toUpperCase();
           const existingReview = await reviewsCol.findOne({ employeeId: emp.id });
 
@@ -570,10 +592,9 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
               {
                 $set: {
                   status: (row.status || 'MANAGER_COMPLETED').toUpperCase(),
-                  managerOverallScore: mgrScore,
-                  selfOverallScore: selfScore,
-                  finalCalculatedScore: mgrScore,
-                  managerSummary: comments,
+                  finalScore: mgrScore,
+                  selfScore: selfScore,
+                  managerOverallComments: comments,
                   updatedAt: new Date().toISOString(),
                 },
               }
@@ -588,12 +609,14 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
               employeeName: emp.name,
               departmentId: emp.departmentId,
               cycleId: emp.cycleId,
-              periodCode,
+              reviewPeriodId: periodCode,
+              reviewPeriodName: periodCode,
               status: (row.status || 'MANAGER_COMPLETED').toUpperCase(),
-              selfOverallScore: selfScore,
-              managerOverallScore: mgrScore,
-              finalCalculatedScore: mgrScore,
-              managerSummary: comments,
+              selfScore: selfScore,
+              finalScore: mgrScore,
+              managerOverallComments: comments,
+              isClosed: false,
+              kraSnapshot: [],
               createdAt: new Date().toISOString(),
             });
             insertedCount++;
@@ -608,8 +631,11 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
           }
 
           const incPct = Number(row.proposedIncrementPercent) || 10;
-          const bonus = Number(row.bonusAmount) || 0;
           const rating = String(row.finalRating || 'MEETS_EXPECTATIONS').toUpperCase();
+          const currentCtc = Number(emp.currentCtc) || 1200000;
+          const incrementAmount = Math.round((currentCtc * incPct) / 100);
+          const revisedCtc = currentCtc + incrementAmount;
+          const promoRec = Boolean(row.promotedDesignation || row.promotionRecommended === true || row.promotionRecommended === 'true');
 
           const existingAppr = await appraisalsCol.findOne({ employeeId: emp.id });
           if (existingAppr) {
@@ -618,11 +644,13 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
               {
                 $set: {
                   finalRating: rating,
-                  proposedIncrement: incPct,
-                  proposedBonus: bonus,
-                  promotedDesignation: row.promotedDesignation || undefined,
-                  hodComments: row.hodNotes || 'Calibrated via bulk increment matrix',
-                  status: 'CALIBRATED',
+                  proposedIncrementPercentage: incPct,
+                  approvedIncrementPercentage: incPct,
+                  incrementAmount,
+                  revisedCtc,
+                  promotionRecommended: promoRec,
+                  hodCalibrationNotes: row.hodNotes || 'Calibrated via bulk increment matrix',
+                  status: 'HOD_CALIBRATED',
                   updatedAt: new Date().toISOString(),
                 },
               }
@@ -637,13 +665,19 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
               employeeName: emp.name,
               cycleId: emp.cycleId,
               departmentId: emp.departmentId,
+              currentCtc,
+              currency: emp.currency || '₹',
               finalRating: rating,
-              proposedIncrement: incPct,
-              proposedBonus: bonus,
-              promotedDesignation: row.promotedDesignation || undefined,
-              hodComments: row.hodNotes || 'Calibrated via bulk increment matrix',
-              status: 'CALIBRATED',
+              recommendedRating: rating,
+              proposedIncrementPercentage: incPct,
+              approvedIncrementPercentage: incPct,
+              incrementAmount,
+              revisedCtc,
+              promotionRecommended: promoRec,
+              hodCalibrationNotes: row.hodNotes || 'Calibrated via bulk increment matrix',
+              status: 'HOD_CALIBRATED',
               createdAt: new Date().toISOString(),
+              updatedAt: new Date().toISOString(),
             });
             insertedCount++;
           }
@@ -728,27 +762,27 @@ bulkRouter.get('/export/:type', async (req: AuthenticatedRequest, res: Response)
         'Full Name': e.name,
         'Work Email': e.email,
         'Joining Date': e.joiningDate,
-        'Cycle Code': cycleMap.get(e.cycleId) || e.cycleId,
+        'Cycle Code': cycleMap.get(e.cycleId) || e.cycleCode || e.cycleId,
         'Department': deptMap.get(e.departmentId) || e.departmentName || 'Engineering',
         'Designation': desigMap.get(e.designationId) || e.designationName || 'Staff',
         'Reporting Manager Code': e.managerEmployeeCode || '',
-        'Base Annual CTC (₹)': e.baseSalary || 1200000,
+        'Base Annual CTC (₹)': e.currentCtc || e.baseSalary || 1200000,
         'Status': e.status || 'ACTIVE',
         'Phone': e.phone || '',
       }));
     } else if (datasetType === 'kras') {
       const templates = await (await kraTemplatesCol.find({})).toArray();
       exportRows = templates.flatMap((tpl) => {
-        return (tpl.kras || []).map((k: any) => ({
-          'Template Title': tpl.title,
-          'Department': deptMap.get(tpl.departmentId) || 'Engineering',
-          'Designation': desigMap.get(tpl.designationId) || 'Software Engineer',
+        const items = tpl.items || tpl.kras || [];
+        return items.map((k: any) => ({
+          'Template Title': tpl.title || tpl.name || 'General Template',
+          'Department': deptMap.get(tpl.departmentId) || tpl.departmentName || 'Engineering',
+          'Designation': desigMap.get(tpl.designationId) || tpl.designationName || 'Software Engineer',
           'Cycle Code': cycleMap.get(tpl.cycleId) || 'ALL',
-          'KRA Title': k.title,
-          'Weightage (%)': k.weightage,
-          'Target Description': k.targetMetric?.description || k.description || '',
-          'Unit': k.targetMetric?.type || 'PERCENTAGE',
-          'Target Value': k.targetMetric?.targetValue || '100',
+          'KRA Title': k.title || k.kraName || 'KRA',
+          'Weightage (%)': k.weight || k.weightage || 0,
+          'Target Description': k.target || k.description || '',
+          'Measurement Criteria': k.measurementCriteria || '',
         }));
       });
     } else if (datasetType === 'quarterly-scores') {
@@ -756,11 +790,11 @@ bulkRouter.get('/export/:type', async (req: AuthenticatedRequest, res: Response)
       exportRows = reviews.map((r) => ({
         'Employee Code': r.employeeCode || '',
         'Employee Name': r.employeeName || '',
-        'Quarter Period': r.periodCode || 'Q1_2026',
-        'Self Score (1-5)': r.selfOverallScore || 0,
-        'Manager Score (1-5)': r.managerOverallScore || 0,
-        'Final Score': r.finalCalculatedScore || 0,
-        'Manager Feedback': r.managerSummary || '',
+        'Quarter Period': r.reviewPeriodName || r.periodCode || 'Q1',
+        'Self Score (1-5)': r.selfScore ?? r.selfOverallScore ?? 0,
+        'Manager Score (1-5)': r.finalScore ?? r.managerOverallScore ?? 0,
+        'Final Score': r.finalScore ?? r.finalCalculatedScore ?? 0,
+        'Manager Feedback': r.managerOverallComments || r.managerSummary || '',
         'Status': r.status || 'DRAFT',
       }));
     } else if (datasetType === 'increment-matrix') {
@@ -769,12 +803,14 @@ bulkRouter.get('/export/:type', async (req: AuthenticatedRequest, res: Response)
         'Employee Code': a.employeeCode || '',
         'Employee Name': a.employeeName || '',
         'Cycle Code': cycleMap.get(a.cycleId) || a.cycleId,
-        'Final Rating': a.finalRating || 'MEETS_EXPECTATIONS',
-        'Proposed Increment (%)': a.proposedIncrement || 0,
-        'Bonus Amount (₹)': a.proposedBonus || 0,
-        'Promoted Designation': a.promotedDesignation || '',
+        'Final Rating': a.finalRating || a.recommendedRating || 'MEETS_EXPECTATIONS',
+        'Proposed Increment (%)': a.proposedIncrementPercentage ?? a.proposedIncrement ?? 0,
+        'Approved Increment (%)': a.approvedIncrementPercentage ?? a.proposedIncrementPercentage ?? 0,
+        'Current CTC (₹)': a.currentCtc || 0,
+        'Revised CTC (₹)': a.revisedCtc || 0,
+        'Promotion Recommended': a.promotionRecommended ? 'YES' : 'NO',
         'Status': a.status || 'DRAFT',
-        'HOD Calibration Notes': a.hodComments || '',
+        'HOD Calibration Notes': a.hodCalibrationNotes || a.hodComments || '',
       }));
     }
 

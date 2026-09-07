@@ -272,7 +272,12 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
         incrementAmount,
         revisedCtc,
         promotionRecommended: false,
-        effectiveDate: `${appraisalYear}-${String((empCycle?.appraisalMonth || 1) + 1).padStart(2, '0')}-01`,
+        effectiveDate: (() => {
+          const m = empCycle?.appraisalMonth || 1;
+          const effMonth = (m % 12) + 1;
+          const effYear = m === 12 ? appraisalYear + 1 : appraisalYear;
+          return `${effYear}-${String(effMonth).padStart(2, '0')}-01`;
+        })(),
         status: 'PENDING',
         isLocked: false,
         createdAt: new Date().toISOString(),

@@ -1,6 +1,7 @@
 import express, { Response } from 'express';
 import { getDbCollection } from '../db.js';
 import { authenticateToken, requireRoles, recordAuditLog, AuthenticatedRequest } from '../auth.js';
+import { validateBody, SubmitSelfAssessmentSchema, SubmitManagerReviewSchema } from '../validation.js';
 import {
   EmployeeReview,
   ReviewPeriod,
@@ -158,7 +159,20 @@ reviewRouter.get('/reviews', async (req: AuthenticatedRequest, res: Response) =>
     const reviewCol = getDbCollection('employeeReviews');
     const employeesCol = getDbCollection('employees');
 
-    let reviews: EmployeeReview[] = await (await reviewCol.find({})).toArray();
+    const reviewQuery: any = {};
+    if (req.user?.role === 'EMPLOYEE' && req.user?.employeeId) {
+      reviewQuery.employeeId = req.user.employeeId;
+    } else if (employeeId) {
+      reviewQuery.employeeId = employeeId;
+    }
+    if (periodId && periodId !== 'ALL') {
+      reviewQuery.reviewPeriodId = periodId;
+    }
+    if (status && status !== 'ALL') {
+      reviewQuery.status = status;
+    }
+
+    let reviews: EmployeeReview[] = await (await reviewCol.find(reviewQuery)).toArray();
     const allEmployees: Employee[] = await (await employeesCol.find({})).toArray();
     const empMap = new Map<string, Employee>();
     allEmployees.forEach((e) => empMap.set(e.id, e));
@@ -583,8 +597,8 @@ reviewRouter.post(
           cycleCode: emp.cycleCode,
           cycleColor: emp.cycleColor || '#1e3a8a',
           isAppraisalMonthDue,
-          managerId: emp.managerId || emp.hodId || 'emp_mgr_eng',
-          managerName: emp.managerName || emp.hodName || 'Engineering Manager',
+          managerId: emp.managerId || emp.hodId || '',
+          managerName: emp.managerName || emp.hodName || 'Unassigned Manager',
           status: 'MANAGER_PENDING',
           finalScore: 0,
           kraSnapshot,
@@ -647,7 +661,10 @@ reviewRouter.post(
  * Updates review scores (ratings 1-5, achievements, comments) and recalculates finalScore
  * Managers, HODs, HR, and Super Admins
  */
-reviewRouter.put('/reviews/:id/score', async (req: AuthenticatedRequest, res: Response) => {
+reviewRouter.put(
+  '/reviews/:id/score',
+  validateBody(SubmitManagerReviewSchema),
+  async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const {
@@ -774,7 +791,7 @@ reviewRouter.put('/reviews/:id/score', async (req: AuthenticatedRequest, res: Re
       // Notify HR
       await notifsCol.insertOne({
         id: `notif_${Date.now()}_hr`,
-        userId: 'usr_mgr_hr',
+        userId: 'ALL',
         userRole: 'HR',
         type: 'MANAGER_SUBMITTED',
         title: `Quarterly Review Scored: ${existing.employeeName}`,
@@ -915,7 +932,10 @@ reviewRouter.put(
  * PUT /api/reviews/:id/self-assess
  * Employee submits their quarterly self-evaluation (self ratings, self achievements, strengths, obstacles)
  */
-reviewRouter.put('/reviews/:id/self-assess', async (req: AuthenticatedRequest, res: Response) => {
+reviewRouter.put(
+  '/reviews/:id/self-assess',
+  validateBody(SubmitSelfAssessmentSchema),
+  async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const {

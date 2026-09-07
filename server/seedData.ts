@@ -30,9 +30,9 @@ export const SEED_ROLES: Role[] = [
 ];
 
 export const SEED_DEPARTMENTS: Department[] = [
-  { id: 'dept_eng', name: 'Engineering', code: 'ENG', hodId: 'emp_hod_eng', hodName: 'Alice Engineering HOD', active: true, createdAt: '2024-01-01T00:00:00.000Z' },
-  { id: 'dept_sales', name: 'Sales', code: 'SLS', hodId: 'emp_hod_sales', hodName: 'Bob Sales HOD', active: true, createdAt: '2024-01-01T00:00:00.000Z' },
-  { id: 'dept_hr', name: 'Human Resources', code: 'HR', hodId: 'emp_hod_hr', hodName: 'Carol HR HOD', active: true, createdAt: '2024-01-01T00:00:00.000Z' }
+  { id: 'dept_eng', name: 'Engineering', code: 'ENG', hodId: 'emp_hod_eng', hodName: 'Alice Engineering HOD', budgetCapPercent: 14.0, active: true, createdAt: '2024-01-01T00:00:00.000Z' },
+  { id: 'dept_sales', name: 'Sales', code: 'SLS', hodId: 'emp_hod_sales', hodName: 'Bob Sales HOD', budgetCapPercent: 10.0, active: true, createdAt: '2024-01-01T00:00:00.000Z' },
+  { id: 'dept_hr', name: 'Human Resources', code: 'HR', hodId: 'emp_hod_hr', hodName: 'Carol HR HOD', budgetCapPercent: 8.5, active: true, createdAt: '2024-01-01T00:00:00.000Z' }
 ];
 
 export const SEED_DESIGNATIONS: Designation[] = [

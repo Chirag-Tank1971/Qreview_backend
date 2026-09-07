@@ -1,7 +1,18 @@
 import express, { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { getDbCollection, getDatabaseStatus } from '../db.js';
-import { generateToken, authenticateToken, verifyTokenString, recordAuditLog, AuthenticatedRequest } from '../auth.js';
+import {
+  generateToken,
+  generateAccessToken,
+  generateRefreshToken,
+  verifyRefreshToken,
+  revokeUserSessions,
+  authenticateToken,
+  verifyTokenString,
+  recordAuditLog,
+  AuthenticatedRequest,
+} from '../auth.js';
+import { validateBody, LoginSchema, ChangePasswordSchema, RefreshTokenSchema } from '../validation.js';
 import { SEED_USERS } from '../seedData.js';
 import { User, Employee, Role, UserRole } from '../../src/types.js';
 
@@ -42,16 +53,12 @@ function clearFailures(ip: string) {
 
 /**
  * POST /api/auth/login
- * Authenticates user by email and password
+ * Authenticates user by email and password with runtime input validation and token lifecycle support
  */
-authRouter.post('/login', async (req: Request, res: Response) => {
+authRouter.post('/login', validateBody(LoginSchema), async (req: Request, res: Response) => {
   try {
     const { email, password } = req.body;
     const ip = getClientIp(req);
-
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password are required.' });
-    }
 
     const usersCol = getDbCollection('users');
     let user = await usersCol.findOne({ email: email.toLowerCase().trim() });
@@ -87,6 +94,8 @@ authRouter.post('/login', async (req: Request, res: Response) => {
           roleId: `role_${inferredRole.toLowerCase()}`,
           active: emp.status !== 'INACTIVE',
           passwordHash: defaultHash,
+          mustChangePassword: true,
+          tokenVersion: 1,
           createdAt: emp.createdAt || new Date().toISOString(),
         };
 
@@ -110,11 +119,8 @@ authRouter.post('/login', async (req: Request, res: Response) => {
       return res.status(403).json({ error: 'Account is deactivated. Contact system administrator.' });
     }
 
-    // Verify password with bcrypt
-    let isPasswordValid = bcrypt.compareSync(password, user.passwordHash);
-    if (!isPasswordValid && (password === 'password123' || password === 'Welcome@2026')) {
-      isPasswordValid = true;
-    }
+    // Strict cryptographic verification against user's stored bcrypt hash
+    const isPasswordValid = Boolean(user.passwordHash && bcrypt.compareSync(password, user.passwordHash));
     if (!isPasswordValid) {
       const failCount = recordFailure(ip);
       const remainingAttempts = Math.max(0, MAX_LOGIN_ATTEMPTS - failCount);
@@ -126,12 +132,19 @@ authRouter.post('/login', async (req: Request, res: Response) => {
     // ✅ Successful login — clear the fail counter
     clearFailures(ip);
 
-    const token = generateToken(user);
+    const tokenVersion = user.tokenVersion ?? 1;
+    const token = generateAccessToken(user);
+    const refreshToken = generateRefreshToken(user, tokenVersion);
 
-    // Update last login
+    // Update last login and ensure tokenVersion is stored
     await usersCol.updateOne(
       { id: user.id },
-      { $set: { lastLoginAt: new Date().toISOString() } }
+      {
+        $set: {
+          lastLoginAt: new Date().toISOString(),
+          tokenVersion: tokenVersion,
+        },
+      }
     );
 
     // Fetch employee profile if exists
@@ -169,11 +182,13 @@ authRouter.post('/login', async (req: Request, res: Response) => {
       avatarUrl: user.avatarUrl,
       lastLoginAt: new Date().toISOString(),
       mustChangePassword: (user as any).mustChangePassword,
+      tokenVersion: tokenVersion,
       createdAt: user.createdAt,
     };
 
     res.json({
       token,
+      refreshToken,
       user: safeUser,
       employeeProfile,
       permissions: roleRecord ? roleRecord.permissions : [],
@@ -204,6 +219,8 @@ authRouter.get('/me', authenticateToken, async (req: AuthenticatedRequest, res: 
     active: req.user.active,
     avatarUrl: req.user.avatarUrl,
     lastLoginAt: req.user.lastLoginAt,
+    mustChangePassword: (req.user as any).mustChangePassword ?? false,
+    tokenVersion: req.user.tokenVersion,
     createdAt: req.user.createdAt,
   };
 
@@ -243,6 +260,11 @@ authRouter.get('/demo-users', async (_req: Request, res: Response) => {
  */
 authRouter.post('/switch-role', async (req: Request, res: Response) => {
   try {
+    // Production Security Guard: Persona switching is strictly for development/staging environments
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(403).json({ error: 'Role switching is strictly prohibited in production mode.' });
+    }
+
     const { role, userId } = req.body || {};
     const usersCol = getDbCollection('users');
     let allUsers: any[] = [];
@@ -367,7 +389,9 @@ authRouter.post('/switch-role', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Demo user not found for requested role.' });
     }
 
-    const token = generateToken(targetUser);
+    const tokenVersion = targetUser.tokenVersion ?? 1;
+    const token = generateAccessToken(targetUser);
+    const refreshToken = generateRefreshToken(targetUser, tokenVersion);
 
     let employeeProfile: Employee | null = null;
     if (targetUser.employeeId) {
@@ -397,11 +421,13 @@ authRouter.post('/switch-role', async (req: Request, res: Response) => {
       active: targetUser.active ?? true,
       avatarUrl: targetUser.avatarUrl,
       lastLoginAt: new Date().toISOString(),
+      tokenVersion: tokenVersion,
       createdAt: targetUser.createdAt,
     };
 
     res.json({
       token,
+      refreshToken,
       user: safeUser,
       employeeProfile,
       permissions: roleRecord ? roleRecord.permissions : [],
@@ -414,6 +440,7 @@ authRouter.post('/switch-role', async (req: Request, res: Response) => {
 
 /**
  * POST /api/auth/logout
+ * Invalidates session and revokes refresh tokens on logout
  */
 authRouter.post('/logout', async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -422,6 +449,8 @@ authRouter.post('/logout', async (req: AuthenticatedRequest, res: Response) => {
     if (token) {
       const user = await verifyTokenString(token);
       if (user) {
+        // Invalidate active session tokens on logout
+        await revokeUserSessions(user.id);
         await recordAuditLog(
           user.id,
           user.name,
@@ -431,7 +460,7 @@ authRouter.post('/logout', async (req: AuthenticatedRequest, res: Response) => {
           user.id,
           '',
           '',
-          `User ${user.email} logged out`
+          `User ${user.email} logged out (sessions invalidated)`
         );
       }
     }
@@ -456,25 +485,38 @@ authRouter.get('/system/db-status', async (_req: Request, res: Response) => {
 
 /**
  * POST /api/auth/refresh
- * Re-issues a fresh JWT if the current token is still valid.
- * Called silently by the frontend before the token expires.
+ * Exchanges a valid, unrevoked Refresh Token for a fresh short-lived Access Token
+ * and rotated Refresh Token. Also supports backward-compatibility with unexpired access tokens.
  */
 authRouter.post('/refresh', async (req: Request, res: Response) => {
   try {
     const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
+    const headerToken = authHeader && authHeader.split(' ')[1];
+    const refreshToken = req.body?.refreshToken || headerToken;
 
-    if (!token) {
-      return res.status(401).json({ error: 'No token provided.' });
+    if (!refreshToken) {
+      return res.status(401).json({ error: 'Refresh token is required.' });
     }
 
-    const user = await verifyTokenString(token);
+    // 1. First attempt verification as a dedicated refresh token (checks tokenVersion revocation)
+    const refreshResult = await verifyRefreshToken(refreshToken);
+    let user: User | null = refreshResult?.user || null;
+
+    // 2. Backward compatibility fallback: if passed an unexpired access token, verify it
     if (!user) {
-      return res.status(401).json({ error: 'Token is invalid or user is no longer active.' });
+      user = await verifyTokenString(refreshToken);
     }
 
-    // Issue fresh token
-    const newToken = generateToken(user);
+    if (!user || user.active === false) {
+      return res.status(401).json({
+        error: 'Your session has expired or has been revoked. Please sign in again.',
+        code: 'SESSION_REVOKED',
+      });
+    }
+
+    const currentVersion = user.tokenVersion ?? 1;
+    const newAccessToken = generateAccessToken(user);
+    const newRefreshToken = generateRefreshToken(user, currentVersion);
 
     // Fetch employee profile if exists
     let employeeProfile: Employee | null = null;
@@ -502,11 +544,13 @@ authRouter.post('/refresh', async (req: Request, res: Response) => {
       avatarUrl: user.avatarUrl,
       lastLoginAt: user.lastLoginAt,
       mustChangePassword: (user as any).mustChangePassword,
+      tokenVersion: currentVersion,
       createdAt: user.createdAt,
     };
 
     res.json({
-      token: newToken,
+      token: newAccessToken,
+      refreshToken: newRefreshToken,
       user: safeUser,
       employeeProfile,
       permissions: roleRecord ? roleRecord.permissions : [],
@@ -518,85 +562,163 @@ authRouter.post('/refresh', async (req: Request, res: Response) => {
 });
 
 /**
- * PUT /api/auth/change-password
- * Allows an authenticated user to change their password.
- * Clears mustChangePassword flag on success.
+ * POST /api/auth/revoke-sessions
+ * Terminates all active sessions across all devices for the calling user,
+ * or for a target employee if called by a SUPER_ADMIN / HR.
  */
-authRouter.put('/change-password', authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+authRouter.post('/revoke-sessions', authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required.' });
     }
 
-    const { newPassword, confirmPassword } = req.body;
+    const targetUserId = req.body?.userId;
+    let userIdToRevoke = req.user.id;
 
-    if (!newPassword || !confirmPassword) {
-      return res.status(400).json({ error: 'New password and confirmation are required.' });
-    }
-
-    if (newPassword !== confirmPassword) {
-      return res.status(400).json({ error: 'Passwords do not match.' });
-    }
-
-    if (newPassword.length < 8) {
-      return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
-    }
-
-    // Reject default/weak passwords
-    const forbidden = ['password123', 'Welcome@2026', 'password', '12345678', 'admin123'];
-    if (forbidden.includes(newPassword.toLowerCase())) {
-      return res.status(400).json({ error: 'This password is too common. Please choose a stronger password.' });
-    }
-
-    const usersCol = getDbCollection('users');
-    const passwordHash = bcrypt.hashSync(newPassword, 12);
-
-    await usersCol.updateOne(
-      { id: req.user.id },
-      {
-        $set: {
-          passwordHash,
-          mustChangePassword: false,
-          passwordChangedAt: new Date().toISOString(),
-        },
+    if (targetUserId && targetUserId !== req.user.id) {
+      if (req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'HR') {
+        return res.status(403).json({ error: 'Only administrators can revoke sessions of other users.' });
       }
-    );
+      userIdToRevoke = targetUserId;
+    }
 
-    // Record audit
+    await revokeUserSessions(userIdToRevoke);
+
     await recordAuditLog(
       req.user.id,
       req.user.name,
       req.user.role,
       'AUTHENTICATION',
-      'PASSWORD_CHANGED',
-      req.user.id,
+      'SESSIONS_REVOKED',
+      userIdToRevoke,
       '',
       '',
-      `User ${req.user.email} changed their password`
+      `All active sessions revoked for user ${userIdToRevoke} by ${req.user.email}`
     );
 
-    // Return updated user (with mustChangePassword: false)
-    const updatedUser = await usersCol.findOne({ id: req.user.id });
-    const safeUser: User = {
-      id: req.user.id,
-      employeeId: req.user.employeeId,
-      email: req.user.email,
-      name: req.user.name,
-      role: req.user.role,
-      roleId: req.user.roleId,
-      active: req.user.active,
-      avatarUrl: req.user.avatarUrl,
-      lastLoginAt: req.user.lastLoginAt,
-      mustChangePassword: false,
-      createdAt: req.user.createdAt,
-    };
-
-    // Issue a fresh token (now without mustChangePassword)
-    const newToken = generateToken(req.user);
-
-    res.json({ success: true, user: safeUser, token: newToken });
-  } catch (error: any) {
-    console.error('Change password error:', error);
-    res.status(500).json({ error: 'Failed to change password.' });
+    res.json({
+      success: true,
+      message: 'All active sessions have been revoked successfully across all devices.',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to revoke sessions.' });
   }
 });
+
+/**
+ * POST /api/auth/logout
+ * Securely signs out the user and revokes their active sessions and refresh tokens on the server
+ */
+authRouter.post('/logout', authenticateToken, async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    if (req.user?.id) {
+      await revokeUserSessions(req.user.id);
+
+      await recordAuditLog(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        'AUTHENTICATION',
+        'LOGOUT',
+        req.user.id,
+        '',
+        '',
+        `User ${req.user.email} signed out and active session tokens were revoked.`
+      );
+    }
+
+    res.json({
+      success: true,
+      message: 'Logged out successfully and server session was invalidated.',
+    });
+  } catch (err: any) {
+    console.error('Logout error:', err);
+    res.status(500).json({ error: 'Failed to complete logout.' });
+  }
+});
+
+/**
+ * PUT /api/auth/change-password
+ * Allows an authenticated user to change their password with Zod validation.
+ * Clears mustChangePassword flag and revokes all old sessions across all devices.
+ */
+authRouter.put(
+  '/change-password',
+  authenticateToken,
+  validateBody(ChangePasswordSchema),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({ error: 'Authentication required.' });
+      }
+
+      const { newPassword } = req.body;
+
+      // Reject common/weak passwords
+      const forbidden = ['password123', 'Welcome@2026', 'password', '12345678', 'admin123'];
+      if (forbidden.includes(newPassword.toLowerCase())) {
+        return res.status(400).json({ error: 'This password is too common. Please choose a stronger password.' });
+      }
+
+      const usersCol = getDbCollection('users');
+      const passwordHash = bcrypt.hashSync(newPassword, 12);
+
+      // Increment tokenVersion by 1 to invalidate all old active sessions across all devices
+      const updatedTokenVersion = ((req.user as any).tokenVersion ?? 1) + 1;
+
+      await usersCol.updateOne(
+        { id: req.user.id },
+        {
+          $set: {
+            passwordHash,
+            mustChangePassword: false,
+            passwordChangedAt: new Date().toISOString(),
+            tokenVersion: updatedTokenVersion,
+          },
+        }
+      );
+
+      // Record audit
+      await recordAuditLog(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        'AUTHENTICATION',
+        'PASSWORD_CHANGED',
+        req.user.id,
+        '',
+        '',
+        `User ${req.user.email} changed their password (previous sessions invalidated)`
+      );
+
+      const safeUser: User = {
+        id: req.user.id,
+        employeeId: req.user.employeeId,
+        email: req.user.email,
+        name: req.user.name,
+        role: req.user.role,
+        roleId: req.user.roleId,
+        active: req.user.active,
+        avatarUrl: req.user.avatarUrl,
+        lastLoginAt: req.user.lastLoginAt,
+        mustChangePassword: false,
+        tokenVersion: updatedTokenVersion,
+        createdAt: req.user.createdAt,
+      };
+
+      // Issue fresh access & refresh tokens with the new tokenVersion
+      const newToken = generateAccessToken(safeUser);
+      const newRefreshToken = generateRefreshToken(safeUser, updatedTokenVersion);
+
+      res.json({
+        success: true,
+        user: safeUser,
+        token: newToken,
+        refreshToken: newRefreshToken,
+      });
+    } catch (error: any) {
+      console.error('Change password error:', error);
+      res.status(500).json({ error: 'Failed to change password.' });
+    }
+  }
+);

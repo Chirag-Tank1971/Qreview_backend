@@ -1,6 +1,7 @@
 import express, { Response } from 'express';
 import { getDbCollection } from '../db.js';
 import { authenticateToken, requireRoles, recordAuditLog, AuthenticatedRequest } from '../auth.js';
+import { validateBody, CreateKraSchema, UpdateKraSchema, KraTemplateSchema } from '../validation.js';
 import { Kra, KraTemplate, KraItem } from '../../src/types.js';
 
 export const kraRouter = express.Router();
@@ -47,7 +48,11 @@ kraRouter.get('/kras', async (req: AuthenticatedRequest, res: Response) => {
  * POST /api/kras
  * Admin/HR/HOD only
  */
-kraRouter.post('/kras', requireRoles('SUPER_ADMIN', 'HR', 'HOD'), async (req: AuthenticatedRequest, res: Response) => {
+kraRouter.post(
+  '/kras',
+  requireRoles('SUPER_ADMIN', 'HR', 'HOD'),
+  validateBody(CreateKraSchema),
+  async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { title, description, category, metricType, targetUnit, departmentId } = req.body;
 
@@ -102,7 +107,11 @@ kraRouter.post('/kras', requireRoles('SUPER_ADMIN', 'HR', 'HOD'), async (req: Au
 /**
  * PUT /api/kras/:id
  */
-kraRouter.put('/kras/:id', requireRoles('SUPER_ADMIN', 'HR', 'HOD'), async (req: AuthenticatedRequest, res: Response) => {
+kraRouter.put(
+  '/kras/:id',
+  requireRoles('SUPER_ADMIN', 'HR', 'HOD'),
+  validateBody(UpdateKraSchema),
+  async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { title, description, category, metricType, targetUnit, departmentId, active } = req.body;
@@ -214,7 +223,11 @@ kraRouter.get('/kra-templates/:id', async (req: AuthenticatedRequest, res: Respo
  * POST /api/kra-templates
  * Strictly validates that the sum of item weights = 100%
  */
-kraRouter.post('/kra-templates', requireRoles('SUPER_ADMIN', 'HR', 'HOD'), async (req: AuthenticatedRequest, res: Response) => {
+kraRouter.post(
+  '/kra-templates',
+  requireRoles('SUPER_ADMIN', 'HR', 'HOD'),
+  validateBody(KraTemplateSchema),
+  async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { title, departmentId, designationId, items, description } = req.body;
 

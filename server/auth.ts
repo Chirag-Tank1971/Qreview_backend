@@ -4,7 +4,22 @@ import { Request, Response, NextFunction } from 'express';
 import { getDbCollection } from './db.js';
 import { User, UserRole, Employee, Role } from '../src/types.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'quarterly_review_appraisal_jwt_secret_key_2026';
+const DEFAULT_SECRET = 'quarterly_review_appraisal_jwt_secret_key_2026';
+if (process.env.NODE_ENV === 'production') {
+  if (!process.env.JWT_SECRET || process.env.JWT_SECRET === DEFAULT_SECRET || process.env.JWT_SECRET.length < 32) {
+    console.error(
+      '[Security Fatal] Production deployment detected without a secure, high-entropy JWT_SECRET! ' +
+      'Set JWT_SECRET environment variable with at least 32 characters to protect token signing.'
+    );
+    throw new Error('FATAL: A strong, unique JWT_SECRET (>= 32 chars) must be provided in production mode.');
+  }
+}
+
+const JWT_SECRET = process.env.JWT_SECRET || DEFAULT_SECRET;
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || `${JWT_SECRET}_refresh_key_2026`;
+
+export const ACCESS_TOKEN_EXPIRY = '15m';
+export const REFRESH_TOKEN_EXPIRY = '7d';
 
 export interface AuthenticatedRequest extends Request {
   user?: User;
@@ -13,7 +28,10 @@ export interface AuthenticatedRequest extends Request {
   permissions?: string[];
 }
 
-export function generateToken(user: User): string {
+/**
+ * Generates a short-lived access token (15 minutes)
+ */
+export function generateAccessToken(user: User): string {
   return jwt.sign(
     {
       id: user.id,
@@ -21,10 +39,92 @@ export function generateToken(user: User): string {
       role: user.role,
       name: user.name,
       employeeId: user.employeeId,
+      type: 'access',
     },
     JWT_SECRET,
-    { expiresIn: '7d' }
+    { expiresIn: ACCESS_TOKEN_EXPIRY }
   );
+}
+
+/**
+ * Generates a long-lived refresh token (7 days) tied to the user's current tokenVersion
+ */
+export function generateRefreshToken(user: User, tokenVersion: number = 1): string {
+  return jwt.sign(
+    {
+      id: user.id,
+      email: user.email,
+      tokenVersion,
+      type: 'refresh',
+    },
+    JWT_REFRESH_SECRET,
+    { expiresIn: REFRESH_TOKEN_EXPIRY }
+  );
+}
+
+/**
+ * Backward-compatible helper that returns the access token
+ */
+export function generateToken(user: User): string {
+  return generateAccessToken(user);
+}
+
+/**
+ * Verifies a refresh token and checks that the user's tokenVersion has not been incremented/revoked
+ */
+export async function verifyRefreshToken(refreshToken: string): Promise<{ user: User; tokenVersion: number } | null> {
+  try {
+    const decoded = jwt.verify(refreshToken, JWT_REFRESH_SECRET) as any;
+    if (!decoded || decoded.type !== 'refresh' || !decoded.id) {
+      return null;
+    }
+
+    const usersCol = getDbCollection('users');
+    let user = await usersCol.findOne({ id: decoded.id });
+    if (!user && decoded.email) {
+      user = await usersCol.findOne({ email: String(decoded.email).toLowerCase().trim() });
+    }
+
+    if (!user) {
+      const { SEED_USERS } = await import('./seedData.js');
+      user = SEED_USERS.find(
+        (u) =>
+          u.id === decoded.id ||
+          (decoded.email && u.email.toLowerCase() === String(decoded.email).toLowerCase().trim())
+      ) || null;
+    }
+
+    if (!user || user.active === false) {
+      return null;
+    }
+
+    // Strict revocation check: verify tokenVersion matches current user record
+    const currentVersion = user.tokenVersion ?? 1;
+    const tokenVersion = decoded.tokenVersion ?? 1;
+    if (currentVersion !== tokenVersion) {
+      // Session has been revoked!
+      return null;
+    }
+
+    return { user, tokenVersion: currentVersion };
+  } catch (err) {
+    return null;
+  }
+}
+
+/**
+ * Revokes all active refresh tokens for a user by incrementing tokenVersion
+ */
+export async function revokeUserSessions(userId: string): Promise<void> {
+  try {
+    const usersCol = getDbCollection('users');
+    await usersCol.updateOne(
+      { $or: [{ id: userId }, { employeeId: userId }] },
+      { $inc: { tokenVersion: 1 } }
+    );
+  } catch (err) {
+    console.error('Failed to revoke user sessions:', err);
+  }
 }
 
 export async function verifyTokenString(token: string): Promise<User | null> {

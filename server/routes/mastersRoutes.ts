@@ -33,7 +33,7 @@ mastersRouter.get('/departments', async (req: AuthenticatedRequest, res: Respons
  */
 mastersRouter.post('/departments', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { name, code, hodId, hodName } = req.body;
+    const { name, code, hodId, hodName, budgetCapPercent } = req.body;
     if (!name || !code) {
       return res.status(400).json({ error: 'Department name and code are required.' });
     }
@@ -44,12 +44,21 @@ mastersRouter.post('/departments', requireRoles('SUPER_ADMIN', 'HR'), async (req
       return res.status(400).json({ error: `Department code ${code} already exists.` });
     }
 
+    let parsedBudgetCap = 12.0;
+    if (budgetCapPercent !== undefined && budgetCapPercent !== null && budgetCapPercent !== '') {
+      const parsed = Number(budgetCapPercent);
+      if (!isNaN(parsed) && parsed >= 0 && parsed <= 100) {
+        parsedBudgetCap = Number(parsed.toFixed(2));
+      }
+    }
+
     const newDept: Department = {
       id: `dept_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
       name: name.trim(),
       code: code.toUpperCase().trim(),
       hodId: hodId || undefined,
       hodName: hodName || undefined,
+      budgetCapPercent: parsedBudgetCap,
       active: true,
       createdAt: new Date().toISOString(),
     };
@@ -66,7 +75,7 @@ mastersRouter.post('/departments', requireRoles('SUPER_ADMIN', 'HR'), async (req
         newDept.id,
         '',
         newDept.name,
-        `Created department ${newDept.name} (${newDept.code})`
+        `Created department ${newDept.name} (${newDept.code}) with budget cap ${parsedBudgetCap}%`
       );
     }
 
@@ -82,7 +91,7 @@ mastersRouter.post('/departments', requireRoles('SUPER_ADMIN', 'HR'), async (req
 mastersRouter.put('/departments/:id', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { name, code, hodId, hodName, active } = req.body;
+    const { name, code, hodId, hodName, active, budgetCapPercent } = req.body;
 
     const deptCol = getDbCollection('departments');
     const dept = await deptCol.findOne({ id });
@@ -96,6 +105,12 @@ mastersRouter.put('/departments/:id', requireRoles('SUPER_ADMIN', 'HR'), async (
     if (hodId !== undefined) updateData.hodId = hodId;
     if (hodName !== undefined) updateData.hodName = hodName;
     if (active !== undefined) updateData.active = Boolean(active);
+    if (budgetCapPercent !== undefined && budgetCapPercent !== null && budgetCapPercent !== '') {
+      const parsed = Number(budgetCapPercent);
+      if (!isNaN(parsed) && parsed >= 0 && parsed <= 100) {
+        updateData.budgetCapPercent = Number(parsed.toFixed(2));
+      }
+    }
 
     await deptCol.updateOne({ id }, { $set: updateData });
     const updated = await deptCol.findOne({ id });
@@ -975,16 +990,19 @@ mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Respo
         if (n.userId && n.userId !== 'ALL') {
           const isUserMatch = n.userId === currentUser.id;
           const isEmpMatch = currentUser.employeeId && n.userId === currentUser.employeeId;
-          return isUserMatch || isEmpMatch;
+          // If the alert is role-targeted (e.g. userRole: 'HR') and current user has that role,
+          // deliver it to all members of that role (or SUPER_ADMIN) even if a legacy seed userId is present
+          const isRoleMatch = n.userRole && (n.userRole === currentUser.role || (currentUser.role === 'SUPER_ADMIN' && n.userRole === 'HR'));
+          return isUserMatch || isEmpMatch || isRoleMatch;
         }
 
         // 2. If notification targets ALL users
         if (n.userId === 'ALL') {
-          if (!n.userRole || n.userRole === currentUser.role) return true;
+          if (!n.userRole || n.userRole === currentUser.role || currentUser.role === 'SUPER_ADMIN') return true;
         }
 
         // 3. Broadcast to a specific role with no specific userId
-        if (!n.userId && n.userRole && n.userRole === currentUser.role) {
+        if (!n.userId && n.userRole && (n.userRole === currentUser.role || currentUser.role === 'SUPER_ADMIN')) {
           return true;
         }
 

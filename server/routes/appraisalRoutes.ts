@@ -3,6 +3,13 @@ import { getDbCollection } from '../db.js';
 import { authenticateToken, requireRoles, AuthenticatedRequest, recordAuditLog } from '../auth.js';
 import { syncAllActiveEmployees } from '../syncHelpers.js';
 import {
+  validateBody,
+  ManagerRecommendationSchema,
+  HodCalibrationSchema,
+  HrApprovalSchema,
+  AcknowledgementSchema,
+} from '../validation.js';
+import {
   Appraisal,
   AppraisalQuarterRecord,
   AppraisalSummaryStats,
@@ -71,7 +78,26 @@ appraisalRouter.get('/appraisals', async (req: AuthenticatedRequest, res: Respon
     const appraisalsCol = getDbCollection('appraisals');
     const employeesCol = getDbCollection('employees');
 
-    let appraisals: Appraisal[] = await (await appraisalsCol.find({})).toArray();
+    const appraisalFilter: any = {};
+    if (user.role === 'EMPLOYEE' && user.employeeId) {
+      appraisalFilter.employeeId = user.employeeId;
+    }
+    if (cycleId && cycleId !== 'ALL') {
+      appraisalFilter.cycleId = cycleId;
+    }
+    if (year) {
+      const targetYear = parseInt(year as string, 10);
+      if (!isNaN(targetYear)) appraisalFilter.appraisalYear = targetYear;
+    }
+    if (month) {
+      const targetMonth = parseInt(month as string, 10);
+      if (!isNaN(targetMonth)) appraisalFilter.appraisalMonth = targetMonth;
+    }
+    if (status && status !== 'ALL') {
+      appraisalFilter.status = status;
+    }
+
+    let appraisals: Appraisal[] = await (await appraisalsCol.find(appraisalFilter)).toArray();
     const allEmployees: Employee[] = await (await employeesCol.find({})).toArray();
     const empMap = new Map<string, Employee>();
     allEmployees.forEach((e) => empMap.set(e.id, e));
@@ -346,7 +372,7 @@ appraisalRouter.get(
       const totalCurrentPayroll = allAppraisals.reduce((acc, a) => acc + (a.currentCtc || 0), 0);
       const totalRevisedPayroll = allAppraisals.reduce((acc, a) => acc + (a.revisedCtc || a.currentCtc || 0), 0);
       const totalBudgetSpent = totalRevisedPayroll - totalCurrentPayroll;
-      const totalBudgetCap = totalCurrentPayroll * 0.12; // 12% target organizational budget cap
+      let totalBudgetCap = totalCurrentPayroll * 0.12; // 12% organizational default fallback
 
       const totalScore = allAppraisals.reduce((acc, a) => acc + (a.averageQuarterlyScore || 0), 0);
       const averageScore = totalAppraisals > 0 ? Number((totalScore / totalAppraisals).toFixed(2)) : 0;
@@ -380,7 +406,7 @@ appraisalRouter.get(
         );
         const headcount = deptAppraisals.length;
         const currentCtc = deptAppraisals.reduce((sum, a) => sum + (a.currentCtc || 0), 0);
-        const budgetCapPercent = 12.0; // 12% departmental cap
+        const budgetCapPercent = typeof dept.budgetCapPercent === 'number' && dept.budgetCapPercent >= 0 ? dept.budgetCapPercent : 12.0;
         const allocatedBudgetAmount = currentCtc * (budgetCapPercent / 100);
         const revisedCtc = deptAppraisals.reduce((sum, a) => sum + (a.revisedCtc || a.currentCtc || 0), 0);
         const actualSpentAmount = revisedCtc - currentCtc;
@@ -494,6 +520,11 @@ appraisalRouter.get(
           ],
         });
       });
+
+      const sumAllocatedDepts = departmentBudgets.reduce((acc, d) => acc + (d.allocatedBudgetAmount || 0), 0);
+      if (sumAllocatedDepts > 0) {
+        totalBudgetCap = sumAllocatedDepts;
+      }
 
       // High Performer Retention & Flight Risk Insights
       const attritionRiskInsights: any[] = [];
@@ -769,7 +800,12 @@ appraisalRouter.post(
           incrementAmount,
           revisedCtc,
           promotionRecommended: false,
-          effectiveDate: `${appraisalYear}-${String(cycle.appraisalMonth + 1).padStart(2, '0')}-01`,
+          effectiveDate: (() => {
+            const m = cycle.appraisalMonth || 1;
+            const effMonth = (m % 12) + 1;
+            const effYear = m === 12 ? appraisalYear + 1 : appraisalYear;
+            return `${effYear}-${String(effMonth).padStart(2, '0')}-01`;
+          })(),
           status: 'PENDING',
           isLocked: false,
           createdAt: existing ? existing.createdAt : new Date().toISOString(),
@@ -835,6 +871,7 @@ appraisalRouter.post(
 appraisalRouter.put(
   '/appraisals/:id/manager-recommend',
   requireRoles('MANAGER', 'SUPER_ADMIN', 'HR'),
+  validateBody(ManagerRecommendationSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const user = req.user;
@@ -953,6 +990,7 @@ appraisalRouter.put(
 appraisalRouter.put(
   '/appraisals/:id/hod-calibrate',
   requireRoles('HOD', 'SUPER_ADMIN', 'HR'),
+  validateBody(HodCalibrationSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const user = req.user;
@@ -1023,14 +1061,14 @@ appraisalRouter.put(
       const notifsCol = getDbCollection('notifications');
       await notifsCol.insertOne({
         id: `notif_${Date.now()}`,
-        userId: 'usr_mgr_hr',
+        userId: 'ALL',
         userRole: 'HR',
         type: 'HOD_ACTION_REQUIRED',
         title: `Appraisal Calibrated: ${appraisal.employeeName}`,
         message: `${user?.name || 'HOD'} calibrated appraisal for ${appraisal.employeeName} (${finalInc}% increment). Ready for HR final approval.`,
         isRead: false,
         priority: 'HIGH',
-        metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals', status: 'CALIBRATED' },
+        metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals', status: 'HOD_CALIBRATED', openDetail: true },
         createdAt: new Date().toISOString(),
       });
 
@@ -1064,6 +1102,7 @@ appraisalRouter.put(
 appraisalRouter.put(
   '/appraisals/:id/hr-approve',
   requireRoles('HR', 'SUPER_ADMIN'),
+  validateBody(HrApprovalSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const user = req.user;
@@ -1347,7 +1386,10 @@ appraisalRouter.get('/appraisals/:id/letter', async (req: AuthenticatedRequest, 
  * PUT /api/appraisals/:id/acknowledge
  * Employee digitally acknowledges and accepts their finalized appraisal letter
  */
-appraisalRouter.put('/appraisals/:id/acknowledge', async (req: AuthenticatedRequest, res: Response) => {
+appraisalRouter.put(
+  '/appraisals/:id/acknowledge',
+  validateBody(AcknowledgementSchema),
+  async (req: AuthenticatedRequest, res: Response) => {
   try {
     const user = req.user;
     const { id } = req.params;
@@ -1406,7 +1448,7 @@ appraisalRouter.put('/appraisals/:id/acknowledge', async (req: AuthenticatedRequ
     const notificationsCol = getDbCollection('notifications');
     await notificationsCol.insertOne({
       id: `notif_${Date.now()}`,
-      userId: 'usr_mgr_hr',
+      userId: 'ALL',
       userRole: 'HR',
       type: 'LETTER_ACKNOWLEDGED',
       title: 'Appraisal Letter Acknowledged',

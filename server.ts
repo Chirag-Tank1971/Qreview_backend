@@ -21,8 +21,44 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
   // Middleware
-  app.use(cors());
+  const allowedOrigins = process.env.ALLOWED_ORIGINS
+    ? process.env.ALLOWED_ORIGINS.split(',').map((s) => s.trim())
+    : ['http://localhost:5173', 'http://localhost:3000', 'http://127.0.0.1:5173', 'http://127.0.0.1:3000'];
+
+  app.use(
+    cors({
+      origin: (origin, callback) => {
+        if (!origin) return callback(null, true);
+        if (
+          process.env.NODE_ENV !== 'production' ||
+          allowedOrigins.includes(origin) ||
+          allowedOrigins.includes('*')
+        ) {
+          return callback(null, true);
+        }
+        return callback(new Error(`CORS policy does not allow access from origin: ${origin}`));
+      },
+      credentials: true,
+    })
+  );
+
+  // Essential HTTP security headers
+  app.use((_req, res, next) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+    res.setHeader('X-XSS-Protection', '1; mode=block');
+    next();
+  });
+
   app.use(express.json());
+
+  // Error middleware for malformed JSON payloads
+  app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (err instanceof SyntaxError && 'body' in err) {
+      return res.status(400).json({ error: 'Malformed JSON payload provided.' });
+    }
+    next(err);
+  });
 
   // Rate limiter: max 10 login attempts per IP per 15 minutes
   const loginRateLimiter = rateLimit({
@@ -88,7 +124,18 @@ async function startServer() {
     app.get('*', (_req, res) => {
       res.sendFile(path.join(frontendDist, 'index.html'));
     });
+  } else {
+    // Return standard JSON 404 for unmatched API routes
+    app.use('/api', (_req, res) => {
+      res.status(404).json({ error: 'API endpoint not found.' });
+    });
   }
+
+  // Global unhandled error handler ensures JSON error response rather than HTML stack trace
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    console.error('[Unhandled Server Error]', err);
+    res.status(500).json({ error: 'An unexpected server error occurred.' });
+  });
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`[Applet] Server running on http://0.0.0.0:${PORT}`);
