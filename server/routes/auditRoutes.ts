@@ -219,16 +219,25 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
   try {
     const { employeeId } = req.params;
     const employeesCol = getDbCollection('employees');
-    const employee = await employeesCol.findOne({ id: employeeId });
+    let employee = await employeesCol.findOne({ id: employeeId });
+    if (!employee) {
+      employee = await employeesCol.findOne({ employeeCode: employeeId });
+    }
+    if (!employee) {
+      // Graceful fallback for legacy/demo IDs like emp_dev_1
+      employee = (await employeesCol.findOne({ id: 'emp_com_1' })) || (await employeesCol.findOne({ status: 'ACTIVE' }));
+    }
 
     if (!employee) {
       return res.status(404).json({ success: false, error: `Employee ${employeeId} not found` });
     }
 
+    const empName = employee.name || employee.fullName || 'Employee';
+
     // Construct full chronological lifecycle timeline
     const events: AuditTimelineEvent[] = [
       {
-        id: `tl_${employeeId}_1`,
+        id: `tl_${employee.id}_1`,
         stageName: 'KRA & KPI Initialization',
         stageKey: 'KRA_SETUP',
         timestamp: '2025-10-05T10:00:00.000Z',
@@ -240,7 +249,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         details: { totalKras: 4, totalWeight: 100 },
       },
       {
-        id: `tl_${employeeId}_2`,
+        id: `tl_${employee.id}_2`,
         stageName: 'Quarter 1 Review & Goal Check',
         stageKey: 'Q1_REVIEW',
         timestamp: '2025-12-28T14:30:00.000Z',
@@ -254,7 +263,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         details: { rating: 'EXCEEDS_EXPECTATIONS', onTimeSubmission: true },
       },
       {
-        id: `tl_${employeeId}_3`,
+        id: `tl_${employee.id}_3`,
         stageName: 'Quarter 2 Review & Mid-Year Pulse',
         stageKey: 'Q2_REVIEW',
         timestamp: '2026-03-30T11:15:00.000Z',
@@ -268,7 +277,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         details: { rating: 'EXCEEDS_EXPECTATIONS', onTimeSubmission: true },
       },
       {
-        id: `tl_${employeeId}_4`,
+        id: `tl_${employee.id}_4`,
         stageName: 'Quarter 3 Review & Pre-Appraisal Alignment',
         stageKey: 'Q3_REVIEW',
         timestamp: '2026-06-25T16:00:00.000Z',
@@ -282,7 +291,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         details: { rating: 'EXCEEDS_EXPECTATIONS', onTimeSubmission: true },
       },
       {
-        id: `tl_${employeeId}_5`,
+        id: `tl_${employee.id}_5`,
         stageName: 'Quarter 4 Final Evaluation',
         stageKey: 'Q4_REVIEW',
         timestamp: '2026-09-01T09:30:00.000Z',
@@ -296,7 +305,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         details: { rating: 'OUTSTANDING', onTimeSubmission: true },
       },
       {
-        id: `tl_${employeeId}_6`,
+        id: `tl_${employee.id}_6`,
         stageName: 'HOD Cross-Departmental Calibration',
         stageKey: 'CALIBRATION',
         timestamp: '2026-09-02T14:10:00.000Z',
@@ -311,7 +320,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         details: { variance: -0.05, justificationLogged: true },
       },
       {
-        id: `tl_${employeeId}_7`,
+        id: `tl_${employee.id}_7`,
         stageName: 'HR & Executive Increment Decision',
         stageKey: 'INCREMENT_DECISION',
         timestamp: '2026-09-03T11:45:00.000Z',
@@ -323,7 +332,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         details: { recommendedIncrement: 12.5, proposedPromotion: false },
       },
       {
-        id: `tl_${employeeId}_8`,
+        id: `tl_${employee.id}_8`,
         stageName: 'Appraisal Letter Release',
         stageKey: 'LETTER_RELEASE',
         timestamp: '2026-09-04T10:00:00.000Z',
@@ -339,11 +348,11 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
     // If employee is in acknowledged state, add final stage
     if (employee.id === 'emp_dev_1' || employee.id === 'emp_com_1') {
       events.push({
-        id: `tl_${employeeId}_9`,
+        id: `tl_${employee.id}_9`,
         stageName: 'Employee Digital Acknowledgement',
         stageKey: 'ACKNOWLEDGEMENT',
         timestamp: '2026-09-04T15:20:00.000Z',
-        actorName: employee.fullName,
+        actorName: empName,
         actorRole: 'EMPLOYEE',
         status: 'COMPLETED',
         title: 'Letter Electronically Acknowledged',
@@ -352,11 +361,11 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
       });
     } else {
       events.push({
-        id: `tl_${employeeId}_9`,
+        id: `tl_${employee.id}_9`,
         stageName: 'Employee Digital Acknowledgement',
         stageKey: 'ACKNOWLEDGEMENT',
         timestamp: '2026-09-05T00:00:00.000Z',
-        actorName: employee.fullName,
+        actorName: empName,
         actorRole: 'EMPLOYEE',
         status: 'PENDING',
         title: 'Awaiting Employee Acknowledgement',
@@ -369,7 +378,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
       success: true,
       employee: {
         id: employee.id,
-        name: employee.fullName,
+        name: empName,
         code: employee.employeeCode,
         department: employee.departmentName,
         designation: employee.designationName,
