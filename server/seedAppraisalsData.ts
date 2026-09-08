@@ -991,6 +991,21 @@ export const SEED_PIPS: PipRecord[] = [
     durationDays: 60,
     status: 'active',
     overallProgress: 50,
+    cycleNumber: 1,
+    signatures: {
+      managerSign: {
+        signedBy: 'Eve Sales Manager',
+        signedAt: '2026-02-01T10:00:00.000Z',
+        role: 'MANAGER',
+        comments: 'Plan initiated with agreed quarterly sales performance objectives.'
+      },
+      employeeAck: {
+        signedBy: 'Jack Sales Rep',
+        signedAt: '2026-02-02T11:00:00.000Z',
+        role: 'EMPLOYEE',
+        comments: 'Acknowledged requirements and milestone schedule.'
+      }
+    },
     coreGaps: [
       'Shortfall in qualified outbound sales pipeline volume',
       'Lower than benchmark deal conversion rate in enterprise discovery calls',

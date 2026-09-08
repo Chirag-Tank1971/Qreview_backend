@@ -5,6 +5,9 @@ import { authenticateToken, AuthenticatedRequest } from '../auth.js';
 import {
   FeedbackEntry,
   PipRecord,
+  PipSignatureEntry,
+  PipStatus,
+  PipFinalOutcome,
   TalentRecord,
   AiReviewSynthesisRequest,
   AiReviewSynthesisResult,
@@ -603,10 +606,17 @@ aiAndFeedbackRouter.get('/pips', async (req: AuthenticatedRequest, res) => {
   }
 });
 
-// POST create PIP
-aiAndFeedbackRouter.post('/pips', async (req, res) => {
+// POST create PIP with multi-cycle repeat detection
+aiAndFeedbackRouter.post('/pips', async (req: AuthenticatedRequest, res) => {
   try {
     const data: Partial<PipRecord> = req.body;
+    const pipsCol = getDbCollection('pips');
+
+    // Check for prior historical PIP cycles for this employee
+    const existingPips = await (await pipsCol.find({ employeeId: data.employeeId })).toArray();
+    const cycleNumber = existingPips.length + 1;
+    const previousPip = existingPips.length > 0 ? existingPips[existingPips.length - 1] : null;
+
     const newPip: PipRecord = {
       id: `pip_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       employeeId: data.employeeId!,
@@ -617,19 +627,41 @@ aiAndFeedbackRouter.post('/pips', async (req, res) => {
       managerId: data.managerId || 'usr_manager',
       managerName: data.managerName || 'Reporting Manager',
       startDate: data.startDate || new Date().toISOString().split('T')[0],
-      targetEndDate: data.targetEndDate || new Date(Date.now() + 60 * 86400000).toISOString().split('T')[0],
-      durationDays: data.durationDays || 60,
+      targetEndDate: data.targetEndDate || new Date(Date.now() + (data.durationDays || 60) * 86400000).toISOString().split('T')[0],
+      durationDays: (data.durationDays as 30 | 60 | 90) || 60,
       status: 'active',
-      overallProgress: data.overallProgress || 0,
+      overallProgress: 0,
+      cycleNumber,
+      previousPipId: previousPip?.id,
+      previousPipOutcome: previousPip
+        ? `${previousPip.finalOutcome?.outcome || previousPip.status} (Cycle ${previousPip.cycleNumber || 1})`
+        : undefined,
       coreGaps: data.coreGaps || [],
-      milestones: data.milestones || [],
+      milestones: (data.milestones || []).map((m, idx) => ({
+        ...m,
+        id: m.id || `ms_${Date.now()}_${idx}`,
+        status: m.status || 'pending',
+      })),
       checkins: data.checkins || [],
+      signatures: {
+        managerSign: {
+          signedBy: req.user?.name || data.managerName || 'Initiating Manager',
+          signedAt: new Date().toISOString(),
+          role: 'MANAGER',
+          comments: 'Plan initiated with coaching objectives and deliverables.',
+        },
+        hrSign: {
+          signedBy: req.userRole === 'HR' || req.userRole === 'SUPER_ADMIN' ? (req.user?.name || 'HR Compliance') : 'HR Operations',
+          signedAt: new Date().toISOString(),
+          role: 'HR',
+          comments: 'Approved by HR Operations under legal talent governance.',
+        },
+      },
       finalOutcomeNotes: data.finalOutcomeNotes,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
 
-    const pipsCol = getDbCollection('pips');
     await pipsCol.insertOne(newPip);
     res.status(201).json(newPip);
   } catch (err: any) {
@@ -683,7 +715,7 @@ aiAndFeedbackRouter.post('/pips/:id/checkin', async (req, res) => {
     const checkins = [...(target.checkins || []), checkin];
     
     // Auto-calculate progress based on completed milestones
-    const metMilestones = (target.milestones || []).filter((m) => m.status === 'met').length;
+    const metMilestones = (target.milestones || []).filter((m: any) => m.status === 'met').length;
     const totalMilestones = (target.milestones || []).length || 1;
     const overallProgress = Math.round((metMilestones / totalMilestones) * 100);
 
@@ -696,6 +728,141 @@ aiAndFeedbackRouter.post('/pips/:id/checkin', async (req, res) => {
 
     await pipsCol.updateOne({ id }, { $set: updated });
     res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST sign PIP (Employee acknowledgment or Manager/HR signature)
+aiAndFeedbackRouter.post('/pips/:id/sign', async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { role, comments } = req.body;
+    const pipsCol = getDbCollection('pips');
+    const target = await pipsCol.findOne({ id });
+    if (!target) {
+      return res.status(404).json({ error: 'PIP record not found' });
+    }
+
+    const signatureEntry: PipSignatureEntry = {
+      signedBy: req.user?.name || 'Authorized Signatory',
+      signedAt: new Date().toISOString(),
+      role: (role || (req.userRole === 'EMPLOYEE' ? 'EMPLOYEE' : req.userRole === 'HR' ? 'HR' : 'MANAGER')) as any,
+      comments: comments || '',
+    };
+
+    const signatures = target.signatures || {};
+    if (role === 'EMPLOYEE' || req.userRole === 'EMPLOYEE') {
+      signatures.employeeAck = signatureEntry;
+    } else if (role === 'HR' || req.userRole === 'HR' || req.userRole === 'SUPER_ADMIN') {
+      signatures.hrSign = signatureEntry;
+    } else {
+      signatures.managerSign = signatureEntry;
+    }
+
+    const updated: PipRecord = {
+      ...target,
+      signatures,
+      updatedAt: new Date().toISOString(),
+    };
+
+    await pipsCol.updateOne({ id }, { $set: updated });
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST conclude PIP (Success / Extended / Separation)
+aiAndFeedbackRouter.post('/pips/:id/conclude', async (req: AuthenticatedRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { outcome, notes } = req.body; // 'PASSED' | 'EXTENDED' | 'SEPARATED'
+    const pipsCol = getDbCollection('pips');
+    const target = await pipsCol.findOne({ id });
+    if (!target) {
+      return res.status(404).json({ error: 'PIP record not found' });
+    }
+
+    let newStatus: PipStatus = 'completed_successfully';
+    let extendedEndDate = target.targetEndDate;
+
+    if (outcome === 'EXTENDED') {
+      newStatus = 'extended';
+      extendedEndDate = new Date(Date.now() + 30 * 86400000).toISOString().split('T')[0];
+    } else if (outcome === 'SEPARATED') {
+      newStatus = 'escalated_action';
+    } else {
+      newStatus = 'completed_successfully';
+    }
+
+    const finalOutcome: PipFinalOutcome = {
+      outcome,
+      decidedBy: req.user?.name || 'HR Administration',
+      decidedAt: new Date().toISOString(),
+      notes: notes || 'Final evaluation concluded under talent governance.',
+      restoredToActiveAt: outcome === 'PASSED' ? new Date().toISOString() : undefined,
+    };
+
+    const updated: PipRecord = {
+      ...target,
+      status: newStatus,
+      targetEndDate: extendedEndDate,
+      finalOutcome,
+      finalOutcomeNotes: notes,
+      updatedAt: new Date().toISOString(),
+    };
+
+    await pipsCol.updateOne({ id }, { $set: updated });
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST toggle milestone status
+aiAndFeedbackRouter.post('/pips/:id/milestone/:milestoneId', async (req, res) => {
+  try {
+    const { id, milestoneId } = req.params;
+    const { status, notes } = req.body; // 'pending' | 'in_progress' | 'met' | 'unmet'
+    const pipsCol = getDbCollection('pips');
+    const target = await pipsCol.findOne({ id });
+    if (!target) {
+      return res.status(404).json({ error: 'PIP record not found' });
+    }
+
+    const milestones = (target.milestones || []).map((m: any) => {
+      if (m.id === milestoneId) {
+        return { ...m, status, notes: notes !== undefined ? notes : m.notes };
+      }
+      return m;
+    });
+
+    const metMilestones = milestones.filter((m: any) => m.status === 'met').length;
+    const totalMilestones = milestones.length || 1;
+    const overallProgress = Math.round((metMilestones / totalMilestones) * 100);
+
+    const updated: PipRecord = {
+      ...target,
+      milestones,
+      overallProgress,
+      updatedAt: new Date().toISOString(),
+    };
+
+    await pipsCol.updateOne({ id }, { $set: updated });
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// GET complete PIP history for an employee
+aiAndFeedbackRouter.get('/pips/history/:employeeId', async (req: AuthenticatedRequest, res) => {
+  try {
+    const { employeeId } = req.params;
+    const pipsCol = getDbCollection('pips');
+    const history = await (await pipsCol.find({ employeeId })).sort({ createdAt: -1 }).toArray();
+    res.json(history);
   } catch (err: any) {
     res.status(500).json({ error: err.message });
   }
