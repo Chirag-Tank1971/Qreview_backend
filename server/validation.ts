@@ -156,6 +156,9 @@ export const SubmitManagerReviewSchema = z.object({
   strengths: z.string().max(3000).optional(),
   improvements: z.string().max(3000).optional(),
   managerOverallComments: z.string().max(3000).optional(),
+  employeeComments: z.string().max(3000).optional(),
+  hrComments: z.string().max(3000).optional(),
+  isDraft: z.boolean().optional(),
 });
 
 export const ReturnReviewSchema = z.object({

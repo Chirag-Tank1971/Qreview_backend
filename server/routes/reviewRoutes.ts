@@ -708,6 +708,11 @@ reviewRouter.put(
       return res.status(403).json({ error: 'Unauthorized: Only the designated reporting manager, departmental HOD, or HR can evaluate and score this review.' });
     }
 
+    // If HOD completed, only HR or Super Admin can modify scores/comments
+    if (existing.status === 'HOD_COMPLETED' && !isSuperAdminOrHr) {
+      return res.status(403).json({ error: 'This review has been completed by HOD and is pending HR sign-off. Managers and HODs cannot edit at this stage.' });
+    }
+
     // Calculate real-time weighted score: sum(rating * weight) / 100
     let totalWeightedScore = 0;
     const updatedSnapshot: ReviewKraSnapshot[] = (kraSnapshot || existing.kraSnapshot).map((k: any) => {
@@ -729,23 +734,28 @@ reviewRouter.put(
 
     let newStatus: ReviewStatus = existing.status;
     if (isSubmitting) {
-      // Determine next status:
-      if (existing.isAppraisalMonthDue) {
-        newStatus = 'MANAGER_COMPLETED';
+      if (req.user?.role === 'HOD') {
+        newStatus = 'HOD_COMPLETED';
+      } else if (req.user?.role === 'HR' || req.user?.role === 'SUPER_ADMIN') {
+        newStatus = 'HR_COMPLETED';
       } else {
         newStatus = 'MANAGER_COMPLETED';
       }
     }
+
+    const userRole = req.user?.role || 'MANAGER';
+    const userName = req.user?.name || (userRole === 'HOD' ? 'Department HOD' : userRole === 'HR' ? 'HR Administrator' : 'Manager');
+    const roleLabel = userRole === 'HOD' ? 'HOD' : userRole === 'HR' ? 'HR' : 'Manager';
 
     const action: ReviewAction = {
       id: `act_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       reviewId: id,
       action: isSubmitting ? 'SUBMITTED' : 'DRAFT_SAVED',
       performedBy: req.user?.id || 'system',
-      performedByName: req.user?.name || 'Manager',
-      performedByRole: req.user?.role || 'MANAGER',
+      performedByName: userName,
+      performedByRole: userRole,
       remarks: isSubmitting
-        ? `Manager submitted scores with final weighted score: ${finalScore}`
+        ? `${roleLabel} submitted evaluation scores with final weighted score: ${finalScore}`
         : 'Saved score and comment drafts',
       performedAt: new Date().toISOString(),
     };
@@ -850,7 +860,7 @@ reviewRouter.put(
       const isClosing = status === 'CLOSED';
       let actionType: ReviewAction['action'] = 'SUBMITTED';
       if (status === 'RETURNED') actionType = 'RETURNED';
-      else if (status === 'HR_COMPLETED' || status === 'MANAGER_COMPLETED') actionType = 'APPROVED';
+      else if (status === 'HR_COMPLETED' || status === 'MANAGER_COMPLETED' || status === 'HOD_COMPLETED') actionType = 'APPROVED';
       else if (status === 'CLOSED') actionType = 'CLOSED';
 
       const action: ReviewAction = {
