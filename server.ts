@@ -15,6 +15,7 @@ import { reportRouter } from './server/routes/reportRoutes.js';
 import { bulkRouter } from './server/routes/bulkRoutes.js';
 import { auditRouter } from './server/routes/auditRoutes.js';
 import { aiAndFeedbackRouter } from './server/routes/aiAndFeedbackRoutes.js';
+import { emailRouter } from './server/routes/emailRoutes.js';
 
 async function startServer() {
   const app = express();
@@ -108,6 +109,7 @@ async function startServer() {
   app.use('/api/bulk', bulkRouter);
   app.use('/api/audit', auditRouter);
   app.use('/api', aiAndFeedbackRouter);
+  app.use('/api/emails', emailRouter);
 
   // Serve compiled frontend assets if available
   const possibleDistPaths = [

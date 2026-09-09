@@ -22,6 +22,8 @@ import {
   User,
   Designation,
 } from '../../src/types.js';
+import { sendNotificationEmail, resolveRecipient } from '../services/emailService.js';
+import { renderAppraisalLetterReleasedEmail } from '../services/emailTemplates.js';
 
 export const appraisalRouter = Router();
 
@@ -1260,6 +1262,33 @@ appraisalRouter.put(
         metadata: { appraisalId: id, cycleId: appraisal.cycleId, subTab: 'appraisal', openLetter: true },
         createdAt: lockedAt,
       });
+
+      // Dispatch Email Notification to Employee (Asynchronously)
+      (async () => {
+        try {
+          const recipient = await resolveRecipient(appraisal.employeeId);
+          if (recipient) {
+            const baseUrl = process.env.APP_URL || 'http://localhost:5173';
+            const { subject, html } = renderAppraisalLetterReleasedEmail({
+              employeeName: appraisal.employeeName,
+              cycleName: appraisal.cycleName || 'Annual Cycle',
+              appraisalUrl: `${baseUrl}/#portal`,
+              effectiveDate: appraisal.effectiveDate,
+            });
+            await sendNotificationEmail({
+              recipientId: appraisal.employeeId,
+              recipientEmail: recipient.email,
+              recipientName: recipient.name,
+              subject,
+              html,
+              templateType: 'LETTER_RELEASED',
+              metadata: { appraisalId: id, cycleId: appraisal.cycleId },
+            });
+          }
+        } catch (mailErr: any) {
+          console.warn('[AppraisalRoutes] Failed to dispatch letter release email:', mailErr.message);
+        }
+      })();
 
       if (user) {
         await recordAuditLog(

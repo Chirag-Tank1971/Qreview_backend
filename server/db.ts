@@ -39,6 +39,7 @@ import {
   PipRecord,
   TalentRecord,
   ComplianceFlag,
+  EmailLog,
   DbStatus,
 } from '../src/types.js';
 
@@ -273,6 +274,7 @@ export const memoryDb = {
   pips: new InMemoryCollection<PipRecord>('pips', SEED_PIPS),
   talentRecords: new InMemoryCollection<TalentRecord>('talent_records', SEED_TALENT_RECORDS),
   complianceFlags: new InMemoryCollection<ComplianceFlag>('compliance_flags', SEED_COMPLIANCE_FLAGS),
+  emailLogs: new InMemoryCollection<EmailLog>('email_logs', []),
 };
 
 export async function initDatabase(): Promise<void> {
@@ -319,6 +321,7 @@ const MONGO_COLLECTION_MAP: Record<string, string> = {
   auditLogs: 'audit_logs',
   talentRecords: 'talent_records',
   complianceFlags: 'compliance_flags',
+  emailLogs: 'email_logs',
 };
 
 export function getDbCollection<T extends { id?: string; _id?: any }>(collectionName: keyof typeof memoryDb): any {
@@ -427,6 +430,7 @@ export async function getDatabaseStatus(): Promise<DbStatus> {
     appraisals: await getDbCollection('appraisals').countDocuments(),
     notifications: await getDbCollection('notifications').countDocuments(),
     auditLogs: await getDbCollection('auditLogs').countDocuments(),
+    emailLogs: await getDbCollection('emailLogs').countDocuments(),
   };
 
   return {

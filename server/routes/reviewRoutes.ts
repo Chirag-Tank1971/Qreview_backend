@@ -14,6 +14,8 @@ import {
   Department,
   ReviewSummaryStats,
 } from '../../src/types.js';
+import { sendNotificationEmail, resolveRecipient } from '../services/emailService.js';
+import { renderSelfAssessmentSubmittedEmail, renderManagerReviewSubmittedEmail } from '../services/emailTemplates.js';
 
 export const reviewRouter = express.Router();
 
@@ -1062,6 +1064,35 @@ reviewRouter.put(
         isRead: false,
         createdAt: now,
       });
+
+      // Dispatch Email Notification to Manager (Asynchronously)
+      (async () => {
+        try {
+          const managerTarget = existing.managerId || 'usr_mgr_eng';
+          const recipient = await resolveRecipient(managerTarget);
+          if (recipient) {
+            const baseUrl = process.env.APP_URL || 'http://localhost:5173';
+            const { subject, html } = renderSelfAssessmentSubmittedEmail({
+              employeeName: existing.employeeName,
+              managerName: recipient.name,
+              reviewPeriodName: existing.reviewPeriodName || 'Quarterly Review',
+              selfScore: Number(selfScore) || 0,
+              reviewUrl: `${baseUrl}/#reviews`,
+            });
+            await sendNotificationEmail({
+              recipientId: managerTarget,
+              recipientEmail: recipient.email,
+              recipientName: recipient.name,
+              subject,
+              html,
+              templateType: 'SELF_ASSESSMENT_SUBMITTED',
+              metadata: { reviewId: id, employeeId: existing.employeeId },
+            });
+          }
+        } catch (mailErr: any) {
+          console.warn('[ReviewRoutes] Failed to dispatch self-assessment email:', mailErr.message);
+        }
+      })();
     }
 
     res.json(updatedReview);
