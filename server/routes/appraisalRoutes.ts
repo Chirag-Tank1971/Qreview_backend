@@ -977,6 +977,7 @@ appraisalRouter.put(
       }
 
       const refreshed = await appraisalsCol.findOne({ id });
+      console.log(`[Appraisal] Manager recommendation submitted: ${id} for "${appraisal.employeeName}" (${appraisal.employeeCode}), Suggested Hike: ${incPercent}%, Promotion: ${promotionRecommended ? 'YES' : 'NO'}, by "${user?.name}" [${user?.role}]`);
       res.json(refreshed);
     } catch (err: any) {
       console.error('Error in PUT /api/appraisals/:id/manager-recommend:', err);
@@ -1089,6 +1090,7 @@ appraisalRouter.put(
       }
 
       const refreshed = await appraisalsCol.findOne({ id });
+      console.log(`[Appraisal] HOD calibrated: ${id} for "${appraisal.employeeName}" (${appraisal.employeeCode}), Final Hike: ${finalInc}%, Rating: ${calibratedRating || appraisal.finalRating || appraisal.recommendedRating}, by "${user?.name}" [${user?.role}]`);
       res.json(refreshed);
     } catch (err: any) {
       console.error('Error in PUT /api/appraisals/:id/hod-calibrate:', err);
@@ -1305,6 +1307,7 @@ appraisalRouter.put(
       }
 
       const refreshed = await appraisalsCol.findOne({ id });
+      console.log(`[Appraisal] Appraisal locked & finalized: ${id} for "${appraisal.employeeName}" (${appraisal.employeeCode}), Revised CTC: ${appraisal.currency}${appraisal.revisedCtc.toLocaleString()}, by "${user?.name}" [${user?.role}]`);
       res.json(refreshed);
     } catch (err: any) {
       console.error('Error in PUT /api/appraisals/:id/lock:', err);
@@ -1489,6 +1492,7 @@ appraisalRouter.put(
     });
 
     const refreshed = await appraisalsCol.findOne({ id });
+    console.log(`[Appraisal] Digitally acknowledged: ${id} by "${appraisal.employeeName}" (${appraisal.employeeCode})`);
     res.json(refreshed);
   } catch (err: any) {
     console.error('Error in PUT /api/appraisals/:id/acknowledge:', err);

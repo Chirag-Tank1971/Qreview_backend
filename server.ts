@@ -17,6 +17,19 @@ import { auditRouter } from './server/routes/auditRoutes.js';
 import { aiAndFeedbackRouter } from './server/routes/aiAndFeedbackRoutes.js';
 import { emailRouter } from './server/routes/emailRoutes.js';
 
+// In production, silence non-critical development logs (console.log, console.info, console.warn)
+// to optimize performance and protect data privacy. Errors (console.error) remain fully active.
+// In development, all logs display normally. Override via ENABLE_PROD_LOGS=true if debugging in production.
+const isProd = process.env.NODE_ENV === 'production' && process.env.ENABLE_PROD_LOGS !== 'true';
+const bootLog = console.log;
+
+if (isProd) {
+  const noop = () => {};
+  console.log = noop;
+  console.info = noop;
+  console.warn = noop;
+}
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
@@ -51,7 +64,32 @@ async function startServer() {
     next();
   });
 
-  app.use(express.json());
+  // Trust reverse proxy headers (e.g. X-Forwarded-For) in production environments (Render, Cloudflare, AWS, Nginx)
+  app.set('trust proxy', 1);
+
+  app.use(express.json({ limit: '10mb' }));
+  app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+
+  // Structured HTTP Request/Response logger (active only in development or when ENABLE_PROD_LOGS=true)
+  if (!isProd) {
+    app.use((req, res, next) => {
+      const start = Date.now();
+      res.on('finish', () => {
+        const duration = Date.now() - start;
+        const status = res.statusCode;
+        const logLevel = status >= 500 ? 'ERROR' : status >= 400 ? 'WARN' : 'INFO';
+        const logMsg = `[HTTP] ${req.method} ${req.originalUrl} ${status} - ${duration}ms`;
+        if (logLevel === 'ERROR') {
+          console.error(logMsg);
+        } else if (logLevel === 'WARN') {
+          console.warn(logMsg);
+        } else {
+          console.log(logMsg);
+        }
+      });
+      next();
+    });
+  }
 
   // Error middleware for malformed JSON payloads
   app.use((err: any, _req: express.Request, res: express.Response, next: express.NextFunction) => {
@@ -111,6 +149,11 @@ async function startServer() {
   app.use('/api', aiAndFeedbackRouter);
   app.use('/api/emails', emailRouter);
 
+  // Always return standard JSON 404 for any unmatched /api routes
+  app.all('/api/*', (_req, res) => {
+    res.status(404).json({ error: 'API endpoint not found.' });
+  });
+
   // Serve compiled frontend assets if available
   const possibleDistPaths = [
     path.resolve(process.cwd(), '../frontend/dist'),
@@ -126,11 +169,6 @@ async function startServer() {
     app.get('*', (_req, res) => {
       res.sendFile(path.join(frontendDist, 'index.html'));
     });
-  } else {
-    // Return standard JSON 404 for unmatched API routes
-    app.use('/api', (_req, res) => {
-      res.status(404).json({ error: 'API endpoint not found.' });
-    });
   }
 
   // Global unhandled error handler ensures JSON error response rather than HTML stack trace
@@ -140,7 +178,7 @@ async function startServer() {
   });
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`[Applet] Server running on http://0.0.0.0:${PORT}`);
+    bootLog(`[Applet] Server running on http://0.0.0.0:${PORT} [mode: ${process.env.NODE_ENV || 'development'}]`);
   });
 }
 

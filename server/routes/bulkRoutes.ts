@@ -27,10 +27,11 @@ const TEMPLATE_COLUMNS: Record<BulkDatasetType, BulkTemplateColumn[]> = {
     { key: 'fullName', label: 'Full Name', description: 'Employee First and Last Name', required: true, example: 'Aarav Sharma', type: 'string' },
     { key: 'email', label: 'Work Email', description: 'Unique corporate email address', required: true, example: 'aarav.sharma@company.com', type: 'string' },
     { key: 'joiningDate', label: 'Joining Date', description: 'Date of joining (YYYY-MM-DD)', required: true, example: '2025-01-15', type: 'date' },
-    { key: 'cycleCode', label: 'Cycle Code', description: 'Joining Cycle: CYCLE_A to CYCLE_H', required: true, example: 'CYCLE_A', type: 'enum', options: ['CYCLE_A', 'CYCLE_B', 'CYCLE_C', 'CYCLE_D', 'CYCLE_E', 'CYCLE_F', 'CYCLE_G', 'CYCLE_H'] },
+    { key: 'cycleCode', label: 'Cycle Code', description: 'Joining Cycle: CYCLE_A to CYCLE_H (Auto-calculated from joining month if blank)', required: false, example: 'CYCLE_A', type: 'enum', options: ['CYCLE_A', 'CYCLE_B', 'CYCLE_C', 'CYCLE_D', 'CYCLE_E', 'CYCLE_F', 'CYCLE_G', 'CYCLE_H'] },
     { key: 'department', label: 'Department', description: 'Department Name or Code', required: true, example: 'Engineering', type: 'string' },
     { key: 'designation', label: 'Designation', description: 'Official Job Designation Title', required: true, example: 'Senior Software Engineer', type: 'string' },
-    { key: 'managerCode', label: 'Reporting Manager Code', description: 'Employee Code of Reporting Manager', required: false, example: 'EMP-001', type: 'string' },
+    { key: 'managerCode', label: 'Reporting Manager Code', description: 'Employee Code of Reporting Manager (e.g. EMP-004)', required: false, example: 'EMP-004', type: 'string' },
+    { key: 'hodCode', label: 'HOD Code', description: 'Employee Code of Head of Department (e.g. EMP-001; defaults to Department HOD if blank)', required: false, example: 'EMP-001', type: 'string' },
     { key: 'baseSalary', label: 'Base Annual CTC (₹)', description: 'Current Annual CTC figure in INR', required: true, example: '1850000', type: 'number' },
     { key: 'role', label: 'System Role', description: 'Access Role in PMS', required: false, example: 'EMPLOYEE', type: 'enum', options: ['EMPLOYEE', 'MANAGER', 'HOD', 'HR_ADMIN', 'CXO'] },
     { key: 'status', label: 'Employment Status', description: 'Active or probation', required: false, example: 'ACTIVE', type: 'enum', options: ['ACTIVE', 'PROBATION', 'NOTICE'] },
@@ -69,10 +70,10 @@ const TEMPLATE_COLUMNS: Record<BulkDatasetType, BulkTemplateColumn[]> = {
 
 const SAMPLE_DATA: Record<BulkDatasetType, any[]> = {
   employees: [
-    { employeeCode: 'EMP-201', fullName: 'Kavita Nair', email: 'kavita.nair@company.com', joiningDate: '2025-01-10', cycleCode: 'CYCLE_A', department: 'Engineering', designation: 'Senior Software Engineer', managerCode: 'EMP-001', baseSalary: 1800000, role: 'EMPLOYEE', status: 'ACTIVE' },
-    { employeeCode: 'EMP-202', fullName: 'Rohan Deshmukh', email: 'rohan.deshmukh@company.com', joiningDate: '2025-02-14', cycleCode: 'CYCLE_B', department: 'Product & Design', designation: 'Product Designer', managerCode: 'EMP-003', baseSalary: 1450000, role: 'EMPLOYEE', status: 'ACTIVE' },
-    { employeeCode: 'EMP-203', fullName: 'Ananya Roy', email: 'ananya.roy@company.com', joiningDate: '2025-03-01', cycleCode: 'CYCLE_C', department: 'Human Resources', designation: 'Talent Acquisition Lead', managerCode: 'EMP-002', baseSalary: 1600000, role: 'EMPLOYEE', status: 'ACTIVE' },
-    { employeeCode: 'EMP-204', fullName: 'Sameer Gupta', email: 'sameer.gupta@company.com', joiningDate: '2025-04-18', cycleCode: 'CYCLE_D', department: 'Sales & Growth', designation: 'Enterprise Account Executive', managerCode: 'EMP-005', baseSalary: 1750000, role: 'EMPLOYEE', status: 'ACTIVE' },
+    { employeeCode: 'EMP-201', fullName: 'Kavita Nair', email: 'kavita.nair@company.com', joiningDate: '2025-01-10', cycleCode: 'CYCLE_A', department: 'Engineering', designation: 'Senior Software Engineer', managerCode: 'EMP-004', hodCode: 'EMP-001', baseSalary: 1800000, role: 'EMPLOYEE', status: 'ACTIVE' },
+    { employeeCode: 'EMP-202', fullName: 'Rohan Deshmukh', email: 'rohan.deshmukh@company.com', joiningDate: '2025-02-14', cycleCode: 'CYCLE_B', department: 'Product & Design', designation: 'Product Designer', managerCode: 'EMP-001', hodCode: 'EMP-001', baseSalary: 1450000, role: 'EMPLOYEE', status: 'ACTIVE' },
+    { employeeCode: 'EMP-203', fullName: 'Ananya Roy', email: 'ananya.roy@company.com', joiningDate: '2025-03-01', cycleCode: 'CYCLE_C', department: 'Human Resources', designation: 'Talent Acquisition Lead', managerCode: 'EMP-006', hodCode: 'EMP-003', baseSalary: 1600000, role: 'EMPLOYEE', status: 'ACTIVE' },
+    { employeeCode: 'EMP-204', fullName: 'Sameer Gupta', email: 'sameer.gupta@company.com', joiningDate: '2025-04-18', cycleCode: 'CYCLE_D', department: 'Sales & Growth', designation: 'Enterprise Account Executive', managerCode: 'EMP-005', hodCode: 'EMP-002', baseSalary: 1750000, role: 'EMPLOYEE', status: 'ACTIVE' },
   ],
   kras: [
     { templateTitle: 'Sales Enterprise Executive 2026', department: 'Sales & Growth', designation: 'Enterprise Account Executive', cycleCode: 'ALL', kraTitle: 'Net New ARR Bookings', weightage: 40, targetDescription: 'Achieve ₹2.5 Cr in new annualized enterprise contract value', measurementUnit: 'CURRENCY', targetValue: '25000000' },
@@ -107,6 +108,172 @@ bulkRouter.get('/templates/:type', (req: AuthenticatedRequest, res: Response) =>
     sampleData: SAMPLE_DATA[datasetType] || [],
   });
 });
+
+function deriveCycleFromDate(dateInput: any): { fullCode: string; shortCode: string; cycleId: string } {
+  let m = 1;
+  if (dateInput) {
+    const d = new Date(dateInput);
+    if (!isNaN(d.getTime())) {
+      m = d.getUTCMonth() + 1; // 1 to 12
+    }
+  }
+  let shortCode = 'A';
+  if (m === 1) shortCode = 'A';
+  else if (m === 2 || m === 3) shortCode = 'B';
+  else if (m === 4) shortCode = 'C';
+  else if (m === 5 || m === 6) shortCode = 'D';
+  else if (m === 7) shortCode = 'E';
+  else if (m === 8 || m === 9 || m === 10) shortCode = 'F';
+  else if (m === 11) shortCode = 'G';
+  else if (m === 12) shortCode = 'H';
+
+  return {
+    fullCode: `CYCLE_${shortCode}`,
+    shortCode,
+    cycleId: `cycle_${shortCode.toLowerCase()}`,
+  };
+}
+
+/**
+ * Synchronizes manager and HOD hierarchy links for all employees in the database.
+ * Resolves managerId / managerName from managerEmployeeCode.
+ * Resolves hodId / hodName from hodEmployeeCode, or falls back to department's assigned HOD.
+ */
+export async function resolveAndSyncHierarchy(): Promise<{ updatedCount: number; totalScanned: number }> {
+  try {
+    const employeesCol = getDbCollection('employees');
+    const departmentsCol = getDbCollection('departments');
+    const allEmployees = await (await employeesCol.find({})).toArray();
+    const allDepartments = await (await departmentsCol.find({})).toArray();
+
+    const empByCode = new Map<string, any>();
+    const empById = new Map<string, any>();
+    for (const emp of allEmployees) {
+      if (emp.employeeCode) empByCode.set(String(emp.employeeCode).trim().toUpperCase(), emp);
+      if (emp.id) empById.set(String(emp.id).trim(), emp);
+    }
+
+    const deptById = new Map<string, any>();
+    for (const d of allDepartments) {
+      if (d.id) deptById.set(d.id, d);
+      if (d.name) deptById.set(String(d.name).trim().toLowerCase(), d);
+      if (d.code) deptById.set(String(d.code).trim().toLowerCase(), d);
+    }
+
+    let updatedCount = 0;
+
+    for (const emp of allEmployees) {
+      let needsUpdate = false;
+      const updateFields: any = {};
+
+      // 1. Resolve Manager
+      const rawMgrCode = String(emp.managerEmployeeCode || '').trim().toUpperCase();
+      if (rawMgrCode && empByCode.has(rawMgrCode)) {
+        const mgr = empByCode.get(rawMgrCode);
+        if (emp.managerId !== mgr.id || emp.managerName !== mgr.name) {
+          updateFields.managerId = mgr.id;
+          updateFields.managerName = mgr.name;
+          needsUpdate = true;
+        }
+      } else if (emp.managerId && empById.has(emp.managerId)) {
+        const mgr = empById.get(emp.managerId);
+        if (emp.managerName !== mgr.name || !emp.managerEmployeeCode) {
+          updateFields.managerName = mgr.name;
+          if (!emp.managerEmployeeCode && mgr.employeeCode) {
+            updateFields.managerEmployeeCode = mgr.employeeCode;
+          }
+          needsUpdate = true;
+        }
+      }
+
+      // 2. Resolve HOD
+      const rawHodCode = String(emp.hodEmployeeCode || '').trim().toUpperCase();
+      if (rawHodCode && empByCode.has(rawHodCode)) {
+        const hod = empByCode.get(rawHodCode);
+        if (emp.hodId !== hod.id || emp.hodName !== hod.name) {
+          updateFields.hodId = hod.id;
+          updateFields.hodName = hod.name;
+          needsUpdate = true;
+        }
+      } else if (emp.hodId && empById.has(emp.hodId)) {
+        const hod = empById.get(emp.hodId);
+        if (emp.hodName !== hod.name || !emp.hodEmployeeCode) {
+          updateFields.hodName = hod.name;
+          if (!emp.hodEmployeeCode && hod.employeeCode) {
+            updateFields.hodEmployeeCode = hod.employeeCode;
+          }
+          needsUpdate = true;
+        }
+      } else {
+        // Fallback to department's assigned HOD
+        const dept = deptById.get(emp.departmentId) || deptById.get(String(emp.departmentName || '').trim().toLowerCase());
+        if (dept && dept.hodId) {
+          const hod = empById.get(dept.hodId) || empByCode.get(String(dept.hodId).toUpperCase());
+          const resolvedHodId = hod ? hod.id : dept.hodId;
+          const resolvedHodName = hod ? hod.name : (dept.hodName || 'Head of Department');
+          const resolvedHodCode = hod ? hod.employeeCode : undefined;
+
+          if (emp.hodId !== resolvedHodId || emp.hodName !== resolvedHodName) {
+            updateFields.hodId = resolvedHodId;
+            updateFields.hodName = resolvedHodName;
+            if (resolvedHodCode && !emp.hodEmployeeCode) {
+              updateFields.hodEmployeeCode = resolvedHodCode;
+            }
+            needsUpdate = true;
+          }
+        } else if (emp.managerId && empById.has(emp.managerId)) {
+          // Fallback: check if manager is an HOD or has an HOD
+          const mgr = empById.get(emp.managerId);
+          const isMgrHod =
+            mgr.role === 'HOD' ||
+            mgr.systemRole === 'HOD' ||
+            String(mgr.designationName || '').toLowerCase().includes('vp') ||
+            String(mgr.designationName || '').toLowerCase().includes('hod');
+
+          if (isMgrHod) {
+            if (emp.hodId !== mgr.id || emp.hodName !== mgr.name) {
+              updateFields.hodId = mgr.id;
+              updateFields.hodName = mgr.name;
+              if (mgr.employeeCode && !emp.hodEmployeeCode) {
+                updateFields.hodEmployeeCode = mgr.employeeCode;
+              }
+              needsUpdate = true;
+            }
+          } else if (mgr.hodId && empById.has(mgr.hodId)) {
+            const mgrHod = empById.get(mgr.hodId);
+            if (emp.hodId !== mgrHod.id || emp.hodName !== mgrHod.name) {
+              updateFields.hodId = mgrHod.id;
+              updateFields.hodName = mgrHod.name;
+              if (mgrHod.employeeCode && !emp.hodEmployeeCode) {
+                updateFields.hodEmployeeCode = mgrHod.employeeCode;
+              }
+              needsUpdate = true;
+            }
+          }
+        }
+      }
+
+      if (needsUpdate) {
+        await employeesCol.updateOne({ id: emp.id }, { $set: updateFields });
+        updatedCount++;
+      }
+    }
+
+    return { updatedCount, totalScanned: allEmployees.length };
+  } catch (err: any) {
+    console.error('[Bulk Engine] Failed to resolve hierarchy:', err);
+    return { updatedCount: 0, totalScanned: 0 };
+  }
+}
+
+// Automatically schedule hierarchy synchronization once server finishes loading
+setTimeout(() => {
+  resolveAndSyncHierarchy().then((res) => {
+    if (res.updatedCount > 0) {
+      console.log(`[Bulk Engine] Auto-synced hierarchy for ${res.updatedCount} employee records on startup.`);
+    }
+  }).catch(() => {});
+}, 3000);
 
 // ==========================================
 // 2. VALIDATION ENGINE
@@ -186,7 +353,12 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
         const cycle = String(rawRow.cycleCode || '').trim().toUpperCase();
         const dept = String(rawRow.department || '').trim().toLowerCase();
         const desig = String(rawRow.designation || '').trim().toLowerCase();
-        const mgrCode = String(rawRow.managerCode || '').trim().toUpperCase();
+        const mgrCode = String(
+          rawRow.managerCode || rawRow.managerEmployeeCode || rawRow.reportingManagerCode || rawRow.manager || ''
+        ).trim().toUpperCase();
+        const hodCode = String(
+          rawRow.hodCode || rawRow.hodEmployeeCode || rawRow.headOfDepartmentCode || rawRow.hod || ''
+        ).trim().toUpperCase();
         const salary = Number(rawRow.baseSalary);
 
         // Code checks
@@ -222,8 +394,12 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
           }
         }
 
-        // Cycle check
-        if (cycle && !cycleCodeSet.has(cycle) && !['CYCLE_A', 'CYCLE_B', 'CYCLE_C', 'CYCLE_D', 'CYCLE_E', 'CYCLE_F', 'CYCLE_G', 'CYCLE_H'].includes(cycle)) {
+        // Cycle check & auto-derivation
+        if (!cycle) {
+          const derived = deriveCycleFromDate(rawRow.joiningDate);
+          rawRow.cycleCode = derived.fullCode;
+          warnings.push(`Cycle Code was omitted; automatically assigned '${derived.fullCode}' based on joining date.`);
+        } else if (!cycleCodeSet.has(cycle) && !['CYCLE_A', 'CYCLE_B', 'CYCLE_C', 'CYCLE_D', 'CYCLE_E', 'CYCLE_F', 'CYCLE_G', 'CYCLE_H'].includes(cycle)) {
           errors.push(`Invalid Cycle Code '${cycle}'. Must be one of CYCLE_A to CYCLE_H.`);
         }
 
@@ -238,8 +414,17 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
         }
 
         // Manager check
-        if (mgrCode && !empCodeMap.has(mgrCode)) {
-          warnings.push(`Reporting manager code '${mgrCode}' not yet in system. Relationship will link once manager joins.`);
+        if (mgrCode) {
+          if (!empCodeMap.has(mgrCode) && !seenCodesInFile.has(mgrCode)) {
+            warnings.push(`Reporting manager code '${mgrCode}' not yet in system. Relationship will link once manager joins.`);
+          }
+        }
+
+        // HOD check
+        if (hodCode) {
+          if (!empCodeMap.has(hodCode) && !seenCodesInFile.has(hodCode)) {
+            warnings.push(`HOD code '${hodCode}' not yet in system. Will fallback to department HOD if not found.`);
+          }
         }
 
         // Salary check
@@ -338,6 +523,8 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
       res.status(400).json({ error: 'No rows provided for import.' });
       return;
     }
+
+    console.log(`[Bulk Import] Starting import of ${rows.length} rows for dataset "${datasetType}" from file "${fileName}" by "${currentUser?.name || 'HR Admin'}"`);
 
     const employeesCol = getDbCollection('employees');
     const departmentsCol = getDbCollection('departments');
@@ -440,7 +627,47 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
           const existing = await employeesCol.findOne({ $or: [{ employeeCode: code }, { email }] });
           const deptObj = await findOrCreateDept(row.department);
           const desigObj = await findOrCreateDesig(row.designation, deptObj.id);
-          const cycleId = mapCycleCodeToId(row.cycleCode);
+          const derivedCycle = deriveCycleFromDate(row.joiningDate);
+          const rawCycleCode = String(row.cycleCode || '').trim().toUpperCase() || derivedCycle.fullCode;
+          const cycleId = mapCycleCodeToId(rawCycleCode);
+          const cycleCodeShort = rawCycleCode.replace('CYCLE_', '') || derivedCycle.shortCode;
+
+          const rawMgrCode = String(
+            row.managerCode || row.managerEmployeeCode || row.reportingManagerCode || row.manager || ''
+          ).trim().toUpperCase();
+          const rawHodCode = String(
+            row.hodCode || row.hodEmployeeCode || row.headOfDepartmentCode || row.hod || ''
+          ).trim().toUpperCase();
+
+          // Resolve manager from database if already present
+          let managerId: string | undefined = undefined;
+          let managerName: string | undefined = undefined;
+          if (rawMgrCode) {
+            const mgr = await employeesCol.findOne({ employeeCode: rawMgrCode });
+            if (mgr) {
+              managerId = mgr.id;
+              managerName = mgr.name;
+            }
+          }
+
+          // Resolve HOD from database or department
+          let hodId: string | undefined = undefined;
+          let hodName: string | undefined = undefined;
+          if (rawHodCode) {
+            const hod = await employeesCol.findOne({ employeeCode: rawHodCode });
+            if (hod) {
+              hodId = hod.id;
+              hodName = hod.name;
+            }
+          }
+          if (!hodId && deptObj.hodId) {
+            hodId = deptObj.hodId;
+            hodName = deptObj.hodName;
+            if (!hodName) {
+              const deptHod = await employeesCol.findOne({ id: deptObj.hodId });
+              if (deptHod) hodName = deptHod.name;
+            }
+          }
 
           const numericCtc = Number(row.baseSalary || row.currentCtc) || 1200000;
           const empPayload: any = {
@@ -449,12 +676,17 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
             email,
             joiningDate: row.joiningDate || new Date().toISOString().split('T')[0],
             cycleId,
-            cycleCode: row.cycleCode?.replace('CYCLE_', '') || 'A',
+            cycleCode: cycleCodeShort,
             departmentId: deptObj.id,
             departmentName: deptObj.name,
             designationId: desigObj.id,
             designationName: desigObj.title || desigObj.name,
-            managerEmployeeCode: row.managerCode ? String(row.managerCode).trim().toUpperCase() : undefined,
+            managerId,
+            managerName,
+            managerEmployeeCode: rawMgrCode || undefined,
+            hodId,
+            hodName,
+            hodEmployeeCode: rawHodCode || undefined,
             currentCtc: numericCtc,
             currency: '₹',
             status: (row.status || 'ACTIVE').toUpperCase(),
@@ -688,6 +920,15 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
       }
     }
 
+    // Post-import hierarchy synchronization pass (links manager and HOD by codes and backfills relationships)
+    if (datasetType === 'employees') {
+      try {
+        await resolveAndSyncHierarchy();
+      } catch (hierErr) {
+        console.error('[Bulk Engine] Error during hierarchy sync post-import:', hierErr);
+      }
+    }
+
     // Record in Audit Trail
     await auditLogsCol.insertOne({
       id: `audit_${Math.random().toString(36).substr(2, 9)}`,
@@ -713,10 +954,29 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
       errors: errorsList.length > 0 ? errorsList : undefined,
     };
 
+    console.log(`[Bulk Import] Completed batch ${batchId} for "${datasetType}": ${insertedCount} inserted, ${updatedCount} updated, ${skippedCount} skipped, ${failedCount} failed`);
+
     res.json(result);
   } catch (error: any) {
     console.error('Import error:', error);
     res.status(500).json({ error: error.message || 'Bulk import processing failed.' });
+  }
+});
+
+/**
+ * POST /api/bulk/sync-hierarchy
+ * Manually trigger full hierarchy synchronization across all employees in the database
+ */
+bulkRouter.post('/sync-hierarchy', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const result = await resolveAndSyncHierarchy();
+    res.json({
+      success: true,
+      message: `Hierarchy synchronized successfully. ${result.updatedCount} employee records updated across ${result.totalScanned} scanned profiles.`,
+      ...result,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to sync hierarchy' });
   }
 });
 
@@ -766,6 +1026,7 @@ bulkRouter.get('/export/:type', async (req: AuthenticatedRequest, res: Response)
         'Department': deptMap.get(e.departmentId) || e.departmentName || 'Engineering',
         'Designation': desigMap.get(e.designationId) || e.designationName || 'Staff',
         'Reporting Manager Code': e.managerEmployeeCode || '',
+        'HOD Code': e.hodEmployeeCode || '',
         'Base Annual CTC (₹)': e.currentCtc || e.baseSalary || 1200000,
         'Status': e.status || 'ACTIVE',
         'Phone': e.phone || '',

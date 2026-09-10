@@ -645,6 +645,8 @@ reviewRouter.post(
         );
       }
 
+      console.log(`[Review] Batch generated: ${createdCount} reviews created (${skippedCount} skipped) for period "${period.name}" by "${req.user?.name}" [${req.user?.role}]`);
+
       res.status(201).json({
         message: `Successfully generated ${createdCount} quarterly reviews for ${period.name}.`,
         createdCount,
@@ -829,6 +831,8 @@ reviewRouter.put(
       });
     }
 
+    console.log(`[Review] Review scored: ${id} for "${existing.employeeName}" (${existing.employeeCode}), Final Score: ${finalScore} (isDraft: ${isDraft}) by "${req.user?.name}" [${req.user?.role}]`);
+
     res.json(updatedReview);
   } catch (error: any) {
     console.error('Failed to score review:', error);
@@ -932,6 +936,8 @@ reviewRouter.put(
           createdAt: now,
         });
       }
+
+      console.log(`[Review] Status transition: Review ${id} ("${existing.employeeName}"): ${existing.status} -> ${status} by "${req.user?.name}" [${req.user?.role}]`);
 
       res.json(updatedReview);
     } catch (error: any) {
@@ -1094,6 +1100,8 @@ reviewRouter.put(
         }
       })();
     }
+
+    console.log(`[Review] Self-assessment ${isSubmitting ? 'submitted' : 'draft saved'} for "${existing.employeeName}" (${existing.employeeCode}), Self Score: ${selfScore}`);
 
     res.json(updatedReview);
   } catch (error: any) {

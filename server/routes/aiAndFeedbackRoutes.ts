@@ -55,6 +55,7 @@ async function safeGenerateContent(ai: GoogleGenAI, config: {
           },
         });
         if (response && response.text) {
+          console.log(`[Gemini AI] Content generated using model: "${modelName}"`);
           return { text: response.text, modelUsed: modelName };
         }
       } catch (err: any) {
@@ -69,6 +70,7 @@ async function safeGenerateContent(ai: GoogleGenAI, config: {
       }
     }
   }
+  console.warn('[Gemini AI] Gemini models unavailable or rate-limited; falling back to rule-based engine');
   return null;
 }
 
@@ -78,6 +80,7 @@ async function safeGenerateContent(ai: GoogleGenAI, config: {
 aiAndFeedbackRouter.post('/gemini/generate-review-narrative', async (req, res) => {
   try {
     const payload: AiReviewSynthesisRequest = req.body;
+    console.log(`[Gemini AI] Generating review narrative for: "${payload.employeeName}" (${payload.department})`);
     const ai = getGeminiClient();
 
     const prompt = `You are an elite Chief People Officer and HR appraisal consultant. Synthesize a comprehensive, executive-level performance review assessment for:
@@ -183,6 +186,7 @@ Generate a structured JSON response matching the required schema with balanced, 
 aiAndFeedbackRouter.post('/gemini/analyze-bias-and-tone', async (req, res) => {
   try {
     const payload: AiBiasCheckRequest = req.body;
+    console.log(`[Gemini AI] Analyzing bias and tone for review evaluation: "${payload.employeeName}"`);
     const ai = getGeminiClient();
 
     const prompt = `You are a compliance officer auditing performance review feedback. Analyze the following manager appraisal comments for unconscious bias, subjective language, vague feedback, or unconstructive tone:
@@ -293,6 +297,7 @@ Assess:
 aiAndFeedbackRouter.post('/gemini/generate-growth-plan', async (req, res) => {
   try {
     const payload: AiGrowthPlanRequest = req.body;
+    console.log(`[Gemini AI] Generating career growth plan for: "${payload.employeeName}" (${payload.designation})`);
     const ai = getGeminiClient();
 
     const prompt = `You are a Chief Talent Officer. Generate a structured 6-month career growth roadmap and upskilling strategy for:
@@ -398,6 +403,7 @@ Provide 4 concrete chronological milestones (Months 1-2, Months 3-4, Month 5, Mo
 aiAndFeedbackRouter.post('/gemini/talent-insights-summary', async (req, res) => {
   try {
     const payload: AiTalentInsightsRequest = req.body;
+    console.log(`[Gemini AI] Synthesizing talent matrix insights for: "${payload.department || 'Enterprise-Wide'}"`);
     const ai = getGeminiClient();
 
     const prompt = `You are an Executive Board Talent Advisor. Generate strategic talent intelligence and risk mitigation recommendations:

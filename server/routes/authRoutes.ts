@@ -110,12 +110,14 @@ authRouter.post('/login', validateBody(LoginSchema), async (req: Request, res: R
     if (!user) {
       const failCount = recordFailure(ip);
       const remainingAttempts = Math.max(0, MAX_LOGIN_ATTEMPTS - failCount);
+      console.warn(`[Auth] Login failed: User "${email}" not found from IP: ${ip} (Failed attempts: ${failCount}/${MAX_LOGIN_ATTEMPTS})`);
       const payload: Record<string, any> = { error: 'Invalid email or password.' };
       if (failCount >= WARN_AFTER_FAILURES) payload.remainingAttempts = remainingAttempts;
       return res.status(401).json(payload);
     }
 
     if (!user.active) {
+      console.warn(`[Auth] Login blocked: Deactivated account "${user.email}" from IP: ${ip}`);
       return res.status(403).json({ error: 'Account is deactivated. Contact system administrator.' });
     }
 
@@ -124,6 +126,7 @@ authRouter.post('/login', validateBody(LoginSchema), async (req: Request, res: R
     if (!isPasswordValid) {
       const failCount = recordFailure(ip);
       const remainingAttempts = Math.max(0, MAX_LOGIN_ATTEMPTS - failCount);
+      console.warn(`[Auth] Login failed: Incorrect password for "${user.email}" from IP: ${ip} (Failed attempts: ${failCount}/${MAX_LOGIN_ATTEMPTS})`);
       const payload: Record<string, any> = { error: 'Invalid email or password.' };
       if (failCount >= WARN_AFTER_FAILURES) payload.remainingAttempts = remainingAttempts;
       return res.status(401).json(payload);
@@ -170,6 +173,8 @@ authRouter.post('/login', validateBody(LoginSchema), async (req: Request, res: R
       user.role,
       `User ${user.email} logged in successfully`
     );
+
+    console.log(`[Auth] Successful login: "${user.name}" (${user.email}) [Role: ${user.role}]`);
 
     const safeUser: User = {
       id: user.id,
@@ -425,6 +430,8 @@ authRouter.post('/switch-role', async (req: Request, res: Response) => {
       createdAt: targetUser.createdAt,
     };
 
+    console.log(`[Auth] Persona switched: "${targetUser.name}" (${targetUser.email}) [Role: ${targetUser.role}]`);
+
     res.json({
       token,
       refreshToken,
@@ -508,11 +515,14 @@ authRouter.post('/refresh', async (req: Request, res: Response) => {
     }
 
     if (!user || user.active === false) {
+      console.warn('[Auth] Token refresh failed: Session has expired or been revoked');
       return res.status(401).json({
         error: 'Your session has expired or has been revoked. Please sign in again.',
         code: 'SESSION_REVOKED',
       });
     }
+
+    console.log(`[Auth] Session refreshed for "${user.name}" (${user.email}) [Role: ${user.role}]`);
 
     const currentVersion = user.tokenVersion ?? 1;
     const newAccessToken = generateAccessToken(user);
@@ -625,6 +635,7 @@ authRouter.post('/logout', authenticateToken, async (req: AuthenticatedRequest, 
         '',
         `User ${req.user.email} signed out and active session tokens were revoked.`
       );
+      console.log(`[Auth] User signed out: "${req.user.name}" (${req.user.email})`);
     }
 
     res.json({
@@ -690,6 +701,8 @@ authRouter.put(
         '',
         `User ${req.user.email} changed their password (previous sessions invalidated)`
       );
+
+      console.log(`[Auth] Password updated for "${req.user.name}" (${req.user.email}). Sessions rotated to tokenVersion: ${updatedTokenVersion}`);
 
       const safeUser: User = {
         id: req.user.id,
