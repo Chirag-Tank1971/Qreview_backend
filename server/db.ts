@@ -41,6 +41,7 @@ import {
   ComplianceFlag,
   EmailLog,
   DbStatus,
+  SystemConfig,
 } from '../src/types.js';
 
 let mongoClient: MongoClient | null = null;
@@ -134,6 +135,13 @@ class InMemoryCollection<T extends { id?: string; _id?: any }> {
         }
       });
     }
+
+    // Register default unique constraints for core collections
+    if (name === 'employeeReviews') {
+      this.uniqueIndexes.push({ fields: ['employeeId', 'reviewPeriodId'], name: 'employeeId_1_reviewPeriodId_1' });
+    } else if (name === 'appraisals') {
+      this.uniqueIndexes.push({ fields: ['employeeId', 'appraisalYear'], name: 'employeeId_1_appraisalYear_1' });
+    }
   }
 
   async find(filter: any = {}): Promise<{ toArray: () => Promise<T[]> }> {
@@ -170,7 +178,28 @@ class InMemoryCollection<T extends { id?: string; _id?: any }> {
     return resolved.length > 0 ? resolved[0] : null;
   }
 
+  private uniqueIndexes: Array<{ fields: string[]; name: string }> = [];
+
   async insertOne(doc: T): Promise<{ insertedId: string; acknowledged: boolean }> {
+    // Enforce unique index constraints
+    for (const uIdx of this.uniqueIndexes) {
+      const conflict = Array.from(this.items.values()).find((existing) => {
+        return uIdx.fields.every((field) => {
+          const docVal = (doc as any)[field];
+          const existVal = (existing as any)[field];
+          return docVal !== undefined && docVal !== null && docVal === existVal;
+        });
+      });
+      if (conflict) {
+        const conflictFields = uIdx.fields.map((f) => `${f}: ${(doc as any)[f]}`).join(', ');
+        const error: any = new Error(
+          `E11000 duplicate key error collection: ${this.name} index: ${uIdx.name} dup key: { ${conflictFields} }`
+        );
+        error.code = 11000;
+        throw error;
+      }
+    }
+
     const id = doc.id || (doc as any)._id || `doc_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
     const saved = { ...doc, id: String(id), _id: String(id) };
     this.items.set(String(id), saved);
@@ -246,7 +275,15 @@ class InMemoryCollection<T extends { id?: string; _id?: any }> {
     return items.length;
   }
 
-  async createIndex(_keys: any, _options?: any): Promise<string> {
+  async createIndex(keys: any, options?: { unique?: boolean }): Promise<string> {
+    if (options?.unique) {
+      const fields = Object.keys(keys);
+      const name = fields.join('_1_') + '_1';
+      if (!this.uniqueIndexes.some((idx) => idx.name === name)) {
+        this.uniqueIndexes.push({ fields, name });
+      }
+      return name;
+    }
     return 'index_created';
   }
 
@@ -275,6 +312,9 @@ export const memoryDb = {
   talentRecords: new InMemoryCollection<TalentRecord>('talent_records', SEED_TALENT_RECORDS),
   complianceFlags: new InMemoryCollection<ComplianceFlag>('compliance_flags', SEED_COMPLIANCE_FLAGS),
   emailLogs: new InMemoryCollection<EmailLog>('email_logs', []),
+  systemConfig: new InMemoryCollection<SystemConfig>('system_config', [
+    { id: 'default', hodApprovalEnabled: false, selfAssessmentEnabled: false, updatedAt: new Date().toISOString() },
+  ]),
 };
 
 export async function initDatabase(): Promise<void> {
@@ -312,6 +352,15 @@ export async function initDatabase(): Promise<void> {
     console.log('[Database] No MONGODB_URI found in environment. Initialized in High-Performance Embedded Persistent Document Mode.');
     dbMode = 'EMBEDDED_COMPATIBLE';
   }
+
+  // Register unique indexes for Embedded mode as well
+  try {
+    await memoryDb.employeeReviews.createIndex({ employeeId: 1, reviewPeriodId: 1 }, { unique: true });
+    await memoryDb.appraisals.createIndex({ employeeId: 1, appraisalYear: 1 }, { unique: true });
+    await memoryDb.users.createIndex({ email: 1 }, { unique: true });
+  } catch (_e) {
+    // ignore
+  }
 }
 
 const MONGO_COLLECTION_MAP: Record<string, string> = {
@@ -322,6 +371,7 @@ const MONGO_COLLECTION_MAP: Record<string, string> = {
   talentRecords: 'talent_records',
   complianceFlags: 'compliance_flags',
   emailLogs: 'email_logs',
+  systemConfig: 'system_config',
 };
 
 export function getDbCollection<T extends { id?: string; _id?: any }>(collectionName: keyof typeof memoryDb): any {
@@ -393,6 +443,7 @@ async function seedMongoCollectionsIfEmpty(db: Db): Promise<void> {
     await revCol.createIndex({ reviewPeriodId: 1 });
 
     const appCol = getDbCollection('appraisals');
+    await appCol.createIndex({ employeeId: 1, appraisalYear: 1 }, { unique: true });
     await appCol.createIndex({ employeeId: 1 });
     await appCol.createIndex({ status: 1 });
     await appCol.createIndex({ appraisalYear: 1 });
@@ -417,20 +468,50 @@ async function seedMongoCollectionsIfEmpty(db: Db): Promise<void> {
 }
 
 export async function getDatabaseStatus(): Promise<DbStatus> {
+  const [
+    users,
+    employees,
+    departments,
+    designations,
+    cycles,
+    kras,
+    kraTemplates,
+    reviewPeriods,
+    employeeReviews,
+    appraisals,
+    notifications,
+    auditLogs,
+    emailLogs,
+  ] = await Promise.all([
+    getDbCollection('users').countDocuments(),
+    getDbCollection('employees').countDocuments(),
+    getDbCollection('departments').countDocuments(),
+    getDbCollection('designations').countDocuments(),
+    getDbCollection('cycles').countDocuments(),
+    getDbCollection('kras').countDocuments(),
+    getDbCollection('kraTemplates').countDocuments(),
+    getDbCollection('reviewPeriods').countDocuments(),
+    getDbCollection('employeeReviews').countDocuments(),
+    getDbCollection('appraisals').countDocuments(),
+    getDbCollection('notifications').countDocuments(),
+    getDbCollection('auditLogs').countDocuments(),
+    getDbCollection('emailLogs').countDocuments(),
+  ]);
+
   const counts = {
-    users: await getDbCollection('users').countDocuments(),
-    employees: await getDbCollection('employees').countDocuments(),
-    departments: await getDbCollection('departments').countDocuments(),
-    designations: await getDbCollection('designations').countDocuments(),
-    cycles: await getDbCollection('cycles').countDocuments(),
-    kras: await getDbCollection('kras').countDocuments(),
-    kraTemplates: await getDbCollection('kraTemplates').countDocuments(),
-    reviewPeriods: await getDbCollection('reviewPeriods').countDocuments(),
-    employeeReviews: await getDbCollection('employeeReviews').countDocuments(),
-    appraisals: await getDbCollection('appraisals').countDocuments(),
-    notifications: await getDbCollection('notifications').countDocuments(),
-    auditLogs: await getDbCollection('auditLogs').countDocuments(),
-    emailLogs: await getDbCollection('emailLogs').countDocuments(),
+    users,
+    employees,
+    departments,
+    designations,
+    cycles,
+    kras,
+    kraTemplates,
+    reviewPeriods,
+    employeeReviews,
+    appraisals,
+    notifications,
+    auditLogs,
+    emailLogs,
   };
 
   return {

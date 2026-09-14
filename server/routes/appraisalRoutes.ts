@@ -8,6 +8,7 @@ import {
   HodCalibrationSchema,
   HrApprovalSchema,
   AcknowledgementSchema,
+  FinalizeAppraisalSchema,
 } from '../validation.js';
 import {
   Appraisal,
@@ -32,7 +33,14 @@ appraisalRouter.use(authenticateToken);
 
 // Compute standard rating and default increment bracket based on rolling 4-quarter score
 export function computeAppraisalMatrix(avgScore: number) {
-  if (avgScore >= 4.5) {
+  if (avgScore <= 0) {
+    return {
+      recommendedRating: 'PENDING',
+      suggestedIncrementMin: 0,
+      suggestedIncrementMax: 0,
+      defaultIncrement: 0,
+    };
+  } else if (avgScore >= 4.5) {
     return {
       recommendedRating: 'OUTSTANDING',
       suggestedIncrementMin: 15,
@@ -62,6 +70,100 @@ export function computeAppraisalMatrix(avgScore: number) {
     };
   }
 }
+
+/**
+ * GET /api/appraisals/due
+ * Section 29: Returns only employees whose configured appraisal cycle month is due
+ */
+appraisalRouter.get(
+  '/appraisals/due',
+  requireRoles('SUPER_ADMIN', 'HR', 'HOD', 'MANAGEMENT', 'REPORTING_MANAGER', 'MANAGER'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const now = new Date();
+      const currentMonth = now.getMonth() + 1;
+      const currentYear = now.getFullYear();
+
+      const month = req.query.month ? parseInt(req.query.month as string, 10) : currentMonth;
+      const year = req.query.year ? parseInt(req.query.year as string, 10) : currentYear;
+      const cycleId = req.query.cycleId as string;
+
+      const cyclesCol = getDbCollection('cycles');
+      const employeesCol = getDbCollection('employees');
+      const appraisalsCol = getDbCollection('appraisals');
+
+      const allCycles: Cycle[] = await (await cyclesCol.find({})).toArray();
+      // Filter cycles where appraisalMonth matches
+      const matchingCycles = allCycles.filter((c) => c.appraisalMonth === month && (!cycleId || c.id === cycleId));
+      const matchingCycleIds = new Set(matchingCycles.map((c) => c.id));
+      const matchingCycleCodes = new Set(matchingCycles.map((c) => c.code));
+
+      let activeEmployees: Employee[] = await (await employeesCol.find({ status: 'ACTIVE' })).toArray();
+      // Filter employees assigned to these cycles
+      let dueEmployees = activeEmployees.filter(
+        (e) => (e.cycleId && matchingCycleIds.has(e.cycleId)) || (e.cycleCode && matchingCycleCodes.has(e.cycleCode))
+      );
+
+      // Strict role scoping: Managers only see their direct reports
+      if (req.user?.role === 'REPORTING_MANAGER' || req.user?.role === 'MANAGER') {
+        dueEmployees = dueEmployees.filter(
+          (e) => e.managerId === req.user?.employeeId || e.managerId === req.user?.id
+        );
+      } else if (req.user?.role === 'HOD') {
+        const deptId = req.employeeProfile?.departmentId;
+        dueEmployees = dueEmployees.filter(
+          (e) => e.departmentId === deptId || e.hodId === req.user?.employeeId
+        );
+      }
+
+      // Check existing appraisal records for this cohort
+      const existingAppraisals: Appraisal[] = await (
+        await appraisalsCol.find({ appraisalYear: year, appraisalMonth: month })
+      ).toArray();
+      const appraisalMap = new Map<string, Appraisal>();
+      existingAppraisals.forEach((a) => appraisalMap.set(a.employeeId, a));
+
+      const result = dueEmployees.map((emp) => {
+        const existing = appraisalMap.get(emp.id);
+        const cycle = allCycles.find((c) => c.id === emp.cycleId || c.code === emp.cycleCode);
+
+        return {
+          employeeId: emp.id,
+          employeeCode: emp.employeeCode,
+          employeeName: emp.name,
+          departmentName: emp.departmentName,
+          designationName: emp.designationName,
+          managerName: emp.managerName,
+          cycleId: cycle?.id || emp.cycleId,
+          cycleCode: cycle?.code || emp.cycleCode,
+          cycleName: cycle?.name || 'Cycle',
+          appraisalMonth: month,
+          appraisalYear: year,
+          currentCtc: emp.currentCtc,
+          hasInitiatedAppraisal: !!existing,
+          appraisalStatus: existing ? existing.status : 'NOT_INITIATED',
+          appraisalId: existing?.id,
+          finalScore: existing?.averageQuarterlyScore,
+          proposedIncrement: existing?.proposedIncrementPercentage,
+          approvedIncrement: existing?.approvedIncrementPercentage,
+          isLocked: existing?.isLocked || false,
+        };
+      });
+
+      res.json({
+        month,
+        year,
+        totalDue: result.length,
+        initiatedCount: result.filter((r) => r.hasInitiatedAppraisal).length,
+        pendingInitiationCount: result.filter((r) => !r.hasInitiatedAppraisal).length,
+        employees: result,
+      });
+    } catch (err: any) {
+      console.error('Error in GET /api/appraisals/due:', err);
+      res.status(500).json({ error: 'Failed to fetch due appraisals.' });
+    }
+  }
+);
 
 /**
  * GET /api/appraisals
@@ -108,7 +210,7 @@ appraisalRouter.get('/appraisals', async (req: AuthenticatedRequest, res: Respon
     if (user.role === 'EMPLOYEE') {
       // Employees can STRICTLY ONLY view their own appraisal record
       appraisals = appraisals.filter((a) => a.employeeId === user.employeeId);
-    } else if (user.role === 'MANAGER') {
+    } else if (user.role === 'REPORTING_MANAGER' || user.role === 'MANAGER') {
       // Managers can view their direct reports or their own record
       appraisals = appraisals.filter((a) => {
         const empRecord = empMap.get(a.employeeId);
@@ -233,7 +335,7 @@ appraisalRouter.post(
  */
 appraisalRouter.get(
   '/appraisals/stats',
-  requireRoles('SUPER_ADMIN', 'HR', 'HOD', 'MANAGEMENT', 'MANAGER'),
+  requireRoles('SUPER_ADMIN', 'HR', 'HOD', 'MANAGEMENT', 'REPORTING_MANAGER', 'MANAGER'),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const user = req.user;
@@ -247,7 +349,7 @@ appraisalRouter.get(
       allEmployees.forEach((e) => empMap.set(e.id, e));
 
       // Role-based scope
-      if (user?.role === 'MANAGER') {
+      if (user?.role === 'REPORTING_MANAGER' || user?.role === 'MANAGER') {
         appraisals = appraisals.filter((a) => {
           const empRecord = empMap.get(a.employeeId);
           return (
@@ -356,8 +458,11 @@ appraisalRouter.get(
       const cyclesCol = getDbCollection('cycles');
 
       let allAppraisals: Appraisal[] = await (await appraisalsCol.find({})).toArray();
-      const allDepartments: Department[] = await (await departmentsCol.find({ active: true })).toArray();
-      const allEmployees: Employee[] = await (await employeesCol.find({ status: 'ACTIVE' })).toArray();
+      const allDeptsRaw: any[] = await (await departmentsCol.find({})).toArray();
+      const allDepartments: Department[] = allDeptsRaw.filter(
+        (d) => d.active !== false && d.isActive !== false && d.status !== 'INACTIVE'
+      );
+      const allEmployees: Employee[] = await (await employeesCol.find({ status: { $ne: 'INACTIVE' } })).toArray();
       const allCycles: Cycle[] = await (await cyclesCol.find({})).toArray();
 
       if (cycleId && cycleId !== 'ALL') {
@@ -403,15 +508,28 @@ appraisalRouter.get(
       const departmentBellCurves: any[] = [];
 
       allDepartments.forEach((dept) => {
-        const deptAppraisals = allAppraisals.filter(
-          (a) => a.departmentId === dept.id || a.departmentName.toLowerCase() === dept.name.toLowerCase()
-        );
-        const headcount = deptAppraisals.length;
-        const currentCtc = deptAppraisals.reduce((sum, a) => sum + (a.currentCtc || 0), 0);
+        const deptAppraisals = allAppraisals.filter((a) => {
+          if (a.departmentId && a.departmentId === dept.id) return true;
+          if (a.departmentName && dept.name && a.departmentName.trim().toLowerCase() === dept.name.trim().toLowerCase()) return true;
+          return false;
+        });
+
+        const deptEmployees = allEmployees.filter((e) => {
+          if (e.departmentId && e.departmentId === dept.id) return true;
+          if (e.departmentName && dept.name && e.departmentName.trim().toLowerCase() === dept.name.trim().toLowerCase()) return true;
+          if ((e as any).department && dept.name && (e as any).department.trim().toLowerCase() === dept.name.trim().toLowerCase()) return true;
+          return false;
+        });
+
+        const headcount = deptAppraisals.length > 0 ? deptAppraisals.length : deptEmployees.length;
+        const currentCtc = deptAppraisals.length > 0
+          ? deptAppraisals.reduce((sum, a) => sum + (a.currentCtc || 0), 0)
+          : deptEmployees.reduce((sum, e) => sum + (e.currentCtc || 0), 0);
+
         const budgetCapPercent = typeof dept.budgetCapPercent === 'number' && dept.budgetCapPercent >= 0 ? dept.budgetCapPercent : 12.0;
         const allocatedBudgetAmount = currentCtc * (budgetCapPercent / 100);
         const revisedCtc = deptAppraisals.reduce((sum, a) => sum + (a.revisedCtc || a.currentCtc || 0), 0);
-        const actualSpentAmount = revisedCtc - currentCtc;
+        const actualSpentAmount = deptAppraisals.length > 0 ? (revisedCtc - currentCtc) : 0;
         const remainingBudgetAmount = allocatedBudgetAmount - actualSpentAmount;
         const actualSpentPercent = currentCtc > 0 ? Number(((actualSpentAmount / currentCtc) * 100).toFixed(2)) : 0;
         const isOverBudget = actualSpentAmount > allocatedBudgetAmount;
@@ -421,9 +539,9 @@ appraisalRouter.get(
         else if (actualSpentAmount > allocatedBudgetAmount * 0.9) status = 'NEAR_CAP';
 
         const deptScores = deptAppraisals.reduce((sum, a) => sum + (a.averageQuarterlyScore || 0), 0);
-        const avgScore = headcount > 0 ? Number((deptScores / headcount).toFixed(2)) : 0;
+        const avgScore = deptAppraisals.length > 0 ? Number((deptScores / deptAppraisals.length).toFixed(2)) : 0;
         const deptIncs = deptAppraisals.reduce((sum, a) => sum + (a.approvedIncrementPercentage || a.proposedIncrementPercentage || 0), 0);
-        const avgInc = headcount > 0 ? Number((deptIncs / headcount).toFixed(2)) : 0;
+        const avgInc = deptAppraisals.length > 0 ? Number((deptIncs / deptAppraisals.length).toFixed(2)) : 0;
         const promoCount = deptAppraisals.filter((a) => a.promotionRecommended || a.hodCalibration?.promotionApproved).length;
 
         departmentBudgets.push({
@@ -443,35 +561,38 @@ appraisalRouter.get(
           promotionsCount: promoCount,
         });
 
-        // Bell curve for department
+        // Bell curve for department (based on active appraisals in this cycle/cohort)
+        const totalDeptAppraisals = deptAppraisals.length;
         const deptOut = deptAppraisals.filter((a) => a.averageQuarterlyScore >= 4.5).length;
         const deptExc = deptAppraisals.filter((a) => a.averageQuarterlyScore >= 3.8 && a.averageQuarterlyScore < 4.5).length;
         const deptMet = deptAppraisals.filter((a) => a.averageQuarterlyScore >= 2.8 && a.averageQuarterlyScore < 3.8).length;
         const deptNid = deptAppraisals.filter((a) => a.averageQuarterlyScore < 2.8).length;
 
-        const pOut = headcount > 0 ? Number(((deptOut / headcount) * 100).toFixed(1)) : 0;
-        const pExc = headcount > 0 ? Number(((deptExc / headcount) * 100).toFixed(1)) : 0;
-        const pMet = headcount > 0 ? Number(((deptMet / headcount) * 100).toFixed(1)) : 0;
-        const pNid = headcount > 0 ? Number(((deptNid / headcount) * 100).toFixed(1)) : 0;
+        const pOut = totalDeptAppraisals > 0 ? Number(((deptOut / totalDeptAppraisals) * 100).toFixed(1)) : 0;
+        const pExc = totalDeptAppraisals > 0 ? Number(((deptExc / totalDeptAppraisals) * 100).toFixed(1)) : 0;
+        const pMet = totalDeptAppraisals > 0 ? Number(((deptMet / totalDeptAppraisals) * 100).toFixed(1)) : 0;
+        const pNid = totalDeptAppraisals > 0 ? Number(((deptNid / totalDeptAppraisals) * 100).toFixed(1)) : 0;
 
         let skewAlert: string | undefined = undefined;
         let skewSeverity: 'NORMAL' | 'WARNING' | 'CRITICAL' = 'NORMAL';
 
-        if (pOut > 30) {
-          skewAlert = `Inflation Alert: ${pOut}% top performers exceeds 10% target guideline. HOD normalization recommended.`;
-          skewSeverity = 'WARNING';
-        } else if (pNid === 0 && headcount >= 5) {
-          skewAlert = `Zero bottom bucket distribution with ${headcount} employees. Check for lenient rating bias.`;
-          skewSeverity = 'WARNING';
-        } else if (isOverBudget) {
-          skewAlert = `Budget Overrun: Actual increment spend of ${actualSpentPercent}% exceeds ${budgetCapPercent}% departmental limit.`;
-          skewSeverity = 'CRITICAL';
+        if (totalDeptAppraisals > 0) {
+          if (pOut > 30) {
+            skewAlert = `Inflation Alert: ${pOut}% top performers exceeds 10% target guideline. HOD normalization recommended.`;
+            skewSeverity = 'WARNING';
+          } else if (pNid === 0 && totalDeptAppraisals >= 5) {
+            skewAlert = `Zero bottom bucket distribution with ${totalDeptAppraisals} employees. Check for lenient rating bias.`;
+            skewSeverity = 'WARNING';
+          } else if (isOverBudget) {
+            skewAlert = `Budget Overrun: Actual increment spend of ${actualSpentPercent}% exceeds ${budgetCapPercent}% departmental limit.`;
+            skewSeverity = 'CRITICAL';
+          }
         }
 
         departmentBellCurves.push({
           departmentId: dept.id,
           departmentName: dept.name,
-          totalEmployees: headcount,
+          totalEmployees: totalDeptAppraisals,
           skewAlert,
           skewSeverity,
           buckets: [
@@ -652,7 +773,7 @@ appraisalRouter.get('/appraisals/:id', async (req: AuthenticatedRequest, res: Re
       if (appraisal.employeeId !== user.employeeId) {
         return res.status(403).json({ error: 'Access denied: You can only view your own appraisal record.' });
       }
-    } else if (user.role === 'MANAGER') {
+    } else if (user.role === 'REPORTING_MANAGER' || user.role === 'MANAGER') {
       const isManagerMatch =
         appraisal.managerId === user.employeeId ||
         appraisal.employeeId === user.employeeId ||
@@ -719,7 +840,7 @@ appraisalRouter.post(
       const auditLogsCol = getDbCollection('auditLogs');
       const notificationsCol = getDbCollection('notifications');
 
-      const eligibleEmployees: Employee[] = await (await employeesCol.find({ cycleId, status: 'ACTIVE' })).toArray();
+      const eligibleEmployees: Employee[] = await (await employeesCol.find({ cycleId, status: { $ne: 'INACTIVE' } })).toArray();
 
       if (eligibleEmployees.length === 0) {
         return res.status(400).json({ error: `No active employees found assigned to ${cycle.name}` });
@@ -754,20 +875,24 @@ appraisalRouter.post(
           reviewId: rev.id,
           strengths: rev.strengths,
           managerComments: rev.managerOverallComments,
-          hrComments: rev.hrComments,
+          status: rev.status,
         }));
 
-        // Calculate rolling 4-quarter average score
-        const validScores = quarterlyHistory.filter((q) => q.score > 0).map((q) => q.score);
+        // Calculate rolling 4-quarter average score from manager-evaluated reviews only
+        const evaluatedStatuses = ['MANAGER_COMPLETED', 'HR_PENDING', 'CLOSED'];
+        const validScores = quarterlyHistory
+          .filter((q) => (q.status ? evaluatedStatuses.includes(q.status) : false) && (q.score || 0) > 0)
+          .map((q) => q.score);
+        const hasScores = validScores.length > 0;
         const avgScore =
-          validScores.length > 0
+          hasScores
             ? Number((validScores.reduce((sum, s) => sum + s, 0) / validScores.length).toFixed(2))
-            : 4.0; // Standard default
+            : 0;
 
         const matrix = computeAppraisalMatrix(avgScore);
-        const currentCtc = emp.currentCtc || 1500000;
-        const proposedIncrementPercent = matrix.defaultIncrement;
-        const incrementAmount = Math.round((currentCtc * proposedIncrementPercent) / 100);
+        const currentCtc = emp.currentCtc || 0;
+        const proposedIncrementPercent = hasScores ? matrix.defaultIncrement : 0;
+        const incrementAmount = hasScores ? Math.round((currentCtc * proposedIncrementPercent) / 100) : 0;
         const revisedCtc = currentCtc + incrementAmount;
 
         const appraisalDoc: Appraisal = {
@@ -793,14 +918,14 @@ appraisalRouter.post(
           currency: emp.currency || '₹',
           quarterlyHistory,
           averageQuarterlyScore: avgScore,
-          recommendedRating: matrix.recommendedRating,
-          suggestedIncrementMin: matrix.suggestedIncrementMin,
-          suggestedIncrementMax: matrix.suggestedIncrementMax,
-          finalRating: matrix.recommendedRating,
+          recommendedRating: hasScores ? matrix.recommendedRating : 'PENDING',
+          suggestedIncrementMin: hasScores ? matrix.suggestedIncrementMin : 0,
+          suggestedIncrementMax: hasScores ? matrix.suggestedIncrementMax : 0,
+          finalRating: hasScores ? matrix.recommendedRating : 'PENDING',
           proposedIncrementPercentage: proposedIncrementPercent,
-          approvedIncrementPercentage: proposedIncrementPercent,
-          incrementAmount,
-          revisedCtc,
+          approvedIncrementPercentage: 0,
+          incrementAmount: 0,
+          revisedCtc: currentCtc,
           promotionRecommended: false,
           effectiveDate: (() => {
             const m = cycle.appraisalMonth || 1;
@@ -872,7 +997,7 @@ appraisalRouter.post(
  */
 appraisalRouter.put(
   '/appraisals/:id/manager-recommend',
-  requireRoles('MANAGER', 'SUPER_ADMIN', 'HR'),
+  requireRoles('REPORTING_MANAGER', 'MANAGER', 'SUPER_ADMIN', 'HR'),
   validateBody(ManagerRecommendationSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
@@ -909,7 +1034,7 @@ appraisalRouter.put(
       }
 
       // Role check: If caller is MANAGER, verify they are the assigned reporting manager
-      if (user?.role === 'MANAGER' && appraisal.managerId !== user.employeeId) {
+      if ((user?.role === 'REPORTING_MANAGER' || user?.role === 'MANAGER') && appraisal.managerId !== user.employeeId) {
         return res.status(403).json({ error: 'Unauthorized: You can only submit recommendations for your assigned direct reports.' });
       }
 
@@ -925,7 +1050,7 @@ appraisalRouter.put(
         promotionDesignationName: promotionDesignationName || undefined,
         justification: justification || 'Recommended based on rolling quarterly performance.',
         strengthsSummary: strengthsSummary || '',
-        recommendedBy: user?.id || 'usr_manager',
+        recommendedBy: user?.id || user?.employeeId || '',
         recommendedByName: user?.name || 'Reporting Manager',
         recommendedAt: new Date().toISOString(),
       };
@@ -948,18 +1073,24 @@ appraisalRouter.put(
 
       // Notify HOD
       const notifsCol = getDbCollection('notifications');
-      await notifsCol.insertOne({
-        id: `notif_${Date.now()}`,
-        userId: appraisal.hodId || undefined,
-        userRole: 'HOD',
-        type: 'HOD_ACTION_REQUIRED',
-        title: `Manager Appraisal Submitted: ${appraisal.employeeName}`,
-        message: `${user?.name || 'Manager'} submitted recommendation (${incPercent}% increment${promotionRecommended ? ' + Promotion' : ''}) for ${appraisal.employeeName}. Ready for HOD calibration.`,
-        isRead: false,
-        priority: 'HIGH',
-        metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals' },
-        createdAt: new Date().toISOString(),
-      });
+      await notifsCol.updateOne(
+        { 'metadata.appraisalId': id, type: 'HOD_ACTION_REQUIRED' },
+        {
+          $set: {
+            id: `notif_${id}_hod`,
+            userId: appraisal.hodId || undefined,
+            userRole: 'HOD',
+            type: 'HOD_ACTION_REQUIRED',
+            title: `Manager Appraisal Submitted: ${appraisal.employeeName}`,
+            message: `${user?.name || 'Manager'} submitted recommendation (${incPercent}% increment${promotionRecommended ? ' + Promotion' : ''}) for ${appraisal.employeeName}. Ready for HOD calibration.`,
+            isRead: false,
+            priority: 'HIGH',
+            metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals' },
+            createdAt: new Date().toISOString(),
+          },
+        },
+        { upsert: true }
+      );
 
       // Audit log
       if (user) {
@@ -992,7 +1123,7 @@ appraisalRouter.put(
  */
 appraisalRouter.put(
   '/appraisals/:id/hod-calibrate',
-  requireRoles('HOD', 'SUPER_ADMIN', 'HR'),
+  requireRoles('SUPER_ADMIN', 'HR', 'HOD'),
   validateBody(HodCalibrationSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
@@ -1005,6 +1136,16 @@ appraisalRouter.put(
 
       if (!appraisal) {
         return res.status(404).json({ error: 'Appraisal record not found' });
+      }
+
+      // HOD Department Verification (Must precede all state and status checks to enforce strict department boundary)
+      if (user?.role === 'HOD') {
+        const isDeptMatch =
+          (req.employeeProfile?.departmentId && appraisal.departmentId === req.employeeProfile.departmentId) ||
+          (req.employeeProfile?.departmentName && appraisal.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase());
+        if (appraisal.hodId !== user.employeeId && !isDeptMatch) {
+          return res.status(403).json({ error: 'Unauthorized: You can only calibrate appraisals within your department.' });
+        }
       }
 
       if (appraisal.isLocked) {
@@ -1021,16 +1162,6 @@ appraisalRouter.put(
         return res.status(400).json({ error: 'Cannot calibrate appraisal: Employee is currently serving NOTICE period and ineligible for annual increment/promotion.' });
       }
 
-      // HOD Department Verification
-      if (user?.role === 'HOD') {
-        const isDeptMatch =
-          (req.employeeProfile?.departmentId && appraisal.departmentId === req.employeeProfile.departmentId) ||
-          (req.employeeProfile?.departmentName && appraisal.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase());
-        if (appraisal.hodId !== user.employeeId && !isDeptMatch) {
-          return res.status(403).json({ error: 'Unauthorized: You can only calibrate appraisals within your department.' });
-        }
-      }
-
       const currentCtc = appraisal.currentCtc;
       const finalInc = Number(calibratedIncrementPercent) || appraisal.proposedIncrementPercentage;
       const incrementAmount = Math.round((currentCtc * finalInc) / 100);
@@ -1041,7 +1172,7 @@ appraisalRouter.put(
         promotionApproved: Boolean(promotionApproved),
         calibratedRating: calibratedRating || appraisal.recommendedRating,
         notes: notes || 'HOD departmental calibration and budget alignment completed.',
-        calibratedBy: user?.id || 'usr_hod',
+        calibratedBy: user?.id || user?.employeeId || '',
         calibratedByName: user?.name || 'Head of Department',
         calibratedAt: new Date().toISOString(),
       };
@@ -1062,18 +1193,24 @@ appraisalRouter.put(
 
       // Notify HR of HOD calibration completion
       const notifsCol = getDbCollection('notifications');
-      await notifsCol.insertOne({
-        id: `notif_${Date.now()}`,
-        userId: 'ALL',
-        userRole: 'HR',
-        type: 'HOD_ACTION_REQUIRED',
-        title: `Appraisal Calibrated: ${appraisal.employeeName}`,
-        message: `${user?.name || 'HOD'} calibrated appraisal for ${appraisal.employeeName} (${finalInc}% increment). Ready for HR final approval.`,
-        isRead: false,
-        priority: 'HIGH',
-        metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals', status: 'HOD_CALIBRATED', openDetail: true },
-        createdAt: new Date().toISOString(),
-      });
+      await notifsCol.updateOne(
+        { 'metadata.appraisalId': id, type: 'HOD_ACTION_REQUIRED', userRole: 'HR' },
+        {
+          $set: {
+            id: `notif_${id}_calibrated_hr`,
+            userId: 'ALL',
+            userRole: 'HR',
+            type: 'HOD_ACTION_REQUIRED',
+            title: `Appraisal Calibrated: ${appraisal.employeeName}`,
+            message: `${user?.name || 'HOD'} calibrated appraisal for ${appraisal.employeeName} (${finalInc}% increment). Ready for HR final approval.`,
+            isRead: false,
+            priority: 'HIGH',
+            metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals', status: 'HOD_CALIBRATED', openDetail: true },
+            createdAt: new Date().toISOString(),
+          },
+        },
+        { upsert: true }
+      );
 
       if (user) {
         await recordAuditLog(
@@ -1143,7 +1280,7 @@ appraisalRouter.put(
         letterGenerated: true,
         letterGeneratedAt: new Date().toISOString(),
         notes: notes || 'HR final approval and compensation verification completed.',
-        approvedBy: user?.id || 'usr_hr',
+        approvedBy: user?.id || user?.employeeId || '',
         approvedByName: user?.name || 'HR Manager',
         approvedAt: new Date().toISOString(),
       };
@@ -1164,18 +1301,24 @@ appraisalRouter.put(
 
       // Notify HOD
       const notifsCol = getDbCollection('notifications');
-      await notifsCol.insertOne({
-        id: `notif_${Date.now()}`,
-        userId: appraisal.hodId || undefined,
-        userRole: 'HOD',
-        type: 'APPRAISAL_DUE',
-        title: `Appraisal Approved by HR: ${appraisal.employeeName}`,
-        message: `HR final approval confirmed for ${appraisal.employeeName} (${approvedInc}% increment). Letter generated and staged for release.`,
-        isRead: false,
-        priority: 'MEDIUM',
-        metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals' },
-        createdAt: new Date().toISOString(),
-      });
+      await notifsCol.updateOne(
+        { 'metadata.appraisalId': id, type: 'APPRAISAL_DUE', userRole: 'HOD' },
+        {
+          $set: {
+            id: `notif_${id}_approved_hod`,
+            userId: appraisal.hodId || undefined,
+            userRole: 'HOD',
+            type: 'APPRAISAL_DUE',
+            title: `Appraisal Approved by HR: ${appraisal.employeeName}`,
+            message: `HR final approval confirmed for ${appraisal.employeeName} (${approvedInc}% increment). Letter generated and staged for release.`,
+            isRead: false,
+            priority: 'MEDIUM',
+            metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals' },
+            createdAt: new Date().toISOString(),
+          },
+        },
+        { upsert: true }
+      );
 
       if (user) {
         await recordAuditLog(
@@ -1252,18 +1395,24 @@ appraisalRouter.put(
 
       // Send Notification to Employee
       const notificationsCol = getDbCollection('notifications');
-      await notificationsCol.insertOne({
-        id: `notif_${Date.now()}`,
-        userId: appraisal.employeeId,
-        userRole: 'EMPLOYEE',
-        type: 'LETTER_RELEASED',
-        title: '🎉 Annual Appraisal Letter Released',
-        message: `Your annual performance appraisal for ${appraisal.cycleName} has been approved and locked. View your appraisal letter for compensation details.`,
-        isRead: false,
-        priority: 'HIGH',
-        metadata: { appraisalId: id, cycleId: appraisal.cycleId, subTab: 'appraisal', openLetter: true },
-        createdAt: lockedAt,
-      });
+      await notificationsCol.updateOne(
+        { 'metadata.appraisalId': id, userId: appraisal.employeeId, type: 'LETTER_RELEASED' },
+        {
+          $set: {
+            id: `notif_${id}_letter_rel`,
+            userId: appraisal.employeeId,
+            userRole: 'EMPLOYEE',
+            type: 'LETTER_RELEASED',
+            title: '🎉 Annual Appraisal Letter Released',
+            message: `Your annual performance appraisal for ${appraisal.cycleName} has been approved and locked. View your appraisal letter for compensation details.`,
+            isRead: false,
+            priority: 'HIGH',
+            metadata: { appraisalId: id, cycleId: appraisal.cycleId, subTab: 'appraisal', openLetter: true },
+            createdAt: lockedAt,
+          },
+        },
+        { upsert: true }
+      );
 
       // Dispatch Email Notification to Employee (Asynchronously)
       (async () => {
@@ -1340,7 +1489,7 @@ appraisalRouter.get('/appraisals/:id/letter', async (req: AuthenticatedRequest, 
       if (appraisal.employeeId !== user.employeeId) {
         return res.status(403).json({ error: 'Access denied: You may only view your own appraisal letter.' });
       }
-    } else if (user.role === 'MANAGER') {
+    } else if (user.role === 'REPORTING_MANAGER' || user.role === 'MANAGER') {
       if (appraisal.managerId !== user.employeeId && appraisal.employeeId !== user.employeeId) {
         return res.status(403).json({ error: 'Access denied: You may only view appraisal letters for your direct reports.' });
       }
@@ -1499,3 +1648,106 @@ appraisalRouter.put(
     res.status(500).json({ error: err.message || 'Failed to acknowledge appraisal' });
   }
 });
+
+/**
+ * POST /api/appraisals/:id/finalize
+ * Section 29: Finalizes and locks the annual salary appraisal.
+ * Applies the revised compensation to the employee profile and emits notifications.
+ * Super Admin & HR only.
+ */
+appraisalRouter.post(
+  '/appraisals/:id/finalize',
+  requireRoles('SUPER_ADMIN', 'HR'),
+  validateBody(FinalizeAppraisalSchema),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { remarks, updateEmployeeCtc = true } = req.body;
+
+      const appraisalsCol = getDbCollection('appraisals');
+      const appraisal: Appraisal | null = await appraisalsCol.findOne({ id });
+
+      if (!appraisal) {
+        return res.status(404).json({ error: 'Appraisal record not found.' });
+      }
+
+      if (appraisal.isLocked || appraisal.status === 'LOCKED') {
+        return res.status(400).json({ error: 'This appraisal is already finalized and locked.' });
+      }
+
+      // Pre-flight check: ensure employee has no unfinalized / pending reviews in active cycles
+      const reviewsCol = getDbCollection('employeeReviews');
+      const pendingReviews = await (await reviewsCol.find({
+        employeeId: appraisal.employeeId,
+        status: { $in: ['DRAFT', 'ASSIGNED', 'MANAGER_PENDING', 'RETURNED'] },
+      })).toArray();
+
+      if (pendingReviews.length > 0) {
+        return res.status(400).json({
+          error: `Cannot finalize appraisal: Employee has ${pendingReviews.length} quarterly review(s) still pending completion/evaluation.`,
+        });
+      }
+
+      const now = new Date().toISOString();
+      const updatedAppraisal: Appraisal = {
+        ...appraisal,
+        status: 'LOCKED',
+        isLocked: true,
+        finalizedAt: now,
+        lockedAt: now,
+        updatedAt: now,
+      };
+
+      await appraisalsCol.updateOne({ id }, { $set: updatedAppraisal });
+
+      // Update employee's currentCtc in employees collection if revisedCtc exists
+      if (updateEmployeeCtc && appraisal.revisedCtc && appraisal.employeeId) {
+        const employeesCol = getDbCollection('employees');
+        await employeesCol.updateOne(
+          { id: appraisal.employeeId },
+          {
+            $set: {
+              currentCtc: appraisal.revisedCtc,
+              updatedAt: now,
+            },
+          }
+        );
+      }
+
+      // Record Audit Log
+      await recordAuditLog(
+        req.user!.id,
+        req.user!.name,
+        req.user!.role,
+        'ANNUAL_APPRAISAL',
+        'APPRAISAL_FINALIZED',
+        id,
+        appraisal.status,
+        'LOCKED',
+        remarks || `Appraisal permanently finalized. Revised CTC: ₹${appraisal.revisedCtc?.toLocaleString() || appraisal.currentCtc?.toLocaleString()}`
+      );
+
+      // Notify Employee
+      const notifCol = getDbCollection('notifications');
+      await notifCol.insertOne({
+        id: `notif_${id}_finalized_${Date.now()}`,
+        userId: appraisal.employeeId,
+        userRole: 'EMPLOYEE',
+        type: 'LETTER_RELEASED',
+        title: `Appraisal Finalized: ${appraisal.cycleName}`,
+        message: `Your annual appraisal for ${appraisal.cycleName} has been officially approved and finalized.`,
+        isRead: false,
+        priority: 'HIGH',
+        metadata: { appraisalId: id, cycleId: appraisal.cycleId },
+        createdAt: now,
+      });
+
+      console.log(`[Appraisal] Finalized: ${id} for "${appraisal.employeeName}" (${appraisal.employeeCode}) by "${req.user?.name}" [${req.user?.role}]`);
+
+      res.json(updatedAppraisal);
+    } catch (err: any) {
+      console.error('Error in POST /api/appraisals/:id/finalize:', err);
+      res.status(500).json({ error: 'Failed to finalize appraisal: ' + (err.message || '') });
+    }
+  }
+);

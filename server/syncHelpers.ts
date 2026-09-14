@@ -11,7 +11,14 @@ import {
 } from '../src/types.js';
 
 export function computeAppraisalMatrix(avgScore: number) {
-  if (avgScore >= 4.5) {
+  if (avgScore <= 0) {
+    return {
+      recommendedRating: 'PENDING' as const,
+      suggestedIncrementMin: 0,
+      suggestedIncrementMax: 0,
+      defaultIncrement: 0,
+    };
+  } else if (avgScore >= 4.5) {
     return {
       recommendedRating: 'OUTSTANDING' as const,
       suggestedIncrementMin: 15,
@@ -67,7 +74,14 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
       });
 
       if (existingReview) {
-        // Sync manager/hod/department fields if changed
+        // CRITICAL HISTORICAL IMMUTABILITY:
+        // Finalized and closed reviews must NEVER be overwritten simply because employee
+        // changed department, designation, or reporting manager.
+        if (existingReview.isClosed || existingReview.status === 'CLOSED') {
+          continue;
+        }
+
+        // For open / unsubmitted / editable reviews only, sync manager/hod/department fields
         await reviewsCol.updateOne(
           { id: existingReview.id },
           {
@@ -82,137 +96,146 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
               hodId: emp.hodId,
               hodName: emp.hodName,
               cycleId: emp.cycleId,
-              cycleCode: emp.cycleCode,
+              cycleCode: emp.cycleCode || empCycle?.code || 'A',
               cycleColor: emp.cycleColor || empCycle?.colorHex || '#1e3a8a',
               updatedAt: new Date().toISOString(),
             },
           }
         );
-      } else {
-        // Find matching KRA template
-        let template = allTemplates.find((t) => t.id === emp.currentKraTemplateId);
-        if (!template && emp.designationId) {
-          template = allTemplates.find((t) => t.designationId === emp.designationId);
+      } else if (period.status === 'ACTIVE' && (emp.status === 'ACTIVE' || emp.status === 'PROBATION')) {
+        // ONLY generate a new review if this is the currently ACTIVE period and employee joined on or before period end date
+        const empAny = emp as any;
+        const joiningTime = emp.joiningDate
+          ? new Date(emp.joiningDate).getTime()
+          : empAny.dateOfJoining
+          ? new Date(empAny.dateOfJoining).getTime()
+          : 0;
+        const periodEndTime = period.endDate ? new Date(period.endDate).getTime() : Infinity;
+
+        if (joiningTime <= periodEndTime) {
+          // Find matching KRA template
+          let template = allTemplates.find((t) => t.id === emp.currentKraTemplateId);
+          if (!template && emp.designationId) {
+            template = allTemplates.find((t) => t.designationId === emp.designationId);
+          }
+          if (!template && emp.departmentId) {
+            template = allTemplates.find((t) => t.departmentId === emp.departmentId);
+          }
+          if (!template && allTemplates.length > 0) {
+            template = allTemplates[0];
+          }
+
+          const kraSnapshot: ReviewKraSnapshot[] = (template?.items || [
+            {
+              id: 'item_fb_1',
+              title: 'Core Deliverables & Execution',
+              description: 'Timely and accurate delivery of core quarterly deliverables',
+              target: 'Complete assigned quarterly goals within SLA',
+              measurementCriteria: '1: Below SLA | 3: Meets SLA | 5: Exceeds SLA',
+              weight: 50,
+            },
+            {
+              id: 'item_fb_2',
+              title: 'Quality & Process Discipline',
+              description: 'Adherence to quality standards and zero defect slip rates',
+              target: 'Maintain high standards and zero critical defect slippages',
+              measurementCriteria: '1: Defects reported | 3: Clean execution | 5: Optimization',
+              weight: 30,
+            },
+            {
+              id: 'item_fb_3',
+              title: 'Team Collaboration & Initiative',
+              description: 'Peer collaboration, cross-functional synergy, and proactive initiatives',
+              target: 'Active cross-functional participation and peer support',
+              measurementCriteria: '1: Low initiative | 3: Solid support | 5: Proactive leadership',
+              weight: 20,
+            },
+          ]).map((item: any, idx: number) => ({
+            id: `snap_${Date.now()}_${idx}_${Math.random().toString(36).substr(2, 6)}`,
+            kraId: item.kraId || item.id,
+            kraName: item.title || item.kraName || `KRA ${idx + 1}`,
+            title: item.title || item.kraName || `KRA ${idx + 1}`,
+            description: item.description || '',
+            targetSnapshot: item.target || item.targetSnapshot || 'Meet quarterly targets',
+            weight: item.weight || 25,
+            measurementCriteria: item.measurementCriteria || '',
+            rating: 0,
+            selfRating: 0,
+            comments: '',
+            selfComments: '',
+          }));
+
+          const appraisalMonth = empCycle ? empCycle.appraisalMonth : 1;
+          const cycleQuarter = Math.ceil(appraisalMonth / 3);
+          const isAppraisalQuarter = (period.quarter === cycleQuarter);
+
+          const newReview: EmployeeReview = {
+            id: `rev_${period.id}_${emp.id}`,
+            employeeId: emp.id,
+            employeeCode: emp.employeeCode,
+            employeeName: emp.name,
+            departmentId: emp.departmentId,
+            departmentName: emp.departmentName || 'Department',
+            designationName: emp.designationName || 'Designation',
+            managerId: emp.managerId || '',
+            managerName: emp.managerName || '',
+            hodId: emp.hodId,
+            hodName: emp.hodName,
+            cycleId: emp.cycleId,
+            cycleCode: emp.cycleCode || empCycle?.code || 'A',
+            cycleColor: emp.cycleColor || empCycle?.colorHex || '#1e3a8a',
+            reviewPeriodId: period.id,
+            reviewPeriodName: period.name,
+            isAppraisalMonthDue: isAppraisalQuarter,
+            kraSnapshot: kraSnapshot,
+            status: 'ASSIGNED',
+            isSelfSubmitted: false,
+            finalScore: 0,
+            selfScore: 0,
+            strengths: '',
+            improvements: '',
+            managerOverallComments: '',
+            isClosed: false,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          };
+
+          await reviewsCol.insertOne(newReview);
+
+          // Notify employee of self-assessment due
+          try {
+            const notifCol = getDbCollection('notifications');
+            await notifCol.insertOne({
+              id: `notif_self_assess_${newReview.id}`,
+              userId: emp.id,
+              userRole: 'EMPLOYEE',
+              type: 'REVIEW_ASSIGNED',
+              title: `Self-Assessment Due: ${period.name}`,
+              message: `Your quarterly performance self-assessment for ${period.name} is open. Please complete your KRA self-ratings and submit your evaluation.`,
+              isRead: false,
+              priority: 'HIGH',
+              metadata: { reviewId: newReview.id, periodId: period.id, subTab: 'reviews', openSelfAssess: true },
+              createdAt: new Date().toISOString(),
+            });
+          } catch (_notifErr) {
+            // quiet fallback
+          }
         }
-        if (!template && emp.departmentId) {
-          template = allTemplates.find((t) => t.departmentId === emp.departmentId);
-        }
-        if (!template && allTemplates.length > 0) {
-          template = allTemplates[0];
-        }
-
-        const kraSnapshot: ReviewKraSnapshot[] = (template?.items || [
-          {
-            id: 'item_fb_1',
-            title: 'Core Deliverables & Execution',
-            description: 'Timely and accurate delivery of core quarterly deliverables',
-            target: 'Complete assigned quarterly goals within SLA',
-            measurementCriteria: '1: Below SLA | 3: Meets SLA | 5: Exceeds SLA',
-            weight: 50,
-          },
-          {
-            id: 'item_fb_2',
-            title: 'Quality & Process Discipline',
-            description: 'Adherence to quality standards and zero defect slip rates',
-            target: 'Maintain high standards and zero critical defect slippages',
-            measurementCriteria: '1: Defects reported | 3: Clean execution | 5: Optimization',
-            weight: 30,
-          },
-          {
-            id: 'item_fb_3',
-            title: 'Team Collaboration & Initiative',
-            description: 'Peer collaboration, cross-functional synergy, and proactive initiatives',
-            target: 'Active cross-functional participation and peer support',
-            measurementCriteria: '1: Low initiative | 3: Solid support | 5: Proactive leadership',
-            weight: 20,
-          },
-        ]).map((item: any, idx: number) => ({
-          id: `snap_${Date.now()}_${idx}_${Math.random().toString(36).substr(2, 6)}`,
-          kraId: item.kraId || item.id,
-          kraName: item.title || item.kraName || `KRA ${idx + 1}`,
-          title: item.title || item.kraName || `KRA ${idx + 1}`,
-          description: item.description || '',
-          targetSnapshot: item.target || item.targetSnapshot || 'Meet quarterly targets',
-          weight: item.weight || 25,
-          measurementCriteria: item.measurementCriteria || '',
-          selfRating: 4.0,
-          selfComments: 'Consistently met and exceeded key delivery milestones for this quarter.',
-          rating: 4.0,
-          comments: 'Strong execution and great team collaboration throughout the review cycle.',
-        }));
-
-        const isAppraisalQuarter = (period.quarter === 1);
-
-        const newReview: EmployeeReview = {
-          id: `rev_${period.id}_${emp.id}`,
-          employeeId: emp.id,
-          employeeCode: emp.employeeCode,
-          employeeName: emp.name,
-          departmentId: emp.departmentId,
-          departmentName: emp.departmentName || 'Department',
-          designationName: emp.designationName || 'Designation',
-          managerId: emp.managerId || '',
-          managerName: emp.managerName || '',
-          hodId: emp.hodId,
-          hodName: emp.hodName,
-          cycleId: emp.cycleId,
-          cycleCode: emp.cycleCode || 'A',
-          cycleColor: emp.cycleColor || empCycle?.colorHex || '#1e3a8a',
-          reviewPeriodId: period.id,
-          reviewPeriodName: period.name,
-          isAppraisalMonthDue: isAppraisalQuarter,
-          kraSnapshot: kraSnapshot,
-          status: 'MANAGER_PENDING',
-          isSelfSubmitted: true,
-          selfSubmittedAt: new Date().toISOString(),
-          finalScore: 4.0,
-          selfScore: 4.0,
-          strengths: 'Reliable execution, positive attitude, and consistent quality of work.',
-          improvements: 'Take on more autonomous project leadership and cross-functional initiatives.',
-          managerOverallComments: 'Solid performance throughout this quarter with high quality output.',
-          isClosed: false,
-          createdAt: new Date().toISOString(),
-          updatedAt: new Date().toISOString(),
-        };
-
-        await reviewsCol.insertOne(newReview);
       }
     }
 
-    // 2. Ensure Annual Appraisal Record exists for current year (2026)
+    // 2. Annual Appraisal records:
+    // Only update master employee metadata for EXISTING unlocked appraisals.
+    // Appraisals must NEVER be created automatically on employee save — they are initiated exclusively
+    // by HR/Super Admin through POST /api/appraisals/initiate-cycle for each 8-Cycle cohort.
     const appraisalYear = 2026;
     const existingAppraisal: Appraisal | null = await appraisalsCol.findOne({
       employeeId: emp.id,
       appraisalYear,
     });
 
-    const empReviews: EmployeeReview[] = await (
-      await reviewsCol.find({ employeeId: emp.id })
-    ).toArray();
-
-    const quarterlyHistory: AppraisalQuarterRecord[] = empReviews.map((rev) => ({
-      periodId: rev.reviewPeriodId,
-      periodName: rev.reviewPeriodName,
-      score: rev.finalScore || 4.0,
-      reviewId: rev.id,
-      strengths: rev.strengths,
-      managerComments: rev.managerOverallComments,
-      hrComments: rev.hrComments,
-    }));
-
-    const validScores = quarterlyHistory.filter((q) => q.score > 0).map((q) => q.score);
-    const avgScore =
-      validScores.length > 0
-        ? Number((validScores.reduce((sum, s) => sum + s, 0) / validScores.length).toFixed(2))
-        : 4.0;
-
-    const matrix = computeAppraisalMatrix(avgScore);
-    const currentCtc = emp.currentCtc || 1600000;
-    const proposedIncrementPercent = matrix.defaultIncrement;
-    const incrementAmount = Math.round((currentCtc * proposedIncrementPercent) / 100);
-    const revisedCtc = currentCtc + incrementAmount;
-
-    if (existingAppraisal) {
+    if (existingAppraisal && !existingAppraisal.isLocked && existingAppraisal.status !== 'LOCKED') {
+      const currentCtc = emp.currentCtc || existingAppraisal.currentCtc || 0;
       await appraisalsCol.updateOne(
         { id: existingAppraisal.id },
         {
@@ -228,8 +251,8 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
             hodId: emp.hodId,
             hodName: emp.hodName,
             cycleId: emp.cycleId,
-            cycleCode: emp.cycleCode || 'A',
-            cycleName: emp.cycleName || empCycle?.name || 'Cycle A',
+            cycleCode: emp.cycleCode || empCycle?.code || 'A',
+            cycleName: emp.cycleName || empCycle?.name || `Cycle ${emp.cycleCode || empCycle?.code || 'A'}`,
             cycleColor: emp.cycleColor || empCycle?.colorHex || '#1e3a8a',
             currentCtc,
             currency: emp.currency || '₹',
@@ -237,54 +260,6 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
           },
         }
       );
-    } else {
-      const appraisalDoc: Appraisal = {
-        id: `appr_${appraisalYear}_${emp.id}`,
-        employeeId: emp.id,
-        employeeCode: emp.employeeCode,
-        employeeName: emp.name,
-        departmentId: emp.departmentId,
-        departmentName: emp.departmentName || 'Department',
-        designationId: emp.designationId,
-        designationName: emp.designationName || 'Designation',
-        managerId: emp.managerId,
-        managerName: emp.managerName,
-        hodId: emp.hodId,
-        hodName: emp.hodName,
-        cycleId: emp.cycleId,
-        cycleCode: emp.cycleCode || 'A',
-        cycleName: emp.cycleName || empCycle?.name || 'Cycle A',
-        cycleColor: emp.cycleColor || empCycle?.colorHex || '#1e3a8a',
-        appraisalYear,
-        appraisalMonth: empCycle?.appraisalMonth || 1,
-        currentCtc,
-        currency: emp.currency || '₹',
-        quarterlyHistory: quarterlyHistory.length > 0 ? quarterlyHistory : [
-          { periodId: 'period_2026_q1', periodName: '2026-Q1 (Jan - Mar)', score: 4.0 },
-        ],
-        averageQuarterlyScore: avgScore,
-        recommendedRating: matrix.recommendedRating,
-        suggestedIncrementMin: matrix.suggestedIncrementMin,
-        suggestedIncrementMax: matrix.suggestedIncrementMax,
-        finalRating: matrix.recommendedRating,
-        proposedIncrementPercentage: proposedIncrementPercent,
-        approvedIncrementPercentage: proposedIncrementPercent,
-        incrementAmount,
-        revisedCtc,
-        promotionRecommended: false,
-        effectiveDate: (() => {
-          const m = empCycle?.appraisalMonth || 1;
-          const effMonth = (m % 12) + 1;
-          const effYear = m === 12 ? appraisalYear + 1 : appraisalYear;
-          return `${effYear}-${String(effMonth).padStart(2, '0')}-01`;
-        })(),
-        status: 'PENDING',
-        isLocked: false,
-        createdAt: new Date().toISOString(),
-        updatedAt: new Date().toISOString(),
-      };
-
-      await appraisalsCol.insertOne(appraisalDoc);
     }
   } catch (err) {
     console.error('Error syncing employee reviews and appraisals:', err);

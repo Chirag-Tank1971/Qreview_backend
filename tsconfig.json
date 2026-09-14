@@ -11,10 +11,7 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "baseUrl": ".",
-    "paths": {
-      "@shared/*": ["../shared/*"]
-    }
+    "baseUrl": "."
   },
-  "include": ["server.ts", "server/**/*", "src/**/*", "../shared/**/*"]
+  "include": ["server.ts", "server/**/*", "src/**/*"]
 }

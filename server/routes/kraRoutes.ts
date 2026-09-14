@@ -50,7 +50,7 @@ kraRouter.get('/kras', async (req: AuthenticatedRequest, res: Response) => {
  */
 kraRouter.post(
   '/kras',
-  requireRoles('SUPER_ADMIN', 'HR', 'HOD'),
+  requireRoles('SUPER_ADMIN', 'HR'),
   validateBody(CreateKraSchema),
   async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -109,7 +109,7 @@ kraRouter.post(
  */
 kraRouter.put(
   '/kras/:id',
-  requireRoles('SUPER_ADMIN', 'HR', 'HOD'),
+  requireRoles('SUPER_ADMIN', 'HR'),
   validateBody(UpdateKraSchema),
   async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -225,7 +225,7 @@ kraRouter.get('/kra-templates/:id', async (req: AuthenticatedRequest, res: Respo
  */
 kraRouter.post(
   '/kra-templates',
-  requireRoles('SUPER_ADMIN', 'HR', 'HOD'),
+  requireRoles('SUPER_ADMIN', 'HR'),
   validateBody(KraTemplateSchema),
   async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -302,7 +302,7 @@ kraRouter.post(
 /**
  * PUT /api/kra-templates/:id
  */
-kraRouter.put('/kra-templates/:id', requireRoles('SUPER_ADMIN', 'HR', 'HOD'), async (req: AuthenticatedRequest, res: Response) => {
+kraRouter.put('/kra-templates/:id', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const { title, departmentId, designationId, items, active } = req.body;

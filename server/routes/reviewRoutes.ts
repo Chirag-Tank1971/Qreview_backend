@@ -1,6 +1,13 @@
 import express, { Response } from 'express';
 import { getDbCollection } from '../db.js';
-import { authenticateToken, requireRoles, recordAuditLog, AuthenticatedRequest } from '../auth.js';
+import {
+  authenticateToken,
+  requireRoles,
+  recordAuditLog,
+  AuthenticatedRequest,
+  authorizeEmployeeAccess,
+  authorizeReviewAccess,
+} from '../auth.js';
 import { validateBody, SubmitSelfAssessmentSchema, SubmitManagerReviewSchema } from '../validation.js';
 import {
   EmployeeReview,
@@ -16,6 +23,13 @@ import {
 } from '../../src/types.js';
 import { sendNotificationEmail, resolveRecipient } from '../services/emailService.js';
 import { renderSelfAssessmentSubmittedEmail, renderManagerReviewSubmittedEmail } from '../services/emailTemplates.js';
+import {
+  generateQuarterlyReviews,
+  submitManagerReview,
+  returnReview,
+  completeHRReview,
+  saveManagerDraft,
+} from '../services/workflowService.js';
 
 export const reviewRouter = express.Router();
 
@@ -25,6 +39,28 @@ reviewRouter.use(authenticateToken);
 // ==========================================
 // 1. REVIEW PERIODS
 // ==========================================
+
+/**
+ * GET /api/review-periods/current
+ * Returns the currently active quarterly period
+ */
+reviewRouter.get('/review-periods/current', async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const periodCol = getDbCollection('reviewPeriods');
+    let current = await periodCol.findOne({ status: 'ACTIVE' });
+    if (!current) {
+      const periods: ReviewPeriod[] = await (await periodCol.find({})).toArray();
+      periods.sort((a, b) => (b.year !== a.year ? b.year - a.year : b.quarter - a.quarter));
+      current = periods[0] || null;
+    }
+    if (!current) {
+      return res.status(404).json({ error: 'No review periods found.' });
+    }
+    res.json(current);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to fetch current review period.' });
+  }
+});
 
 /**
  * GET /api/review-periods
@@ -182,15 +218,16 @@ reviewRouter.get('/reviews', async (req: AuthenticatedRequest, res: Response) =>
     // Strict RBAC Role-based visibility filtering
     if (req.user?.role === 'EMPLOYEE') {
       reviews = reviews.filter((r) => r.employeeId === req.user?.employeeId);
-    } else if (req.user?.role === 'MANAGER') {
-      // Managers can see their direct reports (or themselves)
+    } else if (req.user?.role === 'MANAGER' || req.user?.role === 'REPORTING_MANAGER') {
+      // Managers can see their direct reports (or themselves) - strictly by ID
       reviews = reviews.filter((r) => {
         const empRecord = empMap.get(r.employeeId);
         return (
           r.managerId === req.user?.employeeId ||
+          r.managerId === req.user?.id ||
           r.employeeId === req.user?.employeeId ||
           empRecord?.managerId === req.user?.employeeId ||
-          (req.user?.name && empRecord?.managerName?.toLowerCase() === req.user.name.toLowerCase())
+          empRecord?.managerId === req.user?.id
         );
       });
     } else if (req.user?.role === 'HOD') {
@@ -297,14 +334,15 @@ reviewRouter.get('/reviews/stats', async (req: AuthenticatedRequest, res: Respon
     // Strict RBAC Role-based visibility filtering
     if (req.user?.role === 'EMPLOYEE') {
       reviews = reviews.filter((r) => r.employeeId === req.user?.employeeId);
-    } else if (req.user?.role === 'MANAGER') {
+    } else if (req.user?.role === 'MANAGER' || req.user?.role === 'REPORTING_MANAGER') {
       reviews = reviews.filter((r) => {
         const empRecord = empMap.get(r.employeeId);
         return (
           r.managerId === req.user?.employeeId ||
+          r.managerId === req.user?.id ||
           r.employeeId === req.user?.employeeId ||
           empRecord?.managerId === req.user?.employeeId ||
-          (req.user?.name && empRecord?.managerName?.toLowerCase() === req.user.name.toLowerCase())
+          empRecord?.managerId === req.user?.id
         );
       });
     } else if (req.user?.role === 'HOD') {
@@ -377,54 +415,71 @@ reviewRouter.get('/reviews/stats', async (req: AuthenticatedRequest, res: Respon
 });
 
 /**
- * GET /api/reviews/:id
+ * GET /api/reviews/my-pending
+ * Returns pending reviews assigned to the currently authenticated manager
  */
-reviewRouter.get('/reviews/:id', async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const { id } = req.params;
-    const reviewCol = getDbCollection('employeeReviews');
-    const review: EmployeeReview | null = await reviewCol.findOne({ id });
+reviewRouter.get(
+  '/reviews/my-pending',
+  requireRoles('REPORTING_MANAGER', 'MANAGER', 'HOD', 'SUPER_ADMIN', 'HR'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const reviewCol = getDbCollection('employeeReviews');
+      const employeesCol = getDbCollection('employees');
+      const managerEmployeeId = req.user?.employeeId;
+      const managerUserId = req.user?.id;
+      const managerName = req.user?.name?.toLowerCase().trim();
+      const role = req.user?.role;
 
-    if (!review) {
-      return res.status(404).json({ error: 'Review not found.' });
+      let reviews: EmployeeReview[] = await (await reviewCol.find({})).toArray();
+
+      if (role === 'HOD') {
+        const hodDeptId = req.employeeProfile?.departmentId;
+        reviews = reviews.filter((r) => {
+          const isDept = (hodDeptId && r.departmentId === hodDeptId) || r.hodId === managerEmployeeId;
+          return isDept && r.status === 'MANAGER_PENDING';
+        });
+      } else if (role === 'REPORTING_MANAGER' || role === 'MANAGER') {
+        const allEmployees: Employee[] = await (await employeesCol.find({})).toArray();
+        const directReportIds = new Set(
+          allEmployees
+            .filter(
+              (e) =>
+                (managerEmployeeId && e.managerId === managerEmployeeId) ||
+                (managerUserId && e.managerId === managerUserId)
+            )
+            .map((e) => e.id)
+        );
+        reviews = reviews.filter(
+          (r) =>
+            (r.managerId === managerEmployeeId ||
+              r.managerId === managerUserId ||
+              directReportIds.has(r.employeeId)) &&
+            (r.status === 'MANAGER_PENDING' || r.status === 'RETURNED' || r.status === 'DRAFT')
+        );
+      } else {
+        // SUPER_ADMIN and HR
+        reviews = reviews.filter(
+          (r) => r.status === 'MANAGER_PENDING' || r.status === 'HR_PENDING' || r.status === 'RETURNED' || r.status === 'DRAFT'
+        );
+      }
+
+      reviews.sort((a, b) => new Date(b.updatedAt || b.createdAt).getTime() - new Date(a.updatedAt || a.createdAt).getTime());
+      res.json(reviews);
+    } catch (error: any) {
+      res.status(500).json({ error: 'Failed to fetch pending reviews.' });
     }
+  }
+);
 
-    // Role check: Strict IDOR Protection
+/**
+ * GET /api/reviews/:id
+ * Protected by authorizeReviewAccess('read')
+ */
+reviewRouter.get('/reviews/:id', authorizeReviewAccess('read'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const review = req.review!;
     const employeesCol = getDbCollection('employees');
     const empRecord = await employeesCol.findOne({ id: review.employeeId });
-
-    if (req.user?.role === 'EMPLOYEE' && review.employeeId !== req.user?.employeeId) {
-      return res.status(403).json({ error: 'Unauthorized to view this performance review.' });
-    }
-    if (req.user?.role === 'MANAGER') {
-      const isManagerMatch =
-        review.managerId === req.user?.employeeId ||
-        review.employeeId === req.user?.employeeId ||
-        empRecord?.managerId === req.user?.employeeId ||
-        (req.user?.name && empRecord?.managerName?.toLowerCase() === req.user.name.toLowerCase());
-
-      if (!isManagerMatch) {
-        return res.status(403).json({ error: 'Unauthorized to view performance reviews of other teams.' });
-      }
-    }
-    if (req.user?.role === 'HOD') {
-      const isDeptMatch =
-        (req.employeeProfile?.departmentId && review.departmentId === req.employeeProfile.departmentId) ||
-        (req.employeeProfile?.departmentName && review.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase()) ||
-        (req.employeeProfile?.departmentId && empRecord?.departmentId === req.employeeProfile.departmentId);
-      
-      const isHodMatch =
-        review.hodId === req.user?.employeeId ||
-        review.managerId === req.user?.employeeId ||
-        review.employeeId === req.user?.employeeId ||
-        empRecord?.hodId === req.user?.employeeId ||
-        empRecord?.managerId === req.user?.employeeId ||
-        isDeptMatch;
-
-      if (!isHodMatch) {
-        return res.status(403).json({ error: 'Unauthorized to view performance reviews outside your department.' });
-      }
-    }
 
     res.json({
       ...review,
@@ -442,7 +497,7 @@ reviewRouter.get('/reviews/:id', async (req: AuthenticatedRequest, res: Response
  */
 reviewRouter.post(
   '/reviews/generate-batch',
-  requireRoles('SUPER_ADMIN', 'HR', 'HOD'),
+  requireRoles('SUPER_ADMIN', 'HR'),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const { reviewPeriodId, departmentId, cycleId, overrideExisting } = req.body;
@@ -596,8 +651,8 @@ reviewRouter.post(
           reviewPeriodId: period.id,
           reviewPeriodName: period.name,
           cycleId: emp.cycleId,
-          cycleCode: emp.cycleCode,
-          cycleColor: emp.cycleColor || '#1e3a8a',
+          cycleCode: emp.cycleCode || empCycle?.code || 'A',
+          cycleColor: emp.cycleColor || empCycle?.colorHex || '#1e3a8a',
           isAppraisalMonthDue,
           managerId: emp.managerId || emp.hodId || '',
           managerName: emp.managerName || emp.hodName || 'Unassigned Manager',
@@ -621,15 +676,36 @@ reviewRouter.post(
       }
 
       // Notify managers about new reviews
-      await notifCol.insertOne({
-        id: `notif_${Date.now()}`,
-        userId: 'usr_mgr_eng',
-        type: 'REVIEW_ASSIGNED',
-        title: `Reviews Generated for ${period.name}`,
-        message: `${createdCount} employee quarterly review evaluation sheets generated and ready for manager scoring.`,
-        isRead: false,
-        createdAt: new Date().toISOString(),
-      });
+      const distinctManagerIds = Array.from(new Set(newReviews.map(r => r.managerId).filter((m): m is string => Boolean(m))));
+      for (const mgrId of distinctManagerIds) {
+        await notifCol.insertOne({
+          id: `notif_${Date.now()}_${mgrId}`,
+          userId: mgrId,
+          type: 'REVIEW_ASSIGNED',
+          title: `Reviews Generated for ${period.name}`,
+          message: `Quarterly review evaluation sheets generated for ${period.name} and ready for scoring.`,
+          isRead: false,
+          createdAt: new Date().toISOString(),
+        });
+      }
+
+      // Notify employees about pending self-assessment
+      for (const rev of newReviews) {
+        if (rev.employeeId) {
+          await notifCol.insertOne({
+            id: `notif_self_assess_${rev.id}`,
+            userId: rev.employeeId,
+            userRole: 'EMPLOYEE',
+            type: 'REVIEW_ASSIGNED',
+            title: `Self-Assessment Due: ${period.name}`,
+            message: `Your quarterly performance self-assessment for ${period.name} has been generated. Please complete your ratings and achievements.`,
+            isRead: false,
+            priority: 'HIGH',
+            metadata: { reviewId: rev.id, periodId: period.id, subTab: 'reviews', openSelfAssess: true },
+            createdAt: new Date().toISOString(),
+          });
+        }
+      }
 
       if (req.user) {
         await recordAuditLog(
@@ -667,6 +743,7 @@ reviewRouter.post(
  */
 reviewRouter.put(
   '/reviews/:id/score',
+  authorizeReviewAccess('score'),
   validateBody(SubmitManagerReviewSchema),
   async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -688,6 +765,16 @@ reviewRouter.put(
       return res.status(404).json({ error: 'Review not found.' });
     }
 
+    // Role check: Only assigned reporting manager, HR, or Super Admin can score. HOD cannot score reviews.
+    const isAssignedManager =
+      (req.user?.role === 'REPORTING_MANAGER' || req.user?.role === 'MANAGER') &&
+      (req.user?.employeeId === existing.managerId || req.user?.id === existing.managerId);
+    const isSuperAdminOrHr = req.user?.role === 'SUPER_ADMIN' || req.user?.role === 'HR';
+
+    if (!isAssignedManager && !isSuperAdminOrHr) {
+      return res.status(403).json({ error: 'Unauthorized: Only the designated Reporting Manager or HR can evaluate and score this review. HOD has view-only access to department reviews.' });
+    }
+
     if (existing.isClosed) {
       return res.status(400).json({ error: 'This quarterly review is closed and locked from further scoring changes.' });
     }
@@ -697,24 +784,6 @@ reviewRouter.put(
     const empRecord = await employeesCol.findOne({ id: existing.employeeId });
     if (empRecord && empRecord.status === 'INACTIVE') {
       return res.status(400).json({ error: 'Cannot score review: This employee is marked INACTIVE (Offboarded/Exited).' });
-    }
-
-    // Role check: Only assigned reporting manager, departmental HOD, HR, or Super Admin can score
-    const isAssignedManager = req.user?.employeeId === existing.managerId;
-    const isSuperAdminOrHr = req.user?.role === 'SUPER_ADMIN' || req.user?.role === 'HR';
-    const isDeptHod =
-      req.user?.role === 'HOD' &&
-      (req.user?.employeeId === existing.hodId ||
-        req.employeeProfile?.departmentId === existing.departmentId ||
-        req.employeeProfile?.departmentName?.toLowerCase() === existing.departmentName?.toLowerCase());
-
-    if (!isAssignedManager && !isSuperAdminOrHr && !isDeptHod) {
-      return res.status(403).json({ error: 'Unauthorized: Only the designated reporting manager, departmental HOD, or HR can evaluate and score this review.' });
-    }
-
-    // If HOD completed, only HR or Super Admin can modify scores/comments
-    if (existing.status === 'HOD_COMPLETED' && !isSuperAdminOrHr) {
-      return res.status(403).json({ error: 'This review has been completed by HOD and is pending HR sign-off. Managers and HODs cannot edit at this stage.' });
     }
 
     // Calculate real-time weighted score: sum(rating * weight) / 100
@@ -738,12 +807,10 @@ reviewRouter.put(
 
     let newStatus: ReviewStatus = existing.status;
     if (isSubmitting) {
-      if (req.user?.role === 'HOD') {
-        newStatus = 'HOD_COMPLETED';
-      } else if (req.user?.role === 'HR' || req.user?.role === 'SUPER_ADMIN') {
+      if (req.user?.role === 'HR' || req.user?.role === 'SUPER_ADMIN') {
         newStatus = 'HR_COMPLETED';
       } else {
-        newStatus = 'MANAGER_COMPLETED';
+        newStatus = 'HR_PENDING';
       }
     }
 
@@ -803,32 +870,44 @@ reviewRouter.put(
       const now = new Date().toISOString();
 
       // Notify HR
-      await notifsCol.insertOne({
-        id: `notif_${Date.now()}_hr`,
-        userId: 'ALL',
-        userRole: 'HR',
-        type: 'MANAGER_SUBMITTED',
-        title: `Quarterly Review Scored: ${existing.employeeName}`,
-        message: `${req.user?.name || 'Manager'} submitted evaluation scores (${finalScore}) for ${existing.employeeName}. Ready for HR review.`,
-        isRead: false,
-        priority: 'MEDIUM',
-        metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: 'MANAGER_COMPLETED' },
-        createdAt: now,
-      });
+      await notifsCol.updateOne(
+        { 'metadata.reviewId': id, type: 'MANAGER_SUBMITTED', userRole: 'HR' },
+        {
+          $set: {
+            id: `notif_${id}_hr`,
+            userId: 'ALL',
+            userRole: 'HR',
+            type: 'MANAGER_SUBMITTED',
+            title: `Quarterly Review Scored: ${existing.employeeName}`,
+            message: `${req.user?.name || 'Manager'} submitted evaluation scores (${finalScore}) for ${existing.employeeName}. Ready for HR review.`,
+            isRead: false,
+            priority: 'MEDIUM',
+            metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: 'MANAGER_COMPLETED' },
+            createdAt: now,
+          },
+        },
+        { upsert: true }
+      );
 
       // Notify Employee
-      await notifsCol.insertOne({
-        id: `notif_${Date.now()}_emp`,
-        userId: existing.employeeId,
-        userRole: 'EMPLOYEE',
-        type: 'LETTER_RELEASED',
-        title: `Quarterly Review Evaluated: ${existing.reviewPeriodName}`,
-        message: `Your manager has submitted your quarterly performance review score (${finalScore}). View your review in the portal.`,
-        isRead: false,
-        priority: 'MEDIUM',
-        metadata: { reviewId: id, periodId: existing.reviewPeriodId, subTab: 'reviews' },
-        createdAt: now,
-      });
+      await notifsCol.updateOne(
+        { 'metadata.reviewId': id, userId: existing.employeeId, type: 'LETTER_RELEASED' },
+        {
+          $set: {
+            id: `notif_${id}_emp`,
+            userId: existing.employeeId,
+            userRole: 'EMPLOYEE',
+            type: 'LETTER_RELEASED',
+            title: `Quarterly Review Evaluated: ${existing.reviewPeriodName}`,
+            message: `Your manager has submitted your quarterly performance review score (${finalScore}). View your review in the portal.`,
+            isRead: false,
+            priority: 'MEDIUM',
+            metadata: { reviewId: id, periodId: existing.reviewPeriodId, subTab: 'reviews' },
+            createdAt: now,
+          },
+        },
+        { upsert: true }
+      );
     }
 
     console.log(`[Review] Review scored: ${id} for "${existing.employeeName}" (${existing.employeeCode}), Final Score: ${finalScore} (isDraft: ${isDraft}) by "${req.user?.name}" [${req.user?.role}]`);
@@ -846,7 +925,7 @@ reviewRouter.put(
  */
 reviewRouter.put(
   '/reviews/:id/status',
-  requireRoles('SUPER_ADMIN', 'HR', 'HOD', 'MANAGER'),
+  requireRoles('SUPER_ADMIN', 'HR'),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const { id } = req.params;
@@ -861,6 +940,28 @@ reviewRouter.put(
 
       if (!existing) {
         return res.status(404).json({ error: 'Review not found.' });
+      }
+
+      if (existing.isClosed || existing.status === 'CLOSED') {
+        return res.status(400).json({ error: 'Cannot modify a closed review.' });
+      }
+
+      const allowedTransitions: Record<string, string[]> = {
+        DRAFT: ['ASSIGNED', 'MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED'],
+        ASSIGNED: ['MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED'],
+        MANAGER_PENDING: ['HR_PENDING', 'MANAGER_COMPLETED', 'RETURNED'],
+        MANAGER_COMPLETED: ['HR_PENDING', 'RETURNED'],
+        HR_PENDING: ['HR_COMPLETED', 'CLOSED', 'RETURNED'],
+        HR_COMPLETED: ['CLOSED', 'RETURNED'],
+        RETURNED: ['MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED'],
+        CLOSED: [],
+      };
+
+      const validNextStatuses = allowedTransitions[existing.status] || [];
+      if (status !== existing.status && !validNextStatuses.includes(status)) {
+        return res.status(400).json({
+          error: `Invalid status transition from '${existing.status}' to '${status}'.`,
+        });
       }
 
       const isClosing = status === 'CLOSED';
@@ -910,31 +1011,43 @@ reviewRouter.put(
       const now = new Date().toISOString();
 
       if (status === 'RETURNED' && existing.managerId) {
-        await notifsCol.insertOne({
-          id: `notif_${Date.now()}_ret`,
-          userId: existing.managerId,
-          userRole: 'MANAGER',
-          type: 'RETURNED',
-          title: `Review Returned: ${existing.employeeName}`,
-          message: `HR returned the ${existing.reviewPeriodName} review for ${existing.employeeName}: ${remarks || 'Please re-evaluate scores.'}`,
-          isRead: false,
-          priority: 'HIGH',
-          metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: 'RETURNED' },
-          createdAt: now,
-        });
+        await notifsCol.updateOne(
+          { 'metadata.reviewId': id, type: 'RETURNED' },
+          {
+            $set: {
+              id: `notif_${id}_ret`,
+              userId: existing.managerId,
+              userRole: 'MANAGER',
+              type: 'RETURNED',
+              title: `Review Returned: ${existing.employeeName}`,
+              message: `HR returned the ${existing.reviewPeriodName} review for ${existing.employeeName}: ${remarks || 'Please re-evaluate scores.'}`,
+              isRead: false,
+              priority: 'HIGH',
+              metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: 'RETURNED' },
+              createdAt: now,
+            },
+          },
+          { upsert: true }
+        );
       } else if (status === 'HR_COMPLETED') {
-        await notifsCol.insertOne({
-          id: `notif_${Date.now()}_fin`,
-          userId: existing.employeeId,
-          userRole: 'EMPLOYEE',
-          type: 'HR_COMPLETED',
-          title: `Quarterly Review Approved: ${existing.reviewPeriodName}`,
-          message: `HR has finalized and approved your performance review for ${existing.reviewPeriodName}.`,
-          isRead: false,
-          priority: 'MEDIUM',
-          metadata: { reviewId: id, periodId: existing.reviewPeriodId, subTab: 'reviews' },
-          createdAt: now,
-        });
+        await notifsCol.updateOne(
+          { 'metadata.reviewId': id, userId: existing.employeeId, type: 'HR_COMPLETED' },
+          {
+            $set: {
+              id: `notif_${id}_fin`,
+              userId: existing.employeeId,
+              userRole: 'EMPLOYEE',
+              type: 'HR_COMPLETED',
+              title: `Quarterly Review Approved: ${existing.reviewPeriodName}`,
+              message: `HR has finalized and approved your performance review for ${existing.reviewPeriodName}.`,
+              isRead: false,
+              priority: 'MEDIUM',
+              metadata: { reviewId: id, periodId: existing.reviewPeriodId, subTab: 'reviews' },
+              createdAt: now,
+            },
+          },
+          { upsert: true }
+        );
       }
 
       console.log(`[Review] Status transition: Review ${id} ("${existing.employeeName}"): ${existing.status} -> ${status} by "${req.user?.name}" [${req.user?.role}]`);
@@ -952,6 +1065,7 @@ reviewRouter.put(
  */
 reviewRouter.put(
   '/reviews/:id/self-assess',
+  authorizeReviewAccess('self_assess'),
   validateBody(SubmitSelfAssessmentSchema),
   async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -973,6 +1087,14 @@ reviewRouter.put(
 
     if (existing.isClosed) {
       return res.status(400).json({ error: 'This quarterly review is closed.' });
+    }
+
+    // Once reporting manager has submitted evaluation, self-assessment can no longer be modified
+    const hasManagerSubmitted = Boolean(existing.submittedAt) || !['ASSIGNED', 'MANAGER_PENDING', 'DRAFT'].includes(existing.status);
+    if (hasManagerSubmitted) {
+      return res.status(400).json({
+        error: 'Self-assessment can no longer be edited because the reporting manager has already submitted their review.',
+      });
     }
 
     // Role check: Only the employee or admins/managers can save/submit self assessment
@@ -1014,7 +1136,7 @@ reviewRouter.put(
       id: `act_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       reviewId: id,
       action: isSubmitting ? 'SELF_SUBMITTED' : 'DRAFT_SAVED',
-      performedBy: req.user?.id || 'usr_emp',
+      performedBy: req.user?.id || req.user?.employeeId || existing.employeeId || 'unknown',
       performedByName: req.user?.name || existing.employeeName,
       performedByRole: req.user?.role || 'EMPLOYEE',
       remarks: isSubmitting
@@ -1059,22 +1181,44 @@ reviewRouter.put(
     }
 
     if (isSubmitting) {
-      // Notify Manager
       const notificationsCol = getDbCollection('notifications');
-      await notificationsCol.insertOne({
-        id: `notif_${Date.now()}`,
-        userId: existing.managerId || 'usr_mgr_eng',
-        type: 'REVIEW_ASSIGNED',
-        title: 'Quarterly Self-Assessment Submitted',
-        message: `${existing.employeeName} has completed and submitted their self-evaluation for ${existing.reviewPeriodName}. Review is ready for your evaluation.`,
-        isRead: false,
-        createdAt: now,
-      });
+
+      // Mark employee self-assessment notification as completed/read
+      await notificationsCol.updateMany(
+        {
+          'metadata.reviewId': id,
+          userId: { $in: [existing.employeeId, req.user?.id, req.user?.employeeId].filter(Boolean) },
+          type: 'REVIEW_ASSIGNED',
+        },
+        { $set: { isRead: true } }
+      );
+
+      if (existing.managerId) {
+        // Notify Manager
+        await notificationsCol.updateOne(
+          { 'metadata.reviewId': id, type: 'REVIEW_ASSIGNED', userId: existing.managerId },
+          {
+            $set: {
+              id: `notif_${id}_self_sub`,
+              userId: existing.managerId,
+              userRole: 'MANAGER',
+              type: 'REVIEW_ASSIGNED',
+              title: 'Quarterly Self-Assessment Submitted',
+              message: `${existing.employeeName} has completed and submitted their self-evaluation for ${existing.reviewPeriodName}. Review is ready for your evaluation.`,
+              isRead: false,
+              metadata: { reviewId: id, periodId: existing.reviewPeriodId, subTab: 'reviews' },
+              createdAt: now,
+            },
+          },
+          { upsert: true }
+        );
+      }
 
       // Dispatch Email Notification to Manager (Asynchronously)
       (async () => {
         try {
-          const managerTarget = existing.managerId || 'usr_mgr_eng';
+          const managerTarget = existing.managerId;
+          if (!managerTarget) return;
           const recipient = await resolveRecipient(managerTarget);
           if (recipient) {
             const baseUrl = process.env.APP_URL || 'http://localhost:5173';
@@ -1109,3 +1253,193 @@ reviewRouter.put(
     res.status(500).json({ error: 'Failed to save self assessment.' });
   }
 });
+
+// ==========================================
+// 3. SECTION 29 SPECIFICATION WORKFLOW ENDPOINTS
+// ==========================================
+
+/**
+ * POST /api/reviews/generate
+ * Section 29: Triggers automated quarterly review generation
+ * Super Admin & HR only
+ */
+reviewRouter.post(
+  '/reviews/generate',
+  requireRoles('SUPER_ADMIN', 'HR'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { reviewPeriodId } = req.body;
+      if (!reviewPeriodId) {
+        return res.status(400).json({ error: 'reviewPeriodId is required.' });
+      }
+
+      const report = await generateQuarterlyReviews(reviewPeriodId, {
+        id: req.user!.id,
+        name: req.user!.name,
+        role: req.user!.role,
+      });
+
+      res.status(201).json(report);
+    } catch (error: any) {
+      console.error('Failed to generate quarterly reviews:', error);
+      res.status(500).json({ error: error.message || 'Failed to generate reviews.' });
+    }
+  }
+);
+
+/**
+ * POST /api/reviews/:id/submit
+ * Section 29: Reporting manager submits review scores and transitions to HR_PENDING
+ */
+reviewRouter.post(
+  '/reviews/:id/submit',
+  authorizeReviewAccess('submit'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const updated = await submitManagerReview(id, req.body, {
+        id: req.user!.id,
+        name: req.user!.name,
+        role: req.user!.role,
+        employeeId: req.user!.employeeId,
+      });
+
+      res.json(updated);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to submit review.' });
+    }
+  }
+);
+
+/**
+ * POST /api/reviews/:id/return
+ * Section 29: HR returns review to manager with MANDATORY return reason
+ */
+reviewRouter.post(
+  '/reviews/:id/return',
+  authorizeReviewAccess('return'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const reason = req.body.reason || req.body.returnReason;
+
+      if (!reason || !reason.trim()) {
+        return res.status(400).json({ error: 'Return reason is mandatory. Please provide specific feedback.' });
+      }
+
+      const updated = await returnReview(id, reason, {
+        id: req.user!.id,
+        name: req.user!.name,
+        role: req.user!.role,
+      });
+
+      res.json(updated);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to return review.' });
+    }
+  }
+);
+
+/**
+ * POST /api/reviews/:id/complete
+ * Section 29: HR finalizes review, locks record permanently (isClosed: true)
+ */
+reviewRouter.post(
+  '/reviews/:id/complete',
+  authorizeReviewAccess('complete'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const { hrComments } = req.body;
+
+      const updated = await completeHRReview(id, hrComments || '', {
+        id: req.user!.id,
+        name: req.user!.name,
+        role: req.user!.role,
+      });
+
+      res.json(updated);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to complete review.' });
+    }
+  }
+);
+
+/**
+ * GET /api/employees/:id/review-history
+ * Section 29: Returns employee review history with quarter-to-quarter score comparisons
+ * Protected by strict resource authorization (IDOR protection)
+ */
+reviewRouter.get(
+  '/employees/:id/review-history',
+  authorizeEmployeeAccess('id'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const reviewCol = getDbCollection('employeeReviews');
+      const periodCol = getDbCollection('reviewPeriods');
+
+      const reviews: EmployeeReview[] = await (await reviewCol.find({ employeeId: id })).toArray();
+      const periods: ReviewPeriod[] = await (await periodCol.find({})).toArray();
+      const periodMap = new Map<string, ReviewPeriod>();
+      periods.forEach((p) => periodMap.set(p.id, p));
+
+      // Sort chronologically ascending to calculate progression
+      reviews.sort((a, b) => {
+        const periodA = periodMap.get(a.reviewPeriodId);
+        const periodB = periodMap.get(b.reviewPeriodId);
+        if (periodA && periodB) {
+          if (periodA.year !== periodB.year) return periodA.year - periodB.year;
+          return periodA.quarter - periodB.quarter;
+        }
+        return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+      });
+
+      // Calculate quarter-to-quarter score delta
+      let previousScore: number | null = null;
+      const historyWithComparisons = reviews.map((rev) => {
+        const currentScore = rev.finalScore ?? 0;
+        let scoreDelta: number | null = null;
+        let percentageChange: number | null = null;
+
+        if (previousScore !== null && currentScore > 0) {
+          scoreDelta = Number((currentScore - previousScore).toFixed(2));
+          percentageChange = previousScore > 0
+            ? Number((((currentScore - previousScore) / previousScore) * 100).toFixed(1))
+            : 0;
+        }
+
+        if (currentScore > 0) {
+          previousScore = currentScore;
+        }
+
+        return {
+          id: rev.id,
+          periodId: rev.reviewPeriodId,
+          periodName: rev.reviewPeriodName,
+          status: rev.status,
+          finalScore: rev.finalScore,
+          selfScore: rev.selfScore,
+          scoreDelta,
+          percentageChange,
+          managerName: rev.managerName,
+          completedAt: rev.completedAt,
+          submittedAt: rev.submittedAt,
+          kraCount: rev.kraSnapshot?.length || 0,
+          isClosed: rev.isClosed,
+        };
+      });
+
+      // Return newest first
+      historyWithComparisons.reverse();
+
+      res.json({
+        employeeId: id,
+        totalReviews: historyWithComparisons.length,
+        history: historyWithComparisons,
+      });
+    } catch (error: any) {
+      res.status(500).json({ error: 'Failed to fetch review history.' });
+    }
+  }
+);

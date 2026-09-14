@@ -13,9 +13,9 @@ import {
 
 export const bulkRouter = Router();
 
-// Apply auth to all bulk endpoints - Bulk operations strictly restricted to Super Admin, HR, and HOD
+// Apply auth to all bulk endpoints - Bulk operations strictly restricted to Super Admin and HR
 bulkRouter.use(authenticateToken);
-bulkRouter.use(requireRoles('SUPER_ADMIN', 'HR', 'HOD'));
+bulkRouter.use(requireRoles('SUPER_ADMIN', 'HR'));
 
 // ==========================================
 // 1. TEMPLATE SCHEMAS & SAMPLE DATA

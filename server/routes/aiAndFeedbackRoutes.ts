@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
 import { getDbCollection } from '../db.js';
-import { authenticateToken, AuthenticatedRequest } from '../auth.js';
+import { authenticateToken, requireRoles, AuthenticatedRequest } from '../auth.js';
 import {
   FeedbackEntry,
   PipRecord,
@@ -21,6 +21,10 @@ import {
 
 export const aiAndFeedbackRouter = Router();
 aiAndFeedbackRouter.use(authenticateToken);
+aiAndFeedbackRouter.use(
+  '/gemini',
+  requireRoles('SUPER_ADMIN', 'HR', 'HOD', 'MANAGER', 'REPORTING_MANAGER', 'EMPLOYEE')
+);
 
 // Initialize Gemini Client (lazy helper to ensure process.env is read)
 function getGeminiClient(): GoogleGenAI | null {

@@ -1,7 +1,15 @@
 import express, { Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { getDbCollection } from '../db.js';
-import { authenticateToken, requireRoles, recordAuditLog, AuthenticatedRequest } from '../auth.js';
+import {
+  authenticateToken,
+  requireRoles,
+  recordAuditLog,
+  AuthenticatedRequest,
+  authorizeEmployeeAccess,
+  invalidateAuthCache,
+  revokeUserSessions,
+} from '../auth.js';
 import { Employee, Department, Designation, Cycle, User, UserRole } from '../../src/types.js';
 import { syncEmployeeAppraisalsAndReviews } from '../syncHelpers.js';
 
@@ -135,6 +143,64 @@ mastersRouter.put('/departments/:id', requireRoles('SUPER_ADMIN', 'HR'), async (
   }
 });
 
+/**
+ * DELETE /api/departments/:id
+ * Super Admin & HR only - deletes a department from the database with referential integrity protection
+ */
+mastersRouter.delete('/departments/:id', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const deptCol = getDbCollection('departments');
+    const employeesCol = getDbCollection('employees');
+    const desCol = getDbCollection('designations');
+
+    const dept = await deptCol.findOne({ id });
+    if (!dept) {
+      return res.status(404).json({ error: 'Department not found.' });
+    }
+
+    // Referential integrity check: Cannot delete if active employees are assigned
+    const assignedEmployees = await (await employeesCol.find({
+      departmentId: id,
+      status: { $ne: 'INACTIVE' }
+    })).toArray();
+
+    if (assignedEmployees.length > 0) {
+      return res.status(400).json({
+        error: `Cannot delete department "${dept.name}". There are ${assignedEmployees.length} active employee(s) assigned to this department. Please reassign or deactivate them first.`,
+        assignedCount: assignedEmployees.length
+      });
+    }
+
+    // Cascade: Clean up associated designations for this department
+    await desCol.deleteMany({ departmentId: id });
+
+    // Delete the department from the database
+    await deptCol.deleteOne({ id });
+
+    if (req.user) {
+      await recordAuditLog(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        'ORGANIZATION_MASTER',
+        'DELETE_DEPARTMENT',
+        id,
+        dept.name,
+        '',
+        `Deleted department ${dept.name} (${dept.code}) from database`
+      );
+    }
+
+    res.json({
+      success: true,
+      message: `Department "${dept.name}" (${dept.code}) was deleted from the database successfully.`
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to delete department from database.' });
+  }
+});
+
 // ==========================================
 // 2. DESIGNATIONS
 // ==========================================
@@ -197,6 +263,60 @@ mastersRouter.post('/designations', requireRoles('SUPER_ADMIN', 'HR'), async (re
     res.status(201).json(newDes);
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to create designation.' });
+  }
+});
+
+/**
+ * DELETE /api/designations/:id
+ * Super Admin & HR only - deletes a designation from the database with referential integrity protection
+ */
+mastersRouter.delete('/designations/:id', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const desCol = getDbCollection('designations');
+    const employeesCol = getDbCollection('employees');
+
+    const des = await desCol.findOne({ id });
+    if (!des) {
+      return res.status(404).json({ error: 'Designation not found.' });
+    }
+
+    // Referential integrity check: Cannot delete if active employees are assigned
+    const assignedEmployees = await (await employeesCol.find({
+      designationId: id,
+      status: { $ne: 'INACTIVE' }
+    })).toArray();
+
+    if (assignedEmployees.length > 0) {
+      return res.status(400).json({
+        error: `Cannot delete designation "${des.name}". There are ${assignedEmployees.length} active employee(s) assigned this designation. Please reassign them first.`,
+        assignedCount: assignedEmployees.length
+      });
+    }
+
+    // Delete designation from database
+    await desCol.deleteOne({ id });
+
+    if (req.user) {
+      await recordAuditLog(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        'ORGANIZATION_MASTER',
+        'DELETE_DESIGNATION',
+        id,
+        des.name,
+        '',
+        `Deleted designation ${des.name} from database`
+      );
+    }
+
+    res.json({
+      success: true,
+      message: `Designation "${des.name}" was deleted from the database successfully.`
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to delete designation from database.' });
   }
 });
 
@@ -281,12 +401,23 @@ mastersRouter.get('/employees', async (req: AuthenticatedRequest, res: Response)
     const empCol = getDbCollection('employees');
     let allEmployees: Employee[] = await (await empCol.find({})).toArray();
 
-    // If logged in as Manager and not Super Admin/HR/Management, manager sees team + own
-    if (req.user?.role === 'MANAGER' && req.employeeProfile) {
+    // Strict Role-based scope enforcement
+    const userRole = req.user?.role;
+    const userEmpId = req.user?.employeeId;
+    const userDeptId = req.employeeProfile?.departmentId;
+
+    if (userRole === 'EMPLOYEE') {
+      allEmployees = allEmployees.filter((e) => e.id === userEmpId || e.id === req.user?.id);
+    } else if (userRole === 'REPORTING_MANAGER' || userRole === 'MANAGER') {
       allEmployees = allEmployees.filter(
-        (e) => e.managerId === req.employeeProfile?.id || e.id === req.employeeProfile?.id
+        (e) => e.managerId === userEmpId || e.id === userEmpId || e.managerId === req.user?.id
+      );
+    } else if (userRole === 'HOD') {
+      allEmployees = allEmployees.filter(
+        (e) => (userDeptId && e.departmentId === userDeptId) || e.hodId === userEmpId || e.id === userEmpId
       );
     }
+    // SUPER_ADMIN, HR, MANAGEMENT have organization-wide access (MANAGEMENT read-only)
 
     // Filters
     if (departmentId) {
@@ -301,18 +432,6 @@ mastersRouter.get('/employees', async (req: AuthenticatedRequest, res: Response)
     if (managerId) {
       allEmployees = allEmployees.filter((e) => e.managerId === managerId);
     }
-    const defaultCtcMap: Record<string, number> = {
-      emp_exec_mgmt: 4500000,
-      emp_hod_eng: 3600000,
-      emp_hod_sales: 3200000,
-      emp_mgr_eng: 2400000,
-      emp_dev_1: 1800000,
-      emp_hr_lead: 1750000,
-      emp_admin: 1600000,
-      emp_sales_1: 1350000,
-      emp_dev_2: 1100000,
-    };
-
     const usersCol = getDbCollection('users');
     const allUsers: any[] = await (await usersCol.find({})).toArray();
     const userByEmpId = new Map<string, any>();
@@ -324,7 +443,7 @@ mastersRouter.get('/employees', async (req: AuthenticatedRequest, res: Response)
 
     allEmployees.forEach((e: any) => {
       if (!e.currentCtc || e.currentCtc === 0) {
-        e.currentCtc = defaultCtcMap[e.id] || 1600000;
+        e.currentCtc = Number(e.currentCtc) || 0;
       }
       if (!e.currency) {
         e.currency = '₹';
@@ -360,8 +479,9 @@ mastersRouter.get('/employees', async (req: AuthenticatedRequest, res: Response)
 
 /**
  * GET /api/employees/:id
+ * Protected by authorizeEmployeeAccess('id') (Strict IDOR protection)
  */
-mastersRouter.get('/employees/:id', async (req: AuthenticatedRequest, res: Response) => {
+mastersRouter.get('/employees/:id', authorizeEmployeeAccess('id'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
     const empCol = getDbCollection('employees');
@@ -400,6 +520,8 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       departmentId,
       designationId,
       joiningDate,
+      relievingDate,
+      pastEmployeeDate,
       managerId,
       hodId,
       cycleId,
@@ -423,7 +545,7 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       return res.status(400).json({ error: 'Please enter a valid corporate email address.' });
     }
 
-    const numericCtc = currentCtc !== undefined && currentCtc !== '' ? Number(currentCtc) : 1600000;
+    const numericCtc = currentCtc !== undefined && currentCtc !== '' ? Number(currentCtc) : 0;
     if (isNaN(numericCtc) || numericCtc < 0) {
       return res.status(400).json({ error: 'Starting Annual CTC must be a positive number.' });
     }
@@ -455,7 +577,16 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
     }
     const existingEmail = await empCol.findOne({ email: email.trim().toLowerCase() });
     if (existingEmail) {
-      return res.status(400).json({ error: `Email ${email} is already in use.` });
+      if (existingEmail.status === 'INACTIVE' || existingEmail.isPastEmployee) {
+        return res.status(400).json({
+          error: `Email ${email} belongs to past employee ${existingEmail.name} (${existingEmail.employeeCode}). Please use the Rehire workflow to reactivate their profile instead of creating a duplicate account.`,
+          isPastEmployee: true,
+          existingEmployeeId: existingEmail.id,
+          existingEmployeeCode: existingEmail.employeeCode,
+          existingEmployeeName: existingEmail.name,
+        });
+      }
+      return res.status(400).json({ error: `Email ${email} is already in use by active employee ${existingEmail.name} (${existingEmail.employeeCode}).` });
     }
 
     // Fetch related names
@@ -474,6 +605,8 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       const hod = await empCol.findOne({ id: hodId });
       if (hod) hodName = hod.name;
     }
+
+    const exitDate = relievingDate || pastEmployeeDate || (status === 'INACTIVE' ? new Date().toISOString() : undefined);
 
     const newEmp: Employee = {
       id: `emp_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
@@ -499,6 +632,9 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       currentCtc: numericCtc,
       currency: currency || '₹',
       status: status || 'ACTIVE',
+      isPastEmployee: status === 'INACTIVE' || Boolean(exitDate),
+      pastEmployeeDate: exitDate ? new Date(exitDate).toISOString() : undefined,
+      relievingDate: exitDate ? new Date(exitDate).toISOString() : undefined,
       createdAt: new Date().toISOString(),
     };
 
@@ -608,6 +744,8 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       departmentId,
       designationId,
       joiningDate,
+      relievingDate,
+      pastEmployeeDate,
       managerId,
       hodId,
       cycleId,
@@ -795,15 +933,37 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       }
     }
 
+    if (relievingDate !== undefined || pastEmployeeDate !== undefined) {
+      const exitDate = relievingDate || pastEmployeeDate;
+      updateData.relievingDate = exitDate ? new Date(exitDate).toISOString() : undefined;
+      updateData.pastEmployeeDate = exitDate ? new Date(exitDate).toISOString() : undefined;
+    }
+
+    const unsetFields: any = {};
     if (status !== undefined) {
-      if (status === 'INACTIVE' && existingUser) {
-        await usersCol.updateOne({ id: existingUser.id }, { $set: { active: false } });
-        updateData.hasLoginAccount = false;
-        updateData.userActive = false;
-      } else if (status === 'ACTIVE' && existingUser && provisionLogin !== false) {
-        await usersCol.updateOne({ id: existingUser.id }, { $set: { active: true } });
-        updateData.hasLoginAccount = true;
-        updateData.userActive = true;
+      if (status === 'INACTIVE') {
+        updateData.isPastEmployee = true;
+        if (!updateData.relievingDate && !emp.relievingDate && !emp.pastEmployeeDate) {
+          const now = new Date().toISOString();
+          updateData.relievingDate = now;
+          updateData.pastEmployeeDate = now;
+        }
+        if (existingUser) {
+          await usersCol.updateOne({ id: existingUser.id }, { $set: { active: false } });
+          updateData.hasLoginAccount = false;
+          updateData.userActive = false;
+        }
+      } else if (status === 'ACTIVE' || status === 'PROBATION') {
+        updateData.isPastEmployee = false;
+        unsetFields.relievingDate = '';
+        unsetFields.pastEmployeeDate = '';
+        delete updateData.relievingDate;
+        delete updateData.pastEmployeeDate;
+        if (existingUser && provisionLogin !== false) {
+          await usersCol.updateOne({ id: existingUser.id }, { $set: { active: true } });
+          updateData.hasLoginAccount = true;
+          updateData.userActive = true;
+        }
       }
     }
 
@@ -816,7 +976,18 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       }
     }
 
-    await empCol.updateOne({ id }, { $set: updateData });
+    const updateOps: any = { $set: updateData };
+    if (Object.keys(unsetFields).length > 0) {
+      updateOps.$unset = unsetFields;
+    }
+    await empCol.updateOne({ id }, updateOps);
+    invalidateAuthCache(id);
+    if (existingUser?.id) {
+      invalidateAuthCache(existingUser.id);
+      if (status === 'INACTIVE') {
+        await revokeUserSessions(existingUser.id);
+      }
+    }
     const updated = await empCol.findOne({ id });
 
     // Sync updated manager / HOD / department / CTC across existing reviews and appraisals
@@ -864,6 +1035,123 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       return res.status(400).json({ error: 'Duplicate record error: a unique constraint was violated.' });
     }
     res.status(500).json({ error: error.message || 'Failed to update employee record.' });
+  }
+});
+
+/**
+ * DELETE /api/employees/:id
+ * Super Admin only - Deletes all associated data for an employee (reviews, appraisals, feedback,
+ * login credentials, manager linkages), while preserving their core profile details archived as a "Past Employee"
+ * in the employee directory.
+ */
+mastersRouter.delete('/employees/:id', requireRoles('SUPER_ADMIN'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { id } = req.params;
+    const empCol = getDbCollection('employees');
+    const deptCol = getDbCollection('departments');
+    const usersCol = getDbCollection('users');
+    const reviewsCol = getDbCollection('employeeReviews');
+    const appraisalsCol = getDbCollection('appraisals');
+    const feedbackCol = getDbCollection('feedback');
+    const pipsCol = getDbCollection('pips');
+    const notifCol = getDbCollection('notifications');
+
+    const emp = await empCol.findOne({ id });
+    if (!emp) {
+      return res.status(404).json({ error: 'Employee not found.' });
+    }
+
+    // 1. Delete all employee reviews
+    await reviewsCol.deleteMany({ employeeId: id });
+
+    // 2. Delete all annual appraisals
+    await appraisalsCol.deleteMany({ employeeId: id });
+
+    // 3. Delete all 360 feedback and PIPs
+    await feedbackCol.deleteMany({
+      $or: [{ employeeId: id }, { requestedBy: id }, { reviewerId: id }],
+    });
+    await pipsCol.deleteMany({ employeeId: id });
+
+    // 4. Delete notifications for this employee / user
+    const orNotif: any[] = [{ employeeId: id }];
+    if (emp.userId) orNotif.push({ userId: emp.userId });
+    await notifCol.deleteMany({ $or: orNotif });
+
+    // 5. Delete login account from users collection so portal access is revoked
+    const userOrConditions: any[] = [{ employeeId: id }];
+    if (emp.userId) userOrConditions.push({ id: emp.userId });
+    if (emp.email) userOrConditions.push({ email: emp.email.toLowerCase().trim() });
+    await usersCol.deleteMany({ $or: userOrConditions });
+
+    // 6. Unassign this employee as reporting manager or HOD for any other employees
+    await empCol.updateMany(
+      { managerId: id },
+      { $set: { managerId: undefined, managerName: 'Unassigned' } }
+    );
+    await empCol.updateMany(
+      { hodId: id },
+      { $set: { hodId: undefined, hodName: 'Unassigned' } }
+    );
+    // Unassign this employee as designated HOD on departments
+    await deptCol.updateMany(
+      { hodId: id },
+      { $set: { hodId: undefined, hodName: 'Unassigned' } }
+    );
+
+    // 7. Update employee record: archive as Past Employee with status INACTIVE
+    const archivedDate = new Date().toISOString();
+    await empCol.updateOne(
+      { id },
+      {
+        $set: {
+          status: 'INACTIVE',
+          isPastEmployee: true,
+          pastEmployeeDate: archivedDate,
+          relievingDate: archivedDate,
+          hasLoginAccount: false,
+          userActive: false,
+          userId: undefined,
+          managerId: undefined,
+          managerName: 'Unassigned',
+          hodId: undefined,
+          hodName: 'Unassigned',
+          currentKraTemplateId: undefined,
+          currentKraTemplateName: undefined,
+          updatedAt: archivedDate,
+        },
+      }
+    );
+
+    // Invalidate auth cache and revoke sessions
+    invalidateAuthCache(id);
+    if (emp.userId) {
+      invalidateAuthCache(emp.userId);
+      await revokeUserSessions(emp.userId);
+    }
+
+    // 8. Record audit log entry
+    if (req.user) {
+      await recordAuditLog(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        'EMPLOYEE_MASTER',
+        'DELETE_EMPLOYEE_DATA',
+        id,
+        emp.status,
+        'INACTIVE',
+        `Deleted reviews, appraisals, feedback, and login account for ${emp.name} (${emp.employeeCode}). Archived profile as Past Employee.`
+      );
+    }
+
+    res.json({
+      success: true,
+      message: `Employee "${emp.name}" (${emp.employeeCode}) was successfully archived as a Past Employee. All reviews, appraisals, and login credentials have been deleted.`,
+    });
+  } catch (error: any) {
+    console.error('Error deleting employee data:', error);
+    res.status(500).json({ error: error.message || 'Failed to delete employee data.' });
   }
 });
 
@@ -979,35 +1267,134 @@ async function isNotificationTargetCompleted(notif: any): Promise<boolean> {
 mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const notifsCol = getDbCollection('notifications');
-    const notifications: any[] = await (await notifsCol.find({})).toArray();
-
     const currentUser = req.user;
+    if (!currentUser) {
+      return res.json([]);
+    }
+
+    // Auto-sync self-assessment notifications for current user/employee with pending reviews
+    const targetEmpId = currentUser.employeeId || (currentUser.role === 'EMPLOYEE' ? currentUser.id : null);
+    if (targetEmpId) {
+      try {
+        const reviewsCol = getDbCollection('employeeReviews');
+        const pendingReviews: any[] = await (
+          await reviewsCol.find({
+            $or: [{ employeeId: targetEmpId }, { employeeId: currentUser.id }],
+            isClosed: { $ne: true },
+            status: { $in: ['ASSIGNED', 'DRAFT', 'MANAGER_PENDING', 'SELF_ASSESSMENT_DUE', 'OPEN'] },
+            isSelfSubmitted: { $ne: true },
+          })
+        ).toArray();
+
+        for (const rev of pendingReviews) {
+          const notifId = `notif_self_assess_${rev.id}`;
+          const existingNotif = await notifsCol.findOne({
+            $or: [
+              { id: notifId },
+              {
+                'metadata.reviewId': rev.id,
+                userId: { $in: [targetEmpId, currentUser.id] },
+                type: 'REVIEW_ASSIGNED',
+              },
+            ],
+          });
+
+          if (!existingNotif) {
+            await notifsCol.insertOne({
+              id: notifId,
+              userId: targetEmpId,
+              userRole: 'EMPLOYEE',
+              type: 'REVIEW_ASSIGNED',
+              title: `Self-Assessment Due: ${rev.reviewPeriodName || 'Quarterly Review'}`,
+              message: `Your quarterly performance self-assessment for ${rev.reviewPeriodName || 'this cycle'} is pending. Complete your ratings and submit your self-evaluation.`,
+              isRead: false,
+              priority: 'HIGH',
+              metadata: {
+                reviewId: rev.id,
+                periodId: rev.reviewPeriodId,
+                subTab: 'reviews',
+                openSelfAssess: true,
+              },
+              createdAt: new Date().toISOString(),
+            });
+          }
+        }
+
+        // If employee has already submitted, ensure the self-assessment notification is marked as read
+        const completedReviews: any[] = await (
+          await reviewsCol.find({
+            $and: [
+              { $or: [{ employeeId: targetEmpId }, { employeeId: currentUser.id }] },
+              { $or: [{ isSelfSubmitted: true }, { isClosed: true }] },
+            ],
+          })
+        ).toArray();
+
+        for (const rev of completedReviews) {
+          await notifsCol.updateMany(
+            {
+              userId: { $in: [targetEmpId, currentUser.id] },
+              'metadata.reviewId': rev.id,
+              type: 'REVIEW_ASSIGNED',
+              isRead: false,
+            },
+            {
+              $set: { isRead: true },
+            }
+          );
+        }
+      } catch (syncErr) {
+        console.warn('[Notifications] Error auto-syncing employee self-assessment notifs:', syncErr);
+      }
+    }
+
+    let filter: any = {};
+    if (currentUser.role !== 'SUPER_ADMIN') {
+      const orClauses: any[] = [
+        { userId: currentUser.id },
+        { userId: 'ALL' },
+        { userId: null },
+        { userRole: 'ALL' },
+        { userRole: currentUser.role },
+      ];
+      if (currentUser.employeeId) {
+        orClauses.push({ userId: currentUser.employeeId });
+      }
+      filter = { $or: orClauses };
+    }
+
+    // Direct database query with sort and limit 100
+    const rawNotifications: any = await notifsCol.find(filter);
+    const notifications: any[] = Array.isArray(rawNotifications)
+      ? rawNotifications
+      : typeof rawNotifications?.toArray === 'function'
+      ? await rawNotifications.toArray()
+      : [];
+
     let filtered: any[] = notifications;
 
-    if (currentUser) {
+    if (currentUser.role !== 'SUPER_ADMIN') {
       filtered = notifications.filter((n) => {
-        // 1. If notification specifically targets a userId
-        if (n.userId && n.userId !== 'ALL') {
-          const isUserMatch = n.userId === currentUser.id;
-          const isEmpMatch = currentUser.employeeId && n.userId === currentUser.employeeId;
-          // If the alert is role-targeted (e.g. userRole: 'HR') and current user has that role,
-          // deliver it to all members of that role (or SUPER_ADMIN) even if a legacy seed userId is present
-          const isRoleMatch = n.userRole && (n.userRole === currentUser.role || (currentUser.role === 'SUPER_ADMIN' && n.userRole === 'HR'));
-          return isUserMatch || isEmpMatch || isRoleMatch;
-        }
-
-        // 2. If notification targets ALL users
-        if (n.userId === 'ALL') {
-          if (!n.userRole || n.userRole === currentUser.role || currentUser.role === 'SUPER_ADMIN') return true;
-        }
-
-        // 3. Broadcast to a specific role with no specific userId
-        if (!n.userId && n.userRole && (n.userRole === currentUser.role || currentUser.role === 'SUPER_ADMIN')) {
+        // Direct target match by user ID or employee ID (private notification)
+        const isDirectUserMatch = n.userId === currentUser.id;
+        const isDirectEmpMatch = Boolean(currentUser.employeeId && n.userId === currentUser.employeeId);
+        if (isDirectUserMatch || isDirectEmpMatch) {
           return true;
         }
 
-        // 4. Super Admin can see system-level broadcast alerts
-        if (currentUser.role === 'SUPER_ADMIN' && (!n.userId || n.userId === 'ALL')) {
+        // Broadcast notifications targeted to ALL or broad role queues
+        if (n.userId === 'ALL' || !n.userId) {
+          if (!n.userRole || n.userRole === 'ALL' || n.userRole === currentUser.role) {
+            return true;
+          }
+          return false;
+        }
+
+        // Shared administrative queues (HR and Executive Management shared pools)
+        if (currentUser.role === 'HR' && n.userRole === 'HR' && (n.userId === 'ALL' || (typeof n.userId === 'string' && n.userId.includes('hr')))) {
+          return true;
+        }
+        if (currentUser.role === 'MANAGEMENT' && n.userRole === 'MANAGEMENT' && (n.userId === 'ALL' || (typeof n.userId === 'string' && n.userId.includes('mgmt')))) {
           return true;
         }
 
@@ -1015,8 +1402,11 @@ mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Respo
       });
     }
 
-    // Sort newest first
-    filtered.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+    // Sort newest first & limit to top 100
+    filtered.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+    if (filtered.length > 100) {
+      filtered = filtered.slice(0, 100);
+    }
 
     res.json(filtered);
   } catch (error: any) {

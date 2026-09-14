@@ -50,7 +50,7 @@ essRouter.get('/ess/overview/:employeeId?', authenticateToken, async (req: Authe
     }
 
     // Manager / HOD IDOR Scope Verification
-    if (user.role === 'MANAGER') {
+    if (user.role === 'MANAGER' || user.role === 'REPORTING_MANAGER') {
       if (employee.id !== user.employeeId && employee.managerId !== user.employeeId) {
         return res.status(403).json({ error: 'Access denied: Managers can only view ESS profiles of their direct reports.' });
       }
@@ -64,22 +64,42 @@ essRouter.get('/ess/overview/:employeeId?', authenticateToken, async (req: Authe
     }
 
     // Ensure employee object has valid currentCtc and currency
-    if (!employee.currentCtc || employee.currentCtc === 0) {
-      const defaultCtcMap: Record<string, number> = {
-        emp_exec_mgmt: 4500000,
-        emp_hod_eng: 3600000,
-        emp_hod_sales: 3200000,
-        emp_mgr_eng: 2400000,
-        emp_dev_1: 1800000,
-        emp_hr_lead: 1750000,
-        emp_admin: 1600000,
-        emp_sales_1: 1350000,
-        emp_dev_2: 1100000,
-      };
-      employee.currentCtc = defaultCtcMap[employee.id] || 1600000;
+    if (!employee.currentCtc) {
+      employee.currentCtc = 0;
     }
     if (!employee.currency) {
       employee.currency = '₹';
+    }
+
+    // Hydrate any missing master display names
+    const departmentsCol = getDbCollection('departments');
+    const designationsCol = getDbCollection('designations');
+    const cyclesCol = getDbCollection('cycles');
+
+    if (!employee.departmentName && employee.departmentId) {
+      const dept = await departmentsCol.findOne({ id: employee.departmentId });
+      if (dept) employee.departmentName = dept.name;
+    }
+    if (!employee.designationName && employee.designationId) {
+      const desig = await designationsCol.findOne({ id: employee.designationId });
+      if (desig) employee.designationName = desig.name;
+    }
+    if (!employee.managerName && employee.managerId) {
+      const mgr = await employeesCol.findOne({ id: employee.managerId });
+      if (mgr) employee.managerName = mgr.name;
+    }
+    if (!employee.hodName && employee.hodId) {
+      const hod = await employeesCol.findOne({ id: employee.hodId });
+      if (hod) employee.hodName = hod.name;
+    }
+    if (!employee.cycleName && (employee.cycleId || employee.cycleCode)) {
+      const cycle = await cyclesCol.findOne({
+        $or: [{ id: employee.cycleId }, { code: employee.cycleCode }]
+      });
+      if (cycle) {
+        employee.cycleName = cycle.name;
+        if (!employee.cycleColor) employee.cycleColor = cycle.colorHex;
+      }
     }
 
     const empId = employee.id;
@@ -159,8 +179,14 @@ essRouter.get('/ess/overview/:employeeId?', authenticateToken, async (req: Authe
       });
     }
 
-    // Calculate rolling average score
-    const completedReviews = reviews.filter((r) => r.finalScore && r.finalScore > 0);
+    // Calculate rolling average score from manager-evaluated reviews only
+    const evaluatedStatuses = ['MANAGER_COMPLETED', 'HR_PENDING', 'CLOSED'];
+    const completedReviews = reviews.filter(
+      (r) =>
+        (r.isClosed || evaluatedStatuses.includes(r.status)) &&
+        typeof r.finalScore === 'number' &&
+        r.finalScore > 0
+    );
     const averageScore =
       completedReviews.length > 0
         ? Number(

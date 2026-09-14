@@ -16,6 +16,9 @@ import { bulkRouter } from './server/routes/bulkRoutes.js';
 import { auditRouter } from './server/routes/auditRoutes.js';
 import { aiAndFeedbackRouter } from './server/routes/aiAndFeedbackRoutes.js';
 import { emailRouter } from './server/routes/emailRoutes.js';
+import { dashboardRouter } from './server/routes/dashboardRoutes.js';
+import { managementRouter } from './server/routes/managementRoutes.js';
+import { startBackgroundScheduler } from './server/jobs/scheduler.js';
 
 // In production, silence non-critical development logs (console.log, console.info, console.warn)
 // to optimize performance and protect data privacy. Errors (console.error) remain fully active.
@@ -117,6 +120,9 @@ async function startServer() {
   // Initialize Database (MongoDB / Document Collections Engine)
   await initDatabase();
 
+  // Start background cron jobs (review reminders, overdue escalations, appraisal cohorts)
+  startBackgroundScheduler();
+
   // Health check FIRST (unauthenticated)
   app.get('/api/health', (req, res) => {
     res.json({
@@ -148,6 +154,8 @@ async function startServer() {
   app.use('/api/audit', auditRouter);
   app.use('/api', aiAndFeedbackRouter);
   app.use('/api/emails', emailRouter);
+  app.use('/api', managementRouter);
+  app.use('/api', dashboardRouter);
 
   // Always return standard JSON 404 for any unmatched /api routes
   app.all('/api/*', (_req, res) => {

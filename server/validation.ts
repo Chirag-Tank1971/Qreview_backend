@@ -151,14 +151,31 @@ export const SubmitSelfAssessmentSchema = z.object({
   selfObstacles: z.string().max(3000).optional(),
 });
 
-export const SubmitManagerReviewSchema = z.object({
-  kraSnapshot: z.array(ReviewKraSnapshotItemSchema).optional(),
-  strengths: z.string().max(3000).optional(),
-  improvements: z.string().max(3000).optional(),
-  managerOverallComments: z.string().max(3000).optional(),
-  employeeComments: z.string().max(3000).optional(),
-  hrComments: z.string().max(3000).optional(),
-  isDraft: z.boolean().optional(),
+export const SubmitManagerReviewSchema = z
+  .object({
+    kraSnapshot: z.array(ReviewKraSnapshotItemSchema).optional(),
+    strengths: z.string().max(3000).optional(),
+    improvements: z.string().max(3000).optional(),
+    managerOverallComments: z.string().max(3000).optional(),
+    employeeComments: z.string().max(3000).optional(),
+    hrComments: z.string().max(3000).optional(),
+    isDraft: z.boolean().optional(),
+  })
+  .refine(
+    (data) => {
+      if (data.isDraft) return true;
+      if (!data.kraSnapshot || data.kraSnapshot.length === 0) return true;
+      return data.kraSnapshot.every((k) => k.rating === undefined || (Number(k.rating) >= 1 && Number(k.rating) <= 5));
+    },
+    {
+      message: 'When submitting evaluation scores, all rated KRAs must have a rating between 1.0 and 5.0.',
+      path: ['kraSnapshot'],
+    }
+  );
+
+export const FinalizeAppraisalSchema = z.object({
+  remarks: z.string().trim().max(3000).optional(),
+  updateEmployeeCtc: z.boolean().optional().default(true),
 });
 
 export const ReturnReviewSchema = z.object({

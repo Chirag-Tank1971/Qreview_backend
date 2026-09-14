@@ -213,7 +213,7 @@ auditRouter.get('/summary', async (_req: AuthenticatedRequest, res: Response) =>
 });
 
 // ==========================================
-// 3. GET TIMELINE FOR SPECIFIC EMPLOYEE
+// 3. GET DYNAMIC TIMELINE FOR SPECIFIC EMPLOYEE
 // ==========================================
 auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -224,153 +224,309 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
       employee = await employeesCol.findOne({ employeeCode: employeeId });
     }
     if (!employee) {
-      // Graceful fallback for legacy/demo IDs like emp_dev_1
-      employee = (await employeesCol.findOne({ id: 'emp_com_1' })) || (await employeesCol.findOne({ status: 'ACTIVE' }));
-    }
-
-    if (!employee) {
       return res.status(404).json({ success: false, error: `Employee ${employeeId} not found` });
     }
 
     const empName = employee.name || employee.fullName || 'Employee';
 
-    // Construct full chronological lifecycle timeline
-    const events: AuditTimelineEvent[] = [
-      {
-        id: `tl_${employee.id}_1`,
-        stageName: 'KRA & KPI Initialization',
-        stageKey: 'KRA_SETUP',
-        timestamp: '2025-10-05T10:00:00.000Z',
-        actorName: 'Priya Sundaram',
-        actorRole: 'HR',
-        status: 'COMPLETED',
-        title: 'KRAs Assigned for 8-Cycle Plan',
-        description: `4 weighted KRAs allocated with 100% total weight matching ${employee.designationName || 'Designation'} profile.`,
-        details: { totalKras: 4, totalWeight: 100 },
+    // Fetch related collections
+    const kraTemplatesCol = getDbCollection('kraTemplates');
+    const reviewsCol = getDbCollection('employeeReviews');
+    const appraisalsCol = getDbCollection('appraisals');
+    const auditLogsCol = getDbCollection('auditLogs');
+
+    // 1. Fetch KRA Template
+    let template = null;
+    if (employee.currentKraTemplateId) {
+      template = await kraTemplatesCol.findOne({ id: employee.currentKraTemplateId });
+    }
+    if (!template && (employee.departmentId || employee.designationId)) {
+      template = await kraTemplatesCol.findOne({
+        $or: [
+          { designationId: employee.designationId },
+          { departmentId: employee.departmentId },
+        ],
+      });
+    }
+
+    // 2. Fetch Employee Reviews
+    const reviews = await (await reviewsCol.find({
+      $or: [{ employeeId: employee.id }, { employeeCode: employee.employeeCode }],
+    })).toArray();
+
+    // Sort reviews by quarter (1, 2, 3, 4) or createdAt
+    reviews.sort((a, b) => {
+      const qA = a.quarter || 0;
+      const qB = b.quarter || 0;
+      if (qA !== qB) return qA - qB;
+      return new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime();
+    });
+
+    // 3. Fetch Appraisal
+    const appraisal = await appraisalsCol.findOne({
+      $or: [{ employeeId: employee.id }, { employeeCode: employee.employeeCode }],
+    });
+
+    // 4. Fetch specific Audit Logs for this employee
+    const auditLogs = await (await auditLogsCol.find({
+      $or: [
+        { targetEmployeeId: employee.id },
+        { recordId: employee.id },
+        ...(appraisal ? [{ recordId: appraisal.id }] : []),
+        ...reviews.map((r) => ({ recordId: r.id })),
+      ],
+    })).toArray();
+
+    const events: AuditTimelineEvent[] = [];
+
+    // Stage 1: KRA & KPI Initialization
+    const hasKras = !!(template || employee.currentKraTemplateId || reviews.length > 0);
+    const kraItemsCount = template?.items?.length || template?.kras?.length || 4;
+    const totalWeight = template?.totalWeight || 100;
+    events.push({
+      id: `tl_${employee.id}_kra`,
+      stageName: 'KRA & KPI Initialization',
+      stageKey: 'KRA_SETUP',
+      timestamp: employee.createdAt || '2025-10-01T09:00:00.000Z',
+      actorName: employee.managerName || 'HR Operations',
+      actorRole: 'HR',
+      status: hasKras ? 'COMPLETED' : 'PENDING',
+      title: hasKras
+        ? `KRAs Assigned for ${employee.cycleName || employee.cycleCode || 'Performance Cycle'}`
+        : 'KRA Assignment Pending',
+      description: hasKras
+        ? `${kraItemsCount} weighted KRAs allocated with ${totalWeight}% total weight matching ${employee.designationName || 'Designation'} profile.`
+        : 'Awaiting KRA allocation and goal definition for performance cycle.',
+      details: {
+        totalKras: kraItemsCount,
+        totalWeight,
+        templateTitle: template?.title || template?.name || 'Role Standard Profile',
       },
-      {
-        id: `tl_${employee.id}_2`,
-        stageName: 'Quarter 1 Review & Goal Check',
-        stageKey: 'Q1_REVIEW',
-        timestamp: '2025-12-28T14:30:00.000Z',
-        actorName: employee.managerName || 'Reporting Manager',
+    });
+
+    // Stages 2 - 5: Quarterly Reviews (Q1, Q2, Q3, Q4)
+    const quarters = [1, 2, 3, 4];
+    for (const q of quarters) {
+      const review = reviews.find(
+        (r) => r.quarter === q || r.id?.includes(`_q${q}_`) || r.periodId?.includes(`_q${q}`)
+      ) || (reviews.length >= q ? reviews[q - 1] : null);
+
+      if (review) {
+        const isClosed = review.status === 'CLOSED' || review.status === 'COMPLETED' || review.isClosed;
+        const isReturned = review.status === 'RETURNED';
+        const isPending = review.status === 'DRAFT' || review.status === 'ASSIGNED' || review.status === 'MANAGER_PENDING';
+        const isHrPending = review.status === 'HR_PENDING';
+
+        const status = isClosed ? 'COMPLETED' : isReturned ? 'OVERRIDDEN' : isHrPending ? 'COMPLETED' : isPending ? 'PENDING' : 'COMPLETED';
+        const score = Number(review.score ?? review.finalScore ?? 0);
+        const timestamp = review.completedAt || review.submittedAt || review.updatedAt || review.createdAt;
+
+        let reviewDesc = '';
+        if (review.managerOverallComments) {
+          reviewDesc = review.managerOverallComments;
+        } else if (review.strengths) {
+          reviewDesc = `Strengths: ${review.strengths}`;
+        } else if (isClosed) {
+          reviewDesc = `Quarterly evaluation completed with final evaluated score ${score.toFixed(2)}/5.00.`;
+        } else if (isReturned) {
+          reviewDesc = `Review returned for revision. Status: ${review.status}.`;
+        } else if (isPending) {
+          reviewDesc = `Quarter ${q} evaluation currently pending reporting manager submission.`;
+        } else {
+          reviewDesc = `Quarter ${q} evaluation submitted with score ${score.toFixed(2)}/5.00.`;
+        }
+
+        events.push({
+          id: `tl_${employee.id}_q${q}`,
+          stageName: `Quarter ${q} Review & Evaluation`,
+          stageKey: `Q${q}_REVIEW`,
+          timestamp,
+          actorName: review.managerName || employee.managerName || 'Reporting Manager',
+          actorRole: 'MANAGER',
+          status,
+          title: `Q${q} Evaluation - ${review.status.replace(/_/g, ' ')}`,
+          description: reviewDesc,
+          scoreBefore: 0,
+          scoreAfter: score > 0 ? Number(score.toFixed(2)) : undefined,
+          details: {
+            rating: score >= 4.5 ? 'OUTSTANDING' : score >= 3.8 ? 'EXCEEDS_EXPECTATIONS' : score >= 3.0 ? 'MEETS_EXPECTATIONS' : 'IN_PROGRESS',
+            status: review.status,
+            onTimeSubmission: !isReturned,
+          },
+        });
+      } else {
+        // Scheduled/Pending Quarter
+        events.push({
+          id: `tl_${employee.id}_q${q}`,
+          stageName: `Quarter ${q} Review & Evaluation`,
+          stageKey: `Q${q}_REVIEW`,
+          timestamp: `2026-0${q * 3}-15T12:00:00.000Z`,
+          actorName: employee.managerName || 'Reporting Manager',
+          actorRole: 'MANAGER',
+          status: 'PENDING',
+          title: `Quarter ${q} Review Pending`,
+          description: `Quarter ${q} review cycle scheduled. Awaiting initiation and performance evaluation.`,
+          details: { status: 'PENDING' },
+        });
+      }
+    }
+
+    // Stage 6: Manager Annual Appraisal Recommendation
+    if (appraisal) {
+      const hasRecommendation = !!(appraisal.managerRecommendation || ['RECOMMENDED', 'HR_APPROVED', 'APPROVED', 'FINALIZED', 'LOCKED', 'COMPLETED'].includes(appraisal.status));
+      const proposedIncrement = appraisal.proposedIncrementPercentage ?? appraisal.incrementPercentage ?? appraisal.managerRecommendation?.suggestedIncrementPercent ?? 0;
+      const avgScore = Number((appraisal.averageQuarterlyScore || 0).toFixed(2));
+
+      let recDesc = `Annual evaluation submitted with average quarterly score ${avgScore}/5.00. Recommended increment: ${proposedIncrement}%. Rating: ${appraisal.recommendedRating || appraisal.finalRating || 'Exceeds Expectations'}.`;
+      if (appraisal.promotionRecommended) {
+        recDesc += ` Promotion proposed to ${appraisal.promotionDesignationName || 'Next Level'}.`;
+      }
+      if (appraisal.managerRecommendation?.justification) {
+        recDesc += ` Remarks: "${appraisal.managerRecommendation.justification}".`;
+      }
+
+      events.push({
+        id: `tl_${employee.id}_mgr_appraisal`,
+        stageName: 'Annual Appraisal Recommendation',
+        stageKey: 'MANAGER_RECOMMENDATION',
+        timestamp: appraisal.managerRecommendation?.recommendedAt || appraisal.createdAt,
+        actorName: appraisal.managerRecommendation?.recommendedByName || appraisal.managerName || employee.managerName || 'Reporting Manager',
         actorRole: 'MANAGER',
-        status: 'COMPLETED',
-        title: 'Q1 Evaluation Submitted',
-        description: 'First quarterly sprint completed with target milestones reached ahead of schedule.',
-        scoreBefore: 0,
-        scoreAfter: 4.10,
-        details: { rating: 'EXCEEDS_EXPECTATIONS', onTimeSubmission: true },
-      },
-      {
-        id: `tl_${employee.id}_3`,
-        stageName: 'Quarter 2 Review & Mid-Year Pulse',
-        stageKey: 'Q2_REVIEW',
-        timestamp: '2026-03-30T11:15:00.000Z',
-        actorName: employee.managerName || 'Reporting Manager',
-        actorRole: 'MANAGER',
-        status: 'COMPLETED',
-        title: 'Q2 Evaluation Submitted',
-        description: 'Mid-year evaluation submitted with strong code quality metrics and peer feedback.',
-        scoreBefore: 4.10,
-        scoreAfter: 4.25,
-        details: { rating: 'EXCEEDS_EXPECTATIONS', onTimeSubmission: true },
-      },
-      {
-        id: `tl_${employee.id}_4`,
-        stageName: 'Quarter 3 Review & Pre-Appraisal Alignment',
-        stageKey: 'Q3_REVIEW',
-        timestamp: '2026-06-25T16:00:00.000Z',
-        actorName: employee.managerName || 'Reporting Manager',
-        actorRole: 'MANAGER',
-        status: 'COMPLETED',
-        title: 'Q3 Evaluation Submitted',
-        description: 'Consistent performance on key architecture milestones with zero SLA breaches.',
-        scoreBefore: 4.25,
-        scoreAfter: 4.30,
-        details: { rating: 'EXCEEDS_EXPECTATIONS', onTimeSubmission: true },
-      },
-      {
-        id: `tl_${employee.id}_5`,
-        stageName: 'Quarter 4 Final Evaluation',
-        stageKey: 'Q4_REVIEW',
-        timestamp: '2026-09-01T09:30:00.000Z',
-        actorName: employee.managerName || 'Reporting Manager',
-        actorRole: 'MANAGER',
-        status: 'COMPLETED',
-        title: 'Q4 Evaluation Completed',
-        description: 'Annual evaluation completed. Aggregate year score computed at 4.35.',
-        scoreBefore: 4.30,
-        scoreAfter: 4.35,
-        details: { rating: 'OUTSTANDING', onTimeSubmission: true },
-      },
-      {
-        id: `tl_${employee.id}_6`,
-        stageName: 'HOD Cross-Departmental Calibration',
-        stageKey: 'CALIBRATION',
-        timestamp: '2026-09-02T14:10:00.000Z',
-        actorName: 'Alice Johnson',
-        actorRole: 'HOD',
-        status: 'OVERRIDDEN',
-        title: 'HOD Bell-Curve Calibration Applied',
-        description: 'Score calibrated to 4.30 to meet departmental bell curve and quota distribution guidelines.',
-        scoreBefore: 4.35,
-        scoreAfter: 4.30,
-        changeReason: 'Alignment with 15% top-tier quota guidelines across the Engineering division.',
-        details: { variance: -0.05, justificationLogged: true },
-      },
-      {
-        id: `tl_${employee.id}_7`,
-        stageName: 'HR & Executive Increment Decision',
+        status: hasRecommendation ? 'COMPLETED' : 'PENDING',
+        title: hasRecommendation ? 'Manager Appraisal Recommendation Submitted' : 'Awaiting Manager Recommendation',
+        description: hasRecommendation ? recDesc : 'Reporting manager has not yet submitted annual increment recommendation.',
+        scoreBefore: avgScore > 0 ? avgScore : undefined,
+        scoreAfter: avgScore > 0 ? avgScore : undefined,
+        details: {
+          recommendedIncrement: proposedIncrement,
+          averageScore: avgScore,
+          proposedPromotion: appraisal.promotionRecommended || false,
+        },
+      });
+
+      // Stage 7: HR Decision & Calibration
+      const isApprovedOrLocked = !!(
+        appraisal.hrApproval ||
+        appraisal.isLocked ||
+        ['APPROVED', 'HR_APPROVED', 'FINALIZED', 'LOCKED', 'COMPLETED'].includes(appraisal.status)
+      );
+      const approvedIncrement = appraisal.approvedIncrementPercentage ?? appraisal.incrementPercentage ?? appraisal.hrApproval?.finalIncrementPercent ?? proposedIncrement;
+      const revisedCtc = appraisal.revisedCtc || appraisal.finalCtc;
+
+      let hrDesc = isApprovedOrLocked
+        ? `Final approved increment: ${approvedIncrement}%. Final Rating: ${appraisal.finalRating || appraisal.recommendedRating || 'Approved'}.`
+        : 'Pending final HR compensation verification and cycle lock.';
+      if (revisedCtc) {
+        hrDesc += ` Revised CTC: ₹${(revisedCtc / 100000).toFixed(2)}L p.a.`;
+      }
+      if (appraisal.hrApproval?.notes) {
+        hrDesc += ` HR Notes: "${appraisal.hrApproval.notes}".`;
+      }
+
+      events.push({
+        id: `tl_${employee.id}_hr_decision`,
+        stageName: 'HR Increment Decision & Approval',
         stageKey: 'INCREMENT_DECISION',
-        timestamp: '2026-09-03T11:45:00.000Z',
-        actorName: 'Frank HR Manager',
+        timestamp: appraisal.hrApproval?.approvedAt || appraisal.lockedAt || appraisal.finalizedAt || appraisal.updatedAt,
+        actorName: appraisal.hrApproval?.approvedByName || 'HR Operations',
         actorRole: 'HR',
-        status: 'COMPLETED',
-        title: 'Increment & Band Approved',
-        description: 'Recommended 12.5% salary increment with Band A promotional progression.',
-        details: { recommendedIncrement: 12.5, proposedPromotion: false },
-      },
-      {
-        id: `tl_${employee.id}_8`,
+        status: isApprovedOrLocked ? 'COMPLETED' : 'PENDING',
+        title: isApprovedOrLocked ? 'Increment & Compensation Finalized' : 'HR Approval Pending',
+        description: hrDesc,
+        details: {
+          approvedIncrement,
+          newCtc: revisedCtc,
+          finalRating: appraisal.finalRating || appraisal.recommendedRating,
+        },
+      });
+
+      // Stage 8: Appraisal Letter Release
+      const isLetterIssued = !!(appraisal.letterIssued || appraisal.letterReleased || appraisal.hrApproval?.letterGenerated);
+      events.push({
+        id: `tl_${employee.id}_letter`,
+        stageName: 'Appraisal Letter Release',
+        stageKey: 'LETTER_RELEASE',
+        timestamp: appraisal.letterIssuedAt || appraisal.hrApproval?.letterGeneratedAt || appraisal.updatedAt,
+        actorName: appraisal.hrApproval?.approvedByName || 'HR Operations',
+        actorRole: 'HR',
+        status: isLetterIssued ? 'COMPLETED' : 'PENDING',
+        title: isLetterIssued ? 'Digital Letter Dispatched to ESS Portal' : 'Letter Release Pending',
+        description: isLetterIssued
+          ? `Formal digital appraisal letter issued for ${empName} and released to employee portal.`
+          : 'Appraisal letter will be issued once HR approval is locked.',
+        details: isLetterIssued
+          ? { documentHash: `sha256_${(appraisal.id || 'doc').slice(-8)}`, deliveryChannel: 'ESS_IN_APP' }
+          : undefined,
+      });
+
+      // Stage 9: Employee Digital Acknowledgement
+      const isAcknowledged = !!appraisal.acknowledgedByEmployee;
+      events.push({
+        id: `tl_${employee.id}_ack`,
+        stageName: 'Employee Digital Acknowledgement',
+        stageKey: 'ACKNOWLEDGEMENT',
+        timestamp: appraisal.acknowledgedAt || (isAcknowledged ? appraisal.updatedAt : '2026-09-05T00:00:00.000Z'),
+        actorName: empName,
+        actorRole: 'EMPLOYEE',
+        status: isAcknowledged ? 'COMPLETED' : 'PENDING',
+        title: isAcknowledged ? 'Letter Electronically Acknowledged' : 'Awaiting Employee Acknowledgement',
+        description: isAcknowledged
+          ? `Employee confirmed receipt and accepted terms digitally via ESS portal.${appraisal.employeeAcknowledgement?.remarks ? ` Remarks: "${appraisal.employeeAcknowledgement.remarks}".` : ''}`
+          : isLetterIssued
+          ? 'Letter published to portal. Employee has not yet confirmed receipt.'
+          : 'Pending appraisal letter publication.',
+        details: isAcknowledged
+          ? {
+              ipAddress: appraisal.employeeAcknowledgement?.ipAddress || 'Internal Network',
+              method: 'DIGITAL_SIGNATURE',
+            }
+          : { reminderSentCount: 1 },
+      });
+    } else {
+      // Default placeholder future stages for employees without appraisal record
+      events.push({
+        id: `tl_${employee.id}_mgr_appraisal`,
+        stageName: 'Annual Appraisal Recommendation',
+        stageKey: 'MANAGER_RECOMMENDATION',
+        timestamp: '2026-09-01T09:00:00.000Z',
+        actorName: employee.managerName || 'Reporting Manager',
+        actorRole: 'MANAGER',
+        status: 'PENDING',
+        title: 'Awaiting Manager Appraisal Recommendation',
+        description: 'Annual appraisal recommendation cycle not yet initiated for this employee.',
+      });
+      events.push({
+        id: `tl_${employee.id}_hr_decision`,
+        stageName: 'HR Increment Decision & Approval',
+        stageKey: 'INCREMENT_DECISION',
+        timestamp: '2026-09-03T11:00:00.000Z',
+        actorName: 'HR Operations',
+        actorRole: 'HR',
+        status: 'PENDING',
+        title: 'HR Approval Pending',
+        description: 'Pending completion of quarterly reviews and manager recommendation.',
+      });
+      events.push({
+        id: `tl_${employee.id}_letter`,
         stageName: 'Appraisal Letter Release',
         stageKey: 'LETTER_RELEASE',
         timestamp: '2026-09-04T10:00:00.000Z',
-        actorName: 'Priya Sundaram',
+        actorName: 'HR Operations',
         actorRole: 'HR',
-        status: 'COMPLETED',
-        title: 'Digital Letter Dispatched to ESS Portal',
-        description: 'Formal appraisal letter issued and notification triggered to employee.',
-        details: { documentHash: 'sha256_e891bca7', deliveryChannel: 'ESS_IN_APP' },
-      },
-    ];
-
-    // If employee is in acknowledged state, add final stage
-    if (employee.id === 'emp_dev_1' || employee.id === 'emp_com_1') {
-      events.push({
-        id: `tl_${employee.id}_9`,
-        stageName: 'Employee Digital Acknowledgement',
-        stageKey: 'ACKNOWLEDGEMENT',
-        timestamp: '2026-09-04T15:20:00.000Z',
-        actorName: empName,
-        actorRole: 'EMPLOYEE',
-        status: 'COMPLETED',
-        title: 'Letter Electronically Acknowledged',
-        description: 'Employee confirmed receipt and accepted terms digitally via ESS portal.',
-        details: { ipAddress: '192.168.1.108', method: 'DIGITAL_SIGNATURE' },
+        status: 'PENDING',
+        title: 'Letter Release Pending',
+        description: 'Digital appraisal letter pending compensation finalization.',
       });
-    } else {
       events.push({
-        id: `tl_${employee.id}_9`,
+        id: `tl_${employee.id}_ack`,
         stageName: 'Employee Digital Acknowledgement',
         stageKey: 'ACKNOWLEDGEMENT',
         timestamp: '2026-09-05T00:00:00.000Z',
         actorName: empName,
         actorRole: 'EMPLOYEE',
         status: 'PENDING',
-        title: 'Awaiting Employee Acknowledgement',
-        description: 'Letter published. Employee has not yet confirmed receipt.',
-        details: { reminderSentCount: 1 },
+        title: 'Employee Acknowledgement Pending',
+        description: 'Pending letter generation and portal dispatch.',
       });
     }
 
@@ -382,7 +538,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         code: employee.employeeCode,
         department: employee.departmentName,
         designation: employee.designationName,
-        cycle: employee.cycleName || 'Cycle F (September)',
+        cycle: employee.cycleName || employee.cycleCode || 'Cycle F (September)',
       },
       timeline: events,
     });
