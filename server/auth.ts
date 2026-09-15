@@ -19,7 +19,8 @@ const JWT_SECRET = process.env.JWT_SECRET && process.env.JWT_SECRET.length >= 32
   : DEFAULT_SECRET;
 const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || `${JWT_SECRET}_refresh_key_2026`;
 
-export const ACCESS_TOKEN_EXPIRY = '15m';
+// Dev: 8 hours for convenient local/Postman testing | Production: 15 minutes for security
+export const ACCESS_TOKEN_EXPIRY = process.env.NODE_ENV === 'production' ? '15m' : '8h';
 export const REFRESH_TOKEN_EXPIRY = '7d';
 
 export interface AuthenticatedRequest extends Request {
