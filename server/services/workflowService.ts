@@ -211,33 +211,45 @@ export async function generateQuarterlyReviews(
 
     // Notify Reporting Manager
     if (newReview.managerId) {
-      await notifCol.insertOne({
-        id: `notif_${reviewId}_assigned`,
-        userId: newReview.managerId,
-        userRole: 'MANAGER',
-        type: 'REVIEW_ASSIGNED',
-        title: `New Quarterly Review Assigned: ${emp.name}`,
-        message: `Quarterly review for ${emp.name} (${period.name}) has been generated and is awaiting your evaluation.`,
-        isRead: false,
-        priority: 'MEDIUM',
-        metadata: { reviewId, periodId: period.id },
-        createdAt: now,
-      });
+      await notifCol.updateOne(
+        { id: `notif_${reviewId}_assigned` },
+        {
+          $set: {
+            id: `notif_${reviewId}_assigned`,
+            userId: newReview.managerId,
+            userRole: 'MANAGER',
+            type: 'REVIEW_ASSIGNED',
+            title: `New Quarterly Review Assigned: ${emp.name}`,
+            message: `Quarterly review for ${emp.name} (${period.name}) has been generated and is awaiting your evaluation.`,
+            isRead: false,
+            priority: 'MEDIUM',
+            metadata: { reviewId, periodId: period.id },
+            createdAt: now,
+          },
+        },
+        { upsert: true }
+      );
     }
 
     // Notify Employee about pending Self-Assessment
-    await notifCol.insertOne({
-      id: `notif_self_assess_${reviewId}`,
-      userId: emp.id,
-      userRole: 'EMPLOYEE',
-      type: 'REVIEW_ASSIGNED',
-      title: `Self-Assessment Due: ${period.name}`,
-      message: `Your quarterly performance self-assessment for ${period.name} is open. Please complete your KRA self-ratings and submit your evaluation.`,
-      isRead: false,
-      priority: 'HIGH',
-      metadata: { reviewId, periodId: period.id, subTab: 'reviews', openSelfAssess: true },
-      createdAt: now,
-    });
+    await notifCol.updateOne(
+      { id: `notif_self_assess_${reviewId}` },
+      {
+        $set: {
+          id: `notif_self_assess_${reviewId}`,
+          userId: emp.id,
+          userRole: 'EMPLOYEE',
+          type: 'REVIEW_ASSIGNED',
+          title: `Self-Assessment Due: ${period.name}`,
+          message: `Your quarterly performance self-assessment for ${period.name} is open. Please complete your KRA self-ratings and submit your evaluation.`,
+          isRead: false,
+          priority: 'HIGH',
+          metadata: { reviewId, periodId: period.id, subTab: 'reviews', openSelfAssess: true },
+          createdAt: now,
+        },
+      },
+      { upsert: true }
+    );
 
     // Audit log
     await recordAuditLog(

@@ -1477,10 +1477,23 @@ mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Respo
       });
     }
 
+    // Deduplicate by notification id or (userId + type + metadata.reviewId/periodId)
+    const seenNotifs = new Set<string>();
+    const deduplicated: any[] = [];
+    for (const notif of filtered) {
+      const dedupeKey = notif.id || `${notif.userId}_${notif.type}_${notif.metadata?.reviewId || notif.metadata?.periodId || notif.title}`;
+      if (!seenNotifs.has(dedupeKey)) {
+        seenNotifs.add(dedupeKey);
+        deduplicated.push(notif);
+      }
+    }
+
     // Sort newest first & limit to top 100
-    filtered.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-    if (filtered.length > 100) {
-      filtered = filtered.slice(0, 100);
+    deduplicated.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+    if (deduplicated.length > 100) {
+      filtered = deduplicated.slice(0, 100);
+    } else {
+      filtered = deduplicated;
     }
 
     res.json(filtered);

@@ -376,36 +376,48 @@ export async function createQuarterlyReview(options: CreateQuarterlyReviewOption
 
   // 8. Notifications
   try {
-    // Notify employee of self-assessment due
-    await notifCol.insertOne({
-      id: `notif_self_assess_${newReview.id}`,
-      userId: emp.id,
-      userRole: 'EMPLOYEE',
-      type: 'REVIEW_ASSIGNED',
-      title: `Self-Assessment Due: ${period.name}`,
-      message: `Your quarterly performance self-assessment for ${period.name} is open. Please complete your KRA self-ratings and submit your evaluation.`,
-      isRead: false,
-      priority: 'HIGH',
-      metadata: { reviewId: newReview.id, periodId: period.id, subTab: 'reviews', openSelfAssess: true },
-      createdAt: now,
-    });
+    // Notify employee of self-assessment due (upsert to prevent duplicate alerts)
+    await notifCol.updateOne(
+      { id: `notif_self_assess_${newReview.id}` },
+      {
+        $set: {
+          id: `notif_self_assess_${newReview.id}`,
+          userId: emp.id,
+          userRole: 'EMPLOYEE',
+          type: 'REVIEW_ASSIGNED',
+          title: `Self-Assessment Due: ${period.name}`,
+          message: `Your quarterly performance self-assessment for ${period.name} is open. Please complete your KRA self-ratings and submit your evaluation.`,
+          isRead: false,
+          priority: 'HIGH',
+          metadata: { reviewId: newReview.id, periodId: period.id, subTab: 'reviews', openSelfAssess: true },
+          createdAt: now,
+        },
+      },
+      { upsert: true }
+    );
 
-    // If manually initiated, also notify reporting manager
+    // If manually initiated, also notify reporting manager (upsert to prevent duplicate alerts)
     if (source === 'MANUAL' && (emp.managerId || emp.hodId)) {
       const targetMgrId = emp.managerId || emp.hodId;
       if (targetMgrId && targetMgrId !== initiatedBy?.id) {
-        await notifCol.insertOne({
-          id: `notif_mgr_review_${newReview.id}`,
-          userId: targetMgrId,
-          userRole: 'MANAGER',
-          type: 'REVIEW_ASSIGNED',
-          title: `Quarterly Review Initiated: ${emp.name}`,
-          message: `A quarterly review for ${emp.name} (${period.name}) has been initiated by ${actorName}.`,
-          isRead: false,
-          priority: 'NORMAL',
-          metadata: { reviewId: newReview.id, periodId: period.id, subTab: 'reviews' },
-          createdAt: now,
-        });
+        await notifCol.updateOne(
+          { id: `notif_mgr_review_${newReview.id}` },
+          {
+            $set: {
+              id: `notif_mgr_review_${newReview.id}`,
+              userId: targetMgrId,
+              userRole: 'MANAGER',
+              type: 'REVIEW_ASSIGNED',
+              title: `Quarterly Review Initiated: ${emp.name}`,
+              message: `A quarterly review for ${emp.name} (${period.name}) has been initiated by ${actorName}.`,
+              isRead: false,
+              priority: 'NORMAL',
+              metadata: { reviewId: newReview.id, periodId: period.id, subTab: 'reviews' },
+              createdAt: now,
+            },
+          },
+          { upsert: true }
+        );
       }
     }
   } catch (_notifErr) {
