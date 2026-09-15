@@ -1348,8 +1348,59 @@ mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Respo
       }
     }
 
+    // Auto-resolve stale workflow review notifications across all roles (HR, HOD, Managers, Employees)
+    try {
+      const reviewsCol = getDbCollection('employeeReviews');
+
+      // 1. If reviews are completed / closed, resolve all pending review action notifications
+      const closedOrCompletedReviews: any[] = await (
+        await reviewsCol.find({
+          $or: [{ isClosed: true }, { status: 'CLOSED' }],
+        })
+      ).toArray();
+
+      if (closedOrCompletedReviews.length > 0) {
+        const closedReviewIds = closedOrCompletedReviews.map((r) => r.id);
+        await notifsCol.updateMany(
+          {
+            'metadata.reviewId': { $in: closedReviewIds },
+            type: { $in: ['MANAGER_SUBMITTED', 'HOD_ACTION_REQUIRED', 'HOD_APPROVED', 'RETURNED', 'REVIEW_ASSIGNED'] },
+            isRead: false,
+          },
+          {
+            $set: { isRead: true },
+          }
+        );
+      }
+
+      // 2. If review is no longer pending HR approval (status is not HR_PENDING or SUBMITTED), resolve MANAGER_SUBMITTED and HOD_APPROVED
+      const nonHrPendingReviews: any[] = await (
+        await reviewsCol.find({
+          status: { $nin: ['HR_PENDING', 'SUBMITTED'] },
+        })
+      ).toArray();
+
+      if (nonHrPendingReviews.length > 0) {
+        const nonHrPendingIds = nonHrPendingReviews.map((r) => r.id);
+        await notifsCol.updateMany(
+          {
+            'metadata.reviewId': { $in: nonHrPendingIds },
+            type: { $in: ['MANAGER_SUBMITTED', 'HOD_APPROVED'] },
+            isRead: false,
+          },
+          {
+            $set: { isRead: true },
+          }
+        );
+      }
+    } catch (syncErr) {
+      console.warn('[Notifications] Error auto-syncing completed review workflow notifications:', syncErr);
+    }
+
+    const isExplicitGlobalView = req.query.scope === 'all' && currentUser.role === 'SUPER_ADMIN';
+
     let filter: any = {};
-    if (currentUser.role !== 'SUPER_ADMIN') {
+    if (!isExplicitGlobalView) {
       const orClauses: any[] = [
         { userId: currentUser.id },
         { userId: 'ALL' },
@@ -1373,12 +1424,21 @@ mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Respo
 
     let filtered: any[] = notifications;
 
-    if (currentUser.role !== 'SUPER_ADMIN') {
+    if (!isExplicitGlobalView) {
       filtered = notifications.filter((n) => {
         // Direct target match by user ID or employee ID (private notification)
         const isDirectUserMatch = n.userId === currentUser.id;
         const isDirectEmpMatch = Boolean(currentUser.employeeId && n.userId === currentUser.employeeId);
         if (isDirectUserMatch || isDirectEmpMatch) {
+          return true;
+        }
+
+        // Direct target match by userRole (e.g. SUPER_ADMIN, HR, MANAGEMENT)
+        if (n.userRole === currentUser.role) {
+          // If a specific userId is designated and it does not match this user, don't show it
+          if (n.userId && n.userId !== 'ALL' && n.userId !== currentUser.id && (!currentUser.employeeId || n.userId !== currentUser.employeeId)) {
+            return false;
+          }
           return true;
         }
 
@@ -1458,7 +1518,7 @@ mastersRouter.delete('/notifications/:id', async (req: AuthenticatedRequest, res
   try {
     const { id } = req.params;
     const notifsCol = getDbCollection('notifications');
-    await notifsCol.deleteOne({ id });
+    await notifsCol.deleteMany({ $or: [{ id }, { _id: id }] });
     res.json({ success: true, id, message: 'Notification removed.' });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to delete notification.' });
@@ -1473,7 +1533,7 @@ mastersRouter.post('/notifications/:id/complete', async (req: AuthenticatedReque
   try {
     const { id } = req.params;
     const notifsCol = getDbCollection('notifications');
-    await notifsCol.deleteOne({ id });
+    await notifsCol.deleteMany({ $or: [{ id }, { _id: id }] });
     res.json({ success: true, id, message: 'Target task completed. Notification automatically removed.' });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to complete notification.' });
@@ -1488,7 +1548,7 @@ mastersRouter.put('/notifications/:id/read', async (req: AuthenticatedRequest, r
   try {
     const { id } = req.params;
     const notifsCol = getDbCollection('notifications');
-    await notifsCol.updateOne({ id }, { $set: { isRead: true } });
+    await notifsCol.updateMany({ $or: [{ id }, { _id: id }] }, { $set: { isRead: true } });
     res.json({ success: true, id });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to mark notification as read.' });

@@ -448,8 +448,16 @@ export async function submitManagerReview(
 
   await reviewCol.updateOne({ id: reviewId }, { $set: updated });
 
-  // Notify HR
+  // Notify HR and auto-resolve previous return/assignment notifications
   const notifCol = getDbCollection('notifications');
+  await notifCol.updateMany(
+    {
+      'metadata.reviewId': reviewId,
+      type: { $in: ['RETURNED', 'REVIEW_ASSIGNED'] },
+      isRead: false,
+    },
+    { $set: { isRead: true } }
+  );
   await notifCol.insertOne({
     id: `notif_${reviewId}_hr_pending_${Date.now()}`,
     userId: 'ALL',
@@ -526,9 +534,19 @@ export async function returnReview(
 
   await reviewCol.updateOne({ id: reviewId }, { $set: updated });
 
+  // Auto-resolve pending manager submissions since review is returned
+  const notifCol = getDbCollection('notifications');
+  await notifCol.updateMany(
+    {
+      'metadata.reviewId': reviewId,
+      type: { $in: ['MANAGER_SUBMITTED', 'HOD_APPROVED'] },
+      isRead: false,
+    },
+    { $set: { isRead: true } }
+  );
+
   // Notify Reporting Manager
   if (review.managerId) {
-    const notifCol = getDbCollection('notifications');
     await notifCol.insertOne({
       id: `notif_${reviewId}_returned_${Date.now()}`,
       userId: review.managerId,
@@ -605,8 +623,18 @@ export async function completeHRReview(
 
   await reviewCol.updateOne({ id: reviewId }, { $set: updated });
 
-  // Notify Employee and Manager
+  // Auto-resolve all prior pending review notifications (HR pending, returns, assignments)
   const notifCol = getDbCollection('notifications');
+  await notifCol.updateMany(
+    {
+      'metadata.reviewId': reviewId,
+      type: { $in: ['MANAGER_SUBMITTED', 'HOD_ACTION_REQUIRED', 'HOD_APPROVED', 'RETURNED', 'REVIEW_ASSIGNED'] },
+      isRead: false,
+    },
+    { $set: { isRead: true } }
+  );
+
+  // Notify Employee and Manager
   await notifCol.insertOne({
     id: `notif_${reviewId}_closed_${Date.now()}`,
     userId: review.employeeId,
