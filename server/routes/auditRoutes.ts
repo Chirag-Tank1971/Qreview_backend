@@ -9,6 +9,7 @@ import {
   ComplianceRiskReport,
   AuditFilterParams,
   AuditSummaryMetrics,
+  ReviewPeriod,
 } from '../../src/types.js';
 
 export const auditRouter = Router();
@@ -234,6 +235,24 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
     const reviewsCol = getDbCollection('employeeReviews');
     const appraisalsCol = getDbCollection('appraisals');
     const auditLogsCol = getDbCollection('auditLogs');
+    const reviewPeriodsCol = getDbCollection<ReviewPeriod>('reviewPeriods');
+
+    const allReviewPeriods: ReviewPeriod[] = await (await reviewPeriodsCol.find({})).toArray();
+    const periodMap = new Map<string, ReviewPeriod>();
+    for (const p of allReviewPeriods) {
+      periodMap.set(p.id, p);
+    }
+
+    const getReviewQuarter = (r: any): number => {
+      if (r.quarter && typeof r.quarter === 'number') return r.quarter;
+      const pid = r.reviewPeriodId || r.periodId;
+      if (pid && periodMap.has(pid)) {
+        return periodMap.get(pid)!.quarter;
+      }
+      const match = (pid || r.id || '').match(/_q([1-4])/i);
+      if (match) return parseInt(match[1], 10);
+      return 0;
+    };
 
     // 1. Fetch KRA Template
     let template = null;
@@ -256,8 +275,8 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
 
     // Sort reviews by quarter (1, 2, 3, 4) or createdAt
     reviews.sort((a, b) => {
-      const qA = a.quarter || 0;
-      const qB = b.quarter || 0;
+      const qA = getReviewQuarter(a);
+      const qB = getReviewQuarter(b);
       if (qA !== qB) return qA - qB;
       return new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime();
     });
@@ -307,9 +326,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
     // Stages 2 - 5: Quarterly Reviews (Q1, Q2, Q3, Q4)
     const quarters = [1, 2, 3, 4];
     for (const q of quarters) {
-      const review = reviews.find(
-        (r) => r.quarter === q || r.id?.includes(`_q${q}_`) || r.periodId?.includes(`_q${q}`)
-      ) || (reviews.length >= q ? reviews[q - 1] : null);
+      const review = reviews.find((r) => getReviewQuarter(r) === q);
 
       if (review) {
         const isClosed = review.status === 'CLOSED' || review.status === 'COMPLETED' || review.isClosed;
@@ -355,12 +372,31 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
           },
         });
       } else {
-        // Scheduled/Pending Quarter
+        const targetYear = reviews.map((r) => periodMap.get(r.reviewPeriodId)?.year).find(Boolean) ||
+          (employee.joiningDate ? new Date(employee.joiningDate).getFullYear() : new Date().getFullYear());
+        const targetPeriod = allReviewPeriods.find((p) => p.quarter === q && p.year === targetYear) ||
+          allReviewPeriods.find((p) => p.quarter === q);
+
+        const joiningDateStr = employee.joiningDate || employee.dateOfJoining;
+        const isPreHire = Boolean(
+          targetPeriod &&
+          targetPeriod.endDate &&
+          joiningDateStr &&
+          new Date(joiningDateStr).getTime() > new Date(targetPeriod.endDate).getTime()
+        );
+
+        if (isPreHire) {
+          // Pre-hire quarter: employee was not employed during this quarter and has no review.
+          // Omit from lifecycle timeline so audit trail reflects actual employment tenure.
+          continue;
+        }
+
+        // Scheduled/Pending Quarter (Current or Future)
         events.push({
           id: `tl_${employee.id}_q${q}`,
           stageName: `Quarter ${q} Review & Evaluation`,
           stageKey: `Q${q}_REVIEW`,
-          timestamp: `2026-0${q * 3}-15T12:00:00.000Z`,
+          timestamp: undefined,
           actorName: employee.managerName || 'Reporting Manager',
           actorRole: 'MANAGER',
           status: 'PENDING',
@@ -465,7 +501,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         id: `tl_${employee.id}_ack`,
         stageName: 'Employee Digital Acknowledgement',
         stageKey: 'ACKNOWLEDGEMENT',
-        timestamp: appraisal.acknowledgedAt || (isAcknowledged ? appraisal.updatedAt : '2026-09-05T00:00:00.000Z'),
+        timestamp: appraisal.acknowledgedAt || (isAcknowledged ? appraisal.updatedAt : undefined),
         actorName: empName,
         actorRole: 'EMPLOYEE',
         status: isAcknowledged ? 'COMPLETED' : 'PENDING',
@@ -488,7 +524,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         id: `tl_${employee.id}_mgr_appraisal`,
         stageName: 'Annual Appraisal Recommendation',
         stageKey: 'MANAGER_RECOMMENDATION',
-        timestamp: '2026-09-01T09:00:00.000Z',
+        timestamp: undefined,
         actorName: employee.managerName || 'Reporting Manager',
         actorRole: 'MANAGER',
         status: 'PENDING',
@@ -499,7 +535,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         id: `tl_${employee.id}_hr_decision`,
         stageName: 'HR Increment Decision & Approval',
         stageKey: 'INCREMENT_DECISION',
-        timestamp: '2026-09-03T11:00:00.000Z',
+        timestamp: undefined,
         actorName: 'HR Operations',
         actorRole: 'HR',
         status: 'PENDING',
@@ -510,7 +546,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         id: `tl_${employee.id}_letter`,
         stageName: 'Appraisal Letter Release',
         stageKey: 'LETTER_RELEASE',
-        timestamp: '2026-09-04T10:00:00.000Z',
+        timestamp: undefined,
         actorName: 'HR Operations',
         actorRole: 'HR',
         status: 'PENDING',
@@ -521,7 +557,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         id: `tl_${employee.id}_ack`,
         stageName: 'Employee Digital Acknowledgement',
         stageKey: 'ACKNOWLEDGEMENT',
-        timestamp: '2026-09-05T00:00:00.000Z',
+        timestamp: undefined,
         actorName: empName,
         actorRole: 'EMPLOYEE',
         status: 'PENDING',
