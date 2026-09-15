@@ -84,6 +84,7 @@ temp/
 *.db-journal
 *.sqlite
 *.sqlite3
+.local_database_store.json
 
 # =========================
 # Testing
