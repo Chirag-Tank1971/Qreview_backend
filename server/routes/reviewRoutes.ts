@@ -30,6 +30,11 @@ import {
   completeHRReview,
   saveManagerDraft,
 } from '../services/workflowService.js';
+import {
+  checkEmployeeReviewEligibility,
+  createQuarterlyReview,
+  calculatePeriodTenureDays,
+} from '../services/reviewEligibility.js';
 
 export const reviewRouter = express.Router();
 
@@ -415,6 +420,139 @@ reviewRouter.get('/reviews/stats', async (req: AuthenticatedRequest, res: Respon
 });
 
 /**
+ * GET /api/reviews/check-eligibility
+ * Check if an employee is eligible for review in a specific quarter.
+ * Returns tenure calculation, pass/fail checks, and whether manual override is allowed.
+ * Roles: SUPER_ADMIN, HR, HOD, MANAGER
+ */
+reviewRouter.get(
+  '/reviews/check-eligibility',
+  requireRoles('SUPER_ADMIN', 'HR', 'HOD', 'MANAGER', 'REPORTING_MANAGER'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { employeeId, reviewPeriodId } = req.query;
+
+      if (!employeeId || !reviewPeriodId) {
+        return res.status(400).json({ error: 'employeeId and reviewPeriodId are required query parameters.' });
+      }
+
+      const empCol = getDbCollection('employees');
+      const periodCol = getDbCollection('reviewPeriods');
+
+      const emp = await empCol.findOne({ id: String(employeeId) });
+      if (!emp) {
+        return res.status(404).json({ error: 'Employee not found.' });
+      }
+
+      const period = await periodCol.findOne({ id: String(reviewPeriodId) });
+      if (!period) {
+        return res.status(404).json({ error: 'Review period not found.' });
+      }
+
+      const eligibility = await checkEmployeeReviewEligibility(emp, period);
+
+      res.json({
+        ...eligibility,
+        employee: {
+          id: emp.id,
+          name: emp.name,
+          employeeCode: emp.employeeCode,
+          status: emp.status,
+          joiningDate: emp.joiningDate || (emp as any).dateOfJoining,
+          managerName: emp.managerName,
+          departmentName: emp.departmentName,
+          designationName: emp.designationName,
+        },
+        period: {
+          id: period.id,
+          name: period.name,
+          quarter: period.quarter,
+          year: period.year,
+          startDate: period.startDate,
+          endDate: period.endDate,
+          status: period.status,
+        },
+      });
+    } catch (error: any) {
+      console.error('Error checking review eligibility:', error);
+      res.status(500).json({ error: 'Failed to check review eligibility.' });
+    }
+  }
+);
+
+/**
+ * POST /api/reviews/initiate
+ * Manually initiate a quarterly performance review for an employee.
+ * Strictly restricted to Super Admin and HR.
+ * Bypasses only the tenure check (requiring a justification reason if tenure < 30 days),
+ * but validates all other invariants (active status, manager assignment, KRA template, duplicate prevention).
+ */
+reviewRouter.post(
+  '/reviews/initiate',
+  requireRoles('SUPER_ADMIN', 'HR'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { employeeId, reviewPeriodId, reason } = req.body;
+
+      if (!employeeId || !reviewPeriodId) {
+        return res.status(400).json({ error: 'employeeId and reviewPeriodId are required in the request body.' });
+      }
+
+      const empCol = getDbCollection('employees');
+      const periodCol = getDbCollection('reviewPeriods');
+
+      const emp = await empCol.findOne({ id: String(employeeId) });
+      if (!emp) {
+        return res.status(404).json({ error: `Employee ${employeeId} not found.` });
+      }
+
+      const period = await periodCol.findOne({ id: String(reviewPeriodId) });
+      if (!period) {
+        return res.status(404).json({ error: `Review period ${reviewPeriodId} not found.` });
+      }
+
+      const eligibility = await checkEmployeeReviewEligibility(emp, period);
+
+      if (!eligibility.canInitiateManually) {
+        return res.status(400).json({
+          error: eligibility.reason || 'Employee is not eligible for manual review initiation.',
+          checks: eligibility.checks,
+        });
+      }
+
+      if (eligibility.requiresManualOverride && (!reason || !String(reason).trim())) {
+        return res.status(400).json({
+          error: `Justification reason is mandatory when manually initiating a review for an employee with tenure under ${eligibility.minTenureDays} days.`,
+          requiresReason: true,
+          tenureDays: eligibility.tenureDays,
+          minTenureDays: eligibility.minTenureDays,
+        });
+      }
+
+      const newReview = await createQuarterlyReview({
+        emp,
+        period,
+        source: 'MANUAL',
+        initiatedBy: {
+          id: req.user!.id,
+          name: req.user!.name,
+          role: req.user!.role,
+        },
+        manualOverrideReason: reason ? String(reason).trim() : undefined,
+      });
+
+      res.status(201).json({
+        message: `Quarterly review successfully initiated for ${emp.name} (${period.name}).`,
+        review: newReview,
+      });
+    } catch (error: any) {
+      console.error('Error initiating manual review:', error);
+      res.status(400).json({ error: error.message || 'Failed to initiate review.' });
+    }
+  }
+);
+
+/**
  * GET /api/reviews/my-pending
  * Returns pending reviews assigned to the currently authenticated manager
  */
@@ -539,6 +677,13 @@ reviewRouter.post(
       for (const emp of employees) {
         const existing = existingReviews.find((r) => r.employeeId === emp.id);
         if (existing && !overrideExisting) {
+          skippedCount++;
+          continue;
+        }
+
+        // Tenure eligibility check: Skip employees who do not meet the minimum tenure for the quarter
+        const eligibility = await checkEmployeeReviewEligibility(emp, period);
+        if (!eligibility.checks.tenureMet) {
           skippedCount++;
           continue;
         }

@@ -75,6 +75,8 @@ export interface SystemConfig {
   id: string;
   hodApprovalEnabled: boolean;
   selfAssessmentEnabled: boolean;
+  minTenureDaysForReview?: number;
+  includeProbationInReviews?: boolean;
   updatedAt: string;
   updatedBy?: string;
 }
@@ -314,6 +316,9 @@ export interface EmployeeReview {
   kraSnapshot: ReviewKraSnapshot[];
   actionHistory?: ReviewAction[];
   isClosed?: boolean;
+  creationSource?: 'AUTOMATIC' | 'MANUAL';
+  manualOverrideReason?: string;
+  initiatedBy?: string;
   submittedAt?: string;
   completedAt?: string;
   createdAt: string;

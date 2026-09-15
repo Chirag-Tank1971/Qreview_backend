@@ -1,5 +1,6 @@
 import { getDbCollection } from '../db.js';
 import { recordAuditLog } from '../auth.js';
+import { checkEmployeeReviewEligibility } from './reviewEligibility.js';
 import {
   EmployeeReview,
   ReviewPeriod,
@@ -81,6 +82,19 @@ export async function generateQuarterlyReviews(
     // 1. Check idempotency: Already generated for this period?
     if (existingMap.has(emp.id)) {
       report.skippedCount++;
+      continue;
+    }
+
+    // 1b. Check Minimum Tenure in Quarter (e.g. 30 days default)
+    const eligibility = await checkEmployeeReviewEligibility(emp, period);
+    if (!eligibility.checks.tenureMet) {
+      report.skippedCount++;
+      report.exceptions.push({
+        employeeId: emp.id,
+        employeeCode: emp.employeeCode,
+        employeeName: emp.name,
+        reason: eligibility.reason || `Insufficient tenure in quarter (${eligibility.tenureDays} days < ${eligibility.minTenureDays} days required).`,
+      });
       continue;
     }
 

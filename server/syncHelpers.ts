@@ -9,6 +9,10 @@ import {
   ReviewKraSnapshot,
   AppraisalQuarterRecord,
 } from '../src/types.js';
+import {
+  checkEmployeeReviewEligibility,
+  createQuarterlyReview,
+} from './services/reviewEligibility.js';
 
 export function computeAppraisalMatrix(avgScore: number) {
   if (avgScore <= 0) {
@@ -102,123 +106,18 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
             },
           }
         );
-      } else if (period.status === 'ACTIVE' && (emp.status === 'ACTIVE' || emp.status === 'PROBATION')) {
-        // ONLY generate a new review if this is the currently ACTIVE period and employee joined on or before period end date
-        const empAny = emp as any;
-        const joiningTime = emp.joiningDate
-          ? new Date(emp.joiningDate).getTime()
-          : empAny.dateOfJoining
-          ? new Date(empAny.dateOfJoining).getTime()
-          : 0;
-        const periodEndTime = period.endDate ? new Date(period.endDate).getTime() : Infinity;
-
-        if (joiningTime <= periodEndTime) {
-          // Find matching KRA template
-          let template = allTemplates.find((t) => t.id === emp.currentKraTemplateId);
-          if (!template && emp.designationId) {
-            template = allTemplates.find((t) => t.designationId === emp.designationId);
-          }
-          if (!template && emp.departmentId) {
-            template = allTemplates.find((t) => t.departmentId === emp.departmentId);
-          }
-          if (!template && allTemplates.length > 0) {
-            template = allTemplates[0];
-          }
-
-          const kraSnapshot: ReviewKraSnapshot[] = (template?.items || [
-            {
-              id: 'item_fb_1',
-              title: 'Core Deliverables & Execution',
-              description: 'Timely and accurate delivery of core quarterly deliverables',
-              target: 'Complete assigned quarterly goals within SLA',
-              measurementCriteria: '1: Below SLA | 3: Meets SLA | 5: Exceeds SLA',
-              weight: 50,
-            },
-            {
-              id: 'item_fb_2',
-              title: 'Quality & Process Discipline',
-              description: 'Adherence to quality standards and zero defect slip rates',
-              target: 'Maintain high standards and zero critical defect slippages',
-              measurementCriteria: '1: Defects reported | 3: Clean execution | 5: Optimization',
-              weight: 30,
-            },
-            {
-              id: 'item_fb_3',
-              title: 'Team Collaboration & Initiative',
-              description: 'Peer collaboration, cross-functional synergy, and proactive initiatives',
-              target: 'Active cross-functional participation and peer support',
-              measurementCriteria: '1: Low initiative | 3: Solid support | 5: Proactive leadership',
-              weight: 20,
-            },
-          ]).map((item: any, idx: number) => ({
-            id: `snap_${Date.now()}_${idx}_${Math.random().toString(36).substr(2, 6)}`,
-            kraId: item.kraId || item.id,
-            kraName: item.title || item.kraName || `KRA ${idx + 1}`,
-            title: item.title || item.kraName || `KRA ${idx + 1}`,
-            description: item.description || '',
-            targetSnapshot: item.target || item.targetSnapshot || 'Meet quarterly targets',
-            weight: item.weight || 25,
-            measurementCriteria: item.measurementCriteria || '',
-            rating: 0,
-            selfRating: 0,
-            comments: '',
-            selfComments: '',
-          }));
-
-          const appraisalMonth = empCycle ? empCycle.appraisalMonth : 1;
-          const cycleQuarter = Math.ceil(appraisalMonth / 3);
-          const isAppraisalQuarter = (period.quarter === cycleQuarter);
-
-          const newReview: EmployeeReview = {
-            id: `rev_${period.id}_${emp.id}`,
-            employeeId: emp.id,
-            employeeCode: emp.employeeCode,
-            employeeName: emp.name,
-            departmentId: emp.departmentId,
-            departmentName: emp.departmentName || 'Department',
-            designationName: emp.designationName || 'Designation',
-            managerId: emp.managerId || '',
-            managerName: emp.managerName || '',
-            hodId: emp.hodId,
-            hodName: emp.hodName,
-            cycleId: emp.cycleId,
-            cycleCode: emp.cycleCode || empCycle?.code || 'A',
-            cycleColor: emp.cycleColor || empCycle?.colorHex || '#1e3a8a',
-            reviewPeriodId: period.id,
-            reviewPeriodName: period.name,
-            isAppraisalMonthDue: isAppraisalQuarter,
-            kraSnapshot: kraSnapshot,
-            status: 'ASSIGNED',
-            isSelfSubmitted: false,
-            finalScore: 0,
-            selfScore: 0,
-            strengths: '',
-            improvements: '',
-            managerOverallComments: '',
-            isClosed: false,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-          };
-
-          await reviewsCol.insertOne(newReview);
-
-          // Notify employee of self-assessment due
+      } else if (period.status === 'ACTIVE') {
+        // ONLY generate a new review if employee is eligible under system rules (minimum tenure, manager, status)
+        const eligibility = await checkEmployeeReviewEligibility(emp, period);
+        if (eligibility.eligible) {
           try {
-            const notifCol = getDbCollection('notifications');
-            await notifCol.insertOne({
-              id: `notif_self_assess_${newReview.id}`,
-              userId: emp.id,
-              userRole: 'EMPLOYEE',
-              type: 'REVIEW_ASSIGNED',
-              title: `Self-Assessment Due: ${period.name}`,
-              message: `Your quarterly performance self-assessment for ${period.name} is open. Please complete your KRA self-ratings and submit your evaluation.`,
-              isRead: false,
-              priority: 'HIGH',
-              metadata: { reviewId: newReview.id, periodId: period.id, subTab: 'reviews', openSelfAssess: true },
-              createdAt: new Date().toISOString(),
+            await createQuarterlyReview({
+              emp,
+              period,
+              source: 'AUTOMATIC',
             });
-          } catch (_notifErr) {
-            // quiet fallback
+          } catch (_createErr) {
+            // quiet fallback if already created concurrently
           }
         }
       }
