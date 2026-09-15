@@ -1397,10 +1397,10 @@ mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Respo
       console.warn('[Notifications] Error auto-syncing completed review workflow notifications:', syncErr);
     }
 
-    const isExplicitGlobalView = req.query.scope === 'all' && currentUser.role === 'SUPER_ADMIN';
+    const isSuperAdmin = currentUser.role === 'SUPER_ADMIN';
 
     let filter: any = {};
-    if (!isExplicitGlobalView) {
+    if (!isSuperAdmin) {
       const orClauses: any[] = [
         { userId: currentUser.id },
         { userId: 'ALL' },
@@ -1424,7 +1424,22 @@ mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Respo
 
     let filtered: any[] = notifications;
 
-    if (!isExplicitGlobalView) {
+    if (isSuperAdmin) {
+      filtered = notifications.filter((n) => {
+        // Exclude individual employee private notifications unless specifically for admin
+        if (n.userRole === 'EMPLOYEE' && n.userId !== currentUser.id) return false;
+        if (n.type === 'HR_COMPLETED') return false;
+        if (n.title && n.title.toLowerCase().includes('self-assessment due')) return false;
+        if (n.message && n.message.toLowerCase().includes('your quarterly performance')) return false;
+        if (n.type === 'LETTER_RELEASED' && n.userId !== currentUser.id) return false;
+
+        // Admin has oversight over administrative, management, HR, HOD, and global alerts
+        if (['SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGEMENT', 'HOD', 'ALL'].includes(n.userRole) || !n.userRole) {
+          return true;
+        }
+        return false;
+      });
+    } else {
       filtered = notifications.filter((n) => {
         // Direct target match by user ID or employee ID (private notification)
         const isDirectUserMatch = n.userId === currentUser.id;
@@ -1433,7 +1448,7 @@ mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Respo
           return true;
         }
 
-        // Direct target match by userRole (e.g. SUPER_ADMIN, HR, MANAGEMENT)
+        // Direct target match by userRole (e.g. HR, MANAGEMENT)
         if (n.userRole === currentUser.role) {
           // If a specific userId is designated and it does not match this user, don't show it
           if (n.userId && n.userId !== 'ALL' && n.userId !== currentUser.id && (!currentUser.employeeId || n.userId !== currentUser.employeeId)) {
