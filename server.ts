@@ -38,24 +38,73 @@ async function startServer() {
   const PORT = Number(process.env.PORT) || 3000;
 
   // Middleware
-  const allowedOrigins = process.env.ALLOWED_ORIGINS
-    ? process.env.ALLOWED_ORIGINS.split(',').map((s) => s.trim())
-    : ['http://localhost:5173', 'http://localhost:3000', 'http://127.0.0.1:5173', 'http://127.0.0.1:3000'];
+  const configuredOrigins = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((s) => s.trim().replace(/\/$/, ''))
+    .filter(Boolean);
+
+  const isOriginAllowed = (origin: string): boolean => {
+    // 1. Allow requests with no origin (e.g. mobile apps, curl, server-to-server)
+    if (!origin) return true;
+
+    const cleanOrigin = origin.replace(/\/$/, '');
+
+    // 2. Allow in non-production environments
+    if (process.env.NODE_ENV !== 'production') return true;
+
+    // 3. Allow if wildcard is set in ALLOWED_ORIGINS
+    if (configuredOrigins.includes('*')) return true;
+
+    // 4. Exact match against configured origins
+    if (configuredOrigins.includes(cleanOrigin)) return true;
+
+    // 5. Allow any Vercel deployment preview / production domain (*.vercel.app)
+    if (/^https:\/\/[a-zA-Z0-9._-]+\.vercel\.app$/i.test(cleanOrigin)) {
+      return true;
+    }
+
+    // 6. Allow any Render host domain (*.onrender.com)
+    if (/^https:\/\/[a-zA-Z0-9._-]+\.onrender\.com$/i.test(cleanOrigin)) {
+      return true;
+    }
+
+    // 7. Allow localhost / 127.0.0.1 on any port
+    if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(cleanOrigin)) {
+      return true;
+    }
+
+    // 8. Support wildcard subdomain patterns in configuredOrigins (e.g. *.mycompany.com)
+    for (const pattern of configuredOrigins) {
+      if (pattern.startsWith('*.')) {
+        const rootDomain = pattern.slice(2);
+        try {
+          const originHost = new URL(cleanOrigin).hostname;
+          if (originHost === rootDomain || originHost.endsWith('.' + rootDomain)) {
+            return true;
+          }
+        } catch {
+          // ignore malformed URL
+        }
+      }
+    }
+
+    return false;
+  };
 
   app.use(
     cors({
       origin: (origin, callback) => {
-        if (!origin) return callback(null, true);
-        if (
-          process.env.NODE_ENV !== 'production' ||
-          allowedOrigins.includes(origin) ||
-          allowedOrigins.includes('*')
-        ) {
+        if (isOriginAllowed(origin || '')) {
           return callback(null, true);
         }
-        return callback(new Error(`CORS policy does not allow access from origin: ${origin}`));
+        // Gracefully disallow origin without throwing an unhandled server error
+        return callback(null, false);
       },
       credentials: true,
+      methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept'],
+      exposedHeaders: ['Content-Range', 'X-Content-Range'],
+      optionsSuccessStatus: 204,
     })
   );
 
