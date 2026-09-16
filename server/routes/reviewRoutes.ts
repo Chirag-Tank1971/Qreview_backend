@@ -1450,6 +1450,34 @@ reviewRouter.post(
         employeeId: req.user!.employeeId,
       });
 
+      // Dispatch email notification to employee (Asynchronously)
+      (async () => {
+        try {
+          const recipient = await resolveRecipient(updated.employeeId);
+          if (recipient) {
+            const baseUrl = process.env.APP_URL || 'http://localhost:5173';
+            const { subject, html } = renderManagerReviewSubmittedEmail({
+              employeeName: updated.employeeName,
+              managerName: req.user!.name,
+              reviewPeriodName: updated.reviewPeriodName || 'Quarterly Review',
+              managerScore: updated.finalScore || 0,
+              reviewUrl: `${baseUrl}/#reviews`,
+            });
+            await sendNotificationEmail({
+              recipientId: updated.employeeId,
+              recipientEmail: recipient.email,
+              recipientName: recipient.name,
+              subject,
+              html,
+              templateType: 'MANAGER_REVIEW_SUBMITTED',
+              metadata: { reviewId: id, employeeId: updated.employeeId },
+            });
+          }
+        } catch (mailErr: any) {
+          console.warn('[ReviewRoutes] Failed to dispatch manager review email:', mailErr.message);
+        }
+      })();
+
       res.json(updated);
     } catch (error: any) {
       res.status(400).json({ error: error.message || 'Failed to submit review.' });

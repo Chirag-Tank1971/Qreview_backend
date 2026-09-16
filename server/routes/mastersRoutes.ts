@@ -12,6 +12,8 @@ import {
 } from '../auth.js';
 import { Employee, Department, Designation, Cycle, User, UserRole } from '../../src/types/index.js';
 import { syncEmployeeAppraisalsAndReviews } from '../syncHelpers.js';
+import { sendNotificationEmail } from '../services/emailService.js';
+import { renderEmployeeWelcomeEmail } from '../services/emailTemplates.js';
 
 export const mastersRouter = express.Router();
 
@@ -534,9 +536,9 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       initialPassword,
     } = req.body;
 
-    if (!employeeCode || !name || !email || !departmentId || !designationId || !joiningDate || !cycleId) {
+    if (!employeeCode || !name || !email || !departmentId || !designationId || !joiningDate || !cycleId || !managerId || !hodId) {
       return res.status(400).json({
-        error: 'Required fields missing: employeeCode, name, email, departmentId, designationId, joiningDate, cycleId',
+        error: 'Required fields missing: employeeCode, name, email, departmentId, designationId, joiningDate, cycleId, managerId, hodId',
       });
     }
 
@@ -554,6 +556,36 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
     const deptCol = getDbCollection('departments');
     const desCol = getDbCollection('designations');
     const cyclesCol = getDbCollection('cycles');
+
+    // Validate Reporting Manager & HOD
+    const mgr = await empCol.findOne({ id: managerId });
+    if (!mgr) {
+      return res.status(400).json({ error: 'Selected Reporting Manager was not found in the employee directory.' });
+    }
+    const allDepts = await (await deptCol.find({})).toArray();
+    const deptHodIds = new Set(allDepts.map((d: any) => d.hodId).filter(Boolean));
+    if (deptHodIds.has(managerId) || mgr.systemRole === 'HOD') {
+      return res.status(400).json({
+        error: 'An HOD cannot be assigned as an L1 Reporting Manager. Please select a departmental reporting manager.',
+      });
+    }
+    if (mgr.departmentId !== departmentId) {
+      return res.status(400).json({
+        error: 'Reporting Manager must belong to the same department as the employee.',
+      });
+    }
+    const managerName = mgr.name;
+
+    const hod = await empCol.findOne({ id: hodId });
+    if (!hod) {
+      return res.status(400).json({ error: 'Selected Head of Department (HOD) was not found in the employee directory.' });
+    }
+    if (hod.departmentId !== departmentId) {
+      return res.status(400).json({
+        error: 'Head of Department (HOD) must belong to the same department as the employee.',
+      });
+    }
+    const hodName = hod.name;
 
     // Auto-generate sequential EMP-XXX if employeeCode not provided
     let finalCode = employeeCode ? employeeCode.trim().toUpperCase() : '';
@@ -593,18 +625,6 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
     const dept = await deptCol.findOne({ id: departmentId });
     const des = await desCol.findOne({ id: designationId });
     const cycle = await cyclesCol.findOne({ id: cycleId });
-
-    let managerName: string | undefined;
-    if (managerId) {
-      const mgr = await empCol.findOne({ id: managerId });
-      if (mgr) managerName = mgr.name;
-    }
-
-    let hodName: string | undefined;
-    if (hodId) {
-      const hod = await empCol.findOne({ id: hodId });
-      if (hod) hodName = hod.name;
-    }
 
     const exitDate = relievingDate || pastEmployeeDate || (status === 'INACTIVE' ? new Date().toISOString() : undefined);
 
@@ -707,6 +727,40 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
 
     // Automatically sync and initialize review periods and annual appraisal records
     await syncEmployeeAppraisalsAndReviews(newEmp);
+
+    // Dispatch Welcome Email with Login ID and One-Time Password (Asynchronously)
+    if (provisionedUserMeta?.temporaryPassword) {
+      (async () => {
+        try {
+          const baseUrl = process.env.APP_URL || 'http://localhost:5173';
+          const { subject, html } = renderEmployeeWelcomeEmail({
+            employeeName: newEmp.name,
+            employeeCode: newEmp.employeeCode,
+            email: newEmp.email,
+            temporaryPassword: provisionedUserMeta.temporaryPassword,
+            departmentName: newEmp.departmentName,
+            designationName: newEmp.designationName,
+            loginUrl: `${baseUrl}/#login`,
+          });
+
+          await sendNotificationEmail({
+            recipientId: newEmp.id,
+            recipientEmail: newEmp.email,
+            recipientName: newEmp.name,
+            subject,
+            html,
+            templateType: 'EMPLOYEE_WELCOME',
+            metadata: {
+              employeeId: newEmp.id,
+              employeeCode: newEmp.employeeCode,
+              mustChangePassword: true,
+            },
+          });
+        } catch (emailErr: any) {
+          console.warn('[MastersRoutes] Failed to dispatch welcome email to new employee:', emailErr.message);
+        }
+      })();
+    }
 
     res.status(201).json({
       ...newEmp,
@@ -845,21 +899,60 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
     }
 
     if (managerId !== undefined) {
-      updateData.managerId = managerId || undefined;
+      if (!managerId && status !== 'INACTIVE' && emp.status !== 'INACTIVE') {
+        return res.status(400).json({ error: 'Reporting Manager is required. Self-managed employees are not permitted.' });
+      }
       if (managerId) {
         const mgr = await empCol.findOne({ id: managerId });
-        updateData.managerName = mgr?.name;
+        if (!mgr) {
+          return res.status(400).json({ error: 'Selected Reporting Manager was not found in the employee directory.' });
+        }
+        const allDepts = await (await deptCol.find({})).toArray();
+        const deptHodIds = new Set(allDepts.map((d: any) => d.hodId).filter(Boolean));
+        if (deptHodIds.has(managerId) || mgr.systemRole === 'HOD') {
+          return res.status(400).json({
+            error: 'An HOD cannot be assigned as an L1 Reporting Manager. Please select a departmental reporting manager.',
+          });
+        }
+        const targetDeptId = departmentId || emp.departmentId;
+        if (mgr.departmentId !== targetDeptId) {
+          return res.status(400).json({
+            error: 'Reporting Manager must belong to the same department as the employee.',
+          });
+        }
+        updateData.managerId = managerId;
+        updateData.managerName = mgr.name;
+
+        // Cascade manager update to open quarterly reviews
+        await reviewsCol.updateMany(
+          { employeeId: id, isClosed: { $ne: true }, status: { $ne: 'CLOSED' } },
+          { $set: { managerId, managerName: mgr.name } }
+        );
       } else {
+        updateData.managerId = undefined;
         updateData.managerName = undefined;
       }
     }
 
     if (hodId !== undefined) {
-      updateData.hodId = hodId || undefined;
+      if (!hodId && status !== 'INACTIVE' && emp.status !== 'INACTIVE') {
+        return res.status(400).json({ error: 'Head of Department (HOD) is required.' });
+      }
       if (hodId) {
         const hod = await empCol.findOne({ id: hodId });
-        updateData.hodName = hod?.name;
+        if (!hod) {
+          return res.status(400).json({ error: 'Selected Head of Department (HOD) was not found in the employee directory.' });
+        }
+        const targetDeptId = departmentId || emp.departmentId;
+        if (hod.departmentId !== targetDeptId) {
+          return res.status(400).json({
+            error: 'Head of Department (HOD) must belong to the same department as the employee.',
+          });
+        }
+        updateData.hodId = hodId;
+        updateData.hodName = hod.name;
       } else {
+        updateData.hodId = undefined;
         updateData.hodName = undefined;
       }
     }

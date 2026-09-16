@@ -302,3 +302,46 @@ export function renderTestEmail(data: {
 
   return { subject, html };
 }
+
+/**
+ * 5. Employee Account Provisioned / Welcome Email
+ */
+export function renderEmployeeWelcomeEmail(data: {
+  employeeName: string;
+  employeeCode: string;
+  email: string;
+  temporaryPassword: string;
+  departmentName: string;
+  designationName: string;
+  loginUrl: string;
+}): { subject: string; html: string } {
+  const subject = `🎉 Welcome to Appraisal Management System – Your Portal Credentials`;
+  const html = renderBaseEmailLayout({
+    headerTitle: 'Welcome to the Team',
+    badge: 'Account Activated',
+    badgeColor: '#4f46e5', // Indigo
+    preheader: `Your account credentials for the Appraisal Management Portal.`,
+    contentHtml: `
+      <p>Dear <strong>${data.employeeName}</strong>,</p>
+      <p>Welcome to the organization! Your profile has been registered in the <strong>Appraisal Management System</strong>, and your account has been provisioned.</p>
+
+      <div class="info-card">
+        <div class="info-row"><span class="info-label">Employee Code:</span> <strong>${data.employeeCode}</strong></div>
+        <div class="info-row"><span class="info-label">Department:</span> ${data.departmentName}</div>
+        <div class="info-row"><span class="info-label">Designation:</span> ${data.designationName}</div>
+        <div class="info-row"><span class="info-label">Login Email:</span> <strong>${data.email}</strong></div>
+        <div class="info-row"><span class="info-label">One-Time Temporary Password:</span> <code style="background:#e0e7ff; color:#3730a3; padding:2px 8px; border-radius:4px; font-weight:700; font-size:14px;">${data.temporaryPassword}</code></div>
+      </div>
+
+      <div style="background-color: #fef3c7; border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 0 8px 8px 0; margin: 16px 0; font-size: 13px; color: #92400e;">
+        <strong>🔒 Security Notice:</strong> This is a temporary one-time password. You will be required to change your password immediately upon your first login before accessing the application.
+      </div>
+
+      <p>Click the button below to log in and set your new permanent password:</p>
+    `,
+    ctaText: 'Log In to Appraisal Portal',
+    ctaUrl: data.loginUrl,
+  });
+
+  return { subject, html };
+}
