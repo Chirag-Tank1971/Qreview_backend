@@ -275,40 +275,7 @@ export function renderAppraisalLetterReleasedEmail(data: {
 }
 
 /**
- * 4. Performance Improvement Plan (PIP) Alert
- */
-export function renderPipAlertEmail(data: {
-  employeeName: string;
-  pipTitle: string;
-  targetEndDate: string;
-  planUrl: string;
-}): { subject: string; html: string } {
-  const subject = `Performance Action Plan Initiated: ${data.pipTitle}`;
-  const html = renderBaseEmailLayout({
-    headerTitle: 'Performance Action Plan',
-    badge: 'Confidential HR Notice',
-    badgeColor: '#f43f5e', // Rose
-    preheader: `Performance improvement action plan initiated.`,
-    contentHtml: `
-      <p>Dear <strong>${data.employeeName}</strong>,</p>
-      <p>A structured developmental performance action plan (<strong>${data.pipTitle}</strong>) has been initiated to support your performance targets and career alignment.</p>
-
-      <div class="info-card" style="border-left-color: #f43f5e;">
-        <div class="info-row"><span class="info-label">Action Plan:</span> ${data.pipTitle}</div>
-        <div class="info-row"><span class="info-label">Target Review Date:</span> ${data.targetEndDate}</div>
-      </div>
-
-      <p>Please review the milestones and support guidelines in the portal and coordinate closely with your manager.</p>
-    `,
-    ctaText: 'Open Action Plan',
-    ctaUrl: data.planUrl,
-  });
-
-  return { subject, html };
-}
-
-/**
- * 5. System Test Email
+ * 4. System Test Email
  */
 export function renderTestEmail(data: {
   recipientName: string;

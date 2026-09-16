@@ -36,6 +36,23 @@ async function ensureAuditDataInitialized(): Promise<void> {
 
 function normalizeAuditLog(doc: any): AuditLogEntry {
   const action = doc.actionType || (doc.action ? String(doc.action).toUpperCase() : 'SYSTEM_ACTION');
+  
+  let description = `${action} on ${doc.module || 'record'}`;
+  if (typeof doc.description === 'string' && doc.description.trim() !== '') {
+    description = doc.description;
+  } else if (typeof doc.details === 'string' && doc.details.trim() !== '') {
+    description = doc.details;
+  } else if (doc.details && typeof doc.details === 'object') {
+    try {
+      const keys = Object.keys(doc.details);
+      if (keys.length > 0) {
+        description = `${action} on ${doc.module || 'record'} (${keys.map((k) => `${k}: ${doc.details[k]}`).join(', ')})`;
+      }
+    } catch {
+      description = `${action} on ${doc.module || 'record'}`;
+    }
+  }
+
   return {
     id: doc.id || (doc._id ? String(doc._id) : `aud_${Date.now()}`),
     timestamp: doc.timestamp || doc.createdAt || new Date().toISOString(),
@@ -47,14 +64,14 @@ function normalizeAuditLog(doc: any): AuditLogEntry {
     actorRole: doc.actorRole || doc.userRole || 'HR',
     actorEmail: doc.actorEmail,
     targetEmployeeId: doc.targetEmployeeId,
-    targetEmployeeName: doc.targetEmployeeName,
-    targetDepartment: doc.targetDepartment,
+    targetEmployeeName: typeof doc.targetEmployeeName === 'string' ? doc.targetEmployeeName : (doc.targetEmployeeName ? String(doc.targetEmployeeName) : undefined),
+    targetDepartment: typeof doc.targetDepartment === 'string' ? doc.targetDepartment : (doc.targetDepartment ? String(doc.targetDepartment) : undefined),
     cycleId: doc.cycleId,
     cycleName: doc.cycleName,
-    description: doc.description || doc.details || `${action} on ${doc.module || 'record'}`,
+    description,
     previousValue: doc.previousValue ?? doc.oldValue,
     newValue: doc.newValue ?? doc.newValue,
-    diffSummary: doc.diffSummary,
+    diffSummary: typeof doc.diffSummary === 'string' ? doc.diffSummary : (doc.diffSummary ? JSON.stringify(doc.diffSummary) : undefined),
     ipAddress: doc.ipAddress || '127.0.0.1',
     userAgent: doc.userAgent,
     isFlaggedCompliance: doc.isFlaggedCompliance || false,

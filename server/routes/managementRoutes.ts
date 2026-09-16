@@ -22,6 +22,7 @@ managementRouter.use(requireRoles('MANAGEMENT'));
 async function logManagementAudit(req: AuthenticatedRequest, action: string, details?: any) {
   try {
     const auditLogsCol = getDbCollection('auditLogs');
+    const periodText = details?.periodId ? ` for period ${details.periodId}` : '';
     await auditLogsCol.insertOne({
       id: `aud_mgmt_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       timestamp: new Date().toISOString(),
@@ -32,6 +33,7 @@ async function logManagementAudit(req: AuthenticatedRequest, action: string, det
       actorName: req.user?.name || 'Executive User',
       actorRole: req.user?.role || 'MANAGEMENT',
       actorEmail: req.user?.email,
+      description: `Executive viewed management dashboard${periodText}`,
       details: details || {},
     });
   } catch (err) {

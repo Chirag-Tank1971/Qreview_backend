@@ -13,8 +13,6 @@ import {
   Appraisal,
   Notification,
   AuditLog,
-  FeedbackEntry,
-  PipRecord,
   TalentRecord,
 } from '../src/types.js';
 
@@ -114,8 +112,6 @@ export {
   SEED_APPRAISALS,
   SEED_NOTIFICATIONS,
   SEED_AUDIT_LOGS,
-  SEED_FEEDBACK,
-  SEED_PIPS,
   SEED_TALENT_RECORDS,
 } from './seedAppraisalsData.js';
 

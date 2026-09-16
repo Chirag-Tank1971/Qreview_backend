@@ -470,59 +470,6 @@ export interface AuditLog {
 
 export type AuditLogEntry = AuditLog;
 
-export interface FeedbackEntry {
-  id: string;
-  employeeId?: string;
-  toEmployeeId?: string;
-  toEmployeeName?: string;
-  fromUserId: string;
-  fromUserName: string;
-  fromUserRole: UserRole;
-  fromDepartment?: string;
-  toDepartment?: string;
-  type?: string;
-  badgeCategory?: string;
-  linkedKraTitle?: string;
-  quarter?: string;
-  cycleId?: string;
-  likesCount?: number;
-  likedBy?: string[];
-  message: string;
-  category?: 'KUDOS' | 'GOAL_ALIGNMENT' | 'FEEDBACK' | 'COACHING';
-  isPublic: boolean;
-  createdAt: string;
-}
-
-export interface PipRecord {
-  id: string;
-  employeeId: string;
-  employeeCode?: string;
-  employeeName: string;
-  department?: string;
-  designation?: string;
-  startDate?: string;
-  targetEndDate?: string;
-  managerId: string;
-  managerName: string;
-  initiatedAt?: string;
-  durationDays?: number;
-  targetDate?: string;
-  status: 'ACTIVE' | 'SUCCESSFUL' | 'EXTENDED' | 'FAILED' | 'active';
-  overallProgress?: number;
-  cycleNumber?: number;
-  previousPipId?: string;
-  previousPipOutcome?: string;
-  signatures?: any;
-  coreGaps?: any;
-  milestones?: any;
-  checkins?: any;
-  finalOutcomeNotes?: any;
-  objectives?: Array<{ objective: string; status: 'MET' | 'IN_PROGRESS' | 'UNMET' }>;
-  notes?: string;
-  createdAt: string;
-  updatedAt?: string;
-}
-
 export interface TalentRecord {
   id: string;
   employeeId: string;
@@ -665,26 +612,6 @@ export interface BulkValidationRowResult {
   isValid: boolean;
 }
 
-export interface PipSignatureEntry {
-  role: string;
-  signedBy: string;
-  signedAt: string;
-  comments?: string;
-}
-
-export type PipStatus =
-  | 'ACTIVE'
-  | 'SUCCESSFUL'
-  | 'EXTENDED'
-  | 'FAILED'
-  | 'active'
-  | 'completed_successfully'
-  | 'extended'
-  | 'escalated_action'
-  | string;
-
-export type PipFinalOutcome = 'RETAINED' | 'SEPARATION' | 'ROLE_CHANGE' | 'EXTENDED' | any;
-
 export interface BulkValidationReport {
   datasetType?: string;
   totalRows: number;
@@ -735,47 +662,6 @@ export interface AiReviewSynthesisResult {
   recommendedRating?: string;
   talkingPoints?: string[];
   suggestedGoals?: string[];
-  [key: string]: any;
-}
-
-export interface AiBiasCheckRequest {
-  reviewText: string;
-  feedbackCategory?: string;
-  employeeName?: string;
-  ratingScore?: number;
-  [key: string]: any;
-}
-
-export interface AiBiasCheckResult {
-  hasPotentialBias?: boolean;
-  score?: number;
-  biasScore?: number;
-  overallTone?: string;
-  flaggedPhrases?: string[];
-  suggestions?: string[];
-  toneAnalysis?: string;
-  [key: string]: any;
-}
-
-export interface AiGrowthPlanRequest {
-  employeeId?: string;
-  employeeName?: string;
-  department?: string;
-  currentScore?: number;
-  aspirations?: string;
-  aspirationalRole?: string;
-  targetRole?: string;
-  designation?: string;
-  strengths: string[];
-  weaknesses: string[];
-  [key: string]: any;
-}
-
-export interface AiGrowthPlanResult {
-  skillsToAcquire?: string[];
-  learningResources?: Array<{ title: string; type: string; url?: string }>;
-  milestones: Array<{ title?: string; timeline?: string; month?: string; focusArea?: string; actionableTask?: string; [key: string]: any }>;
-  careerPathAdvice?: string;
   [key: string]: any;
 }
 

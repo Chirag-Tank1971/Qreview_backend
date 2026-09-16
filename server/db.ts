@@ -16,8 +16,6 @@ import {
   SEED_APPRAISALS,
   SEED_NOTIFICATIONS,
   SEED_AUDIT_LOGS,
-  SEED_FEEDBACK,
-  SEED_PIPS,
   SEED_TALENT_RECORDS,
 } from './seedData.js';
 import { SEED_COMPLIANCE_FLAGS } from './seedAuditData.js';
@@ -35,8 +33,6 @@ import {
   Appraisal,
   Notification,
   AuditLog,
-  FeedbackEntry,
-  PipRecord,
   TalentRecord,
   ComplianceFlag,
   EmailLog,
@@ -307,8 +303,6 @@ export const memoryDb = {
   appraisals: new InMemoryCollection<Appraisal>('appraisals', SEED_APPRAISALS),
   notifications: new InMemoryCollection<Notification>('notifications', SEED_NOTIFICATIONS),
   auditLogs: new InMemoryCollection<AuditLog>('audit_logs', SEED_AUDIT_LOGS),
-  feedback: new InMemoryCollection<FeedbackEntry>('feedback', SEED_FEEDBACK),
-  pips: new InMemoryCollection<PipRecord>('pips', SEED_PIPS),
   talentRecords: new InMemoryCollection<TalentRecord>('talent_records', SEED_TALENT_RECORDS),
   complianceFlags: new InMemoryCollection<ComplianceFlag>('compliance_flags', SEED_COMPLIANCE_FLAGS),
   emailLogs: new InMemoryCollection<EmailLog>('email_logs', []),
@@ -429,8 +423,6 @@ async function seedMongoCollectionsIfEmpty(db: Db): Promise<void> {
   await upsertCollection('appraisals', SEED_APPRAISALS);
   await upsertCollection('notifications', SEED_NOTIFICATIONS);
   await upsertCollection('auditLogs', SEED_AUDIT_LOGS);
-  await upsertCollection('feedback', SEED_FEEDBACK);
-  await upsertCollection('pips', SEED_PIPS);
   await upsertCollection('talentRecords', SEED_TALENT_RECORDS);
   await upsertCollection('complianceFlags', SEED_COMPLIANCE_FLAGS);
 

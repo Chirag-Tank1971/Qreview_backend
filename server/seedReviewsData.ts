@@ -312,7 +312,7 @@ export const SEED_EMPLOYEE_REVIEWS: EmployeeReview[] = [
   },
 
   // ==========================================
-  // JACK SALES REP (emp_com_4) - Underperformer / On PIP
+  // JACK SALES REP (emp_com_4) - Developing Performer
   // ==========================================
   {
     id: 'rev_2025_q3_jack',
@@ -372,7 +372,7 @@ export const SEED_EMPLOYEE_REVIEWS: EmployeeReview[] = [
       { id: 'snap_jk_q4_3', kraId: 'kra_sales_crm', kraName: 'CRM Pipeline Hygiene & Accuracy', targetSnapshot: '95% hygiene score', measurementCriteria: '1: <80% | 3: 95% | 5: 100%', weight: 20, achievement: 'Maintained 84% CRM completeness', rating: 3, comments: 'Requires manager intervention to keep pipeline current' },
     ],
     strengths: 'Positive team demeanor.',
-    improvements: 'Initiating structured Performance Improvement Plan (PIP) to support recovery.',
+    improvements: 'Targeted sales development plan to support quota recovery.',
     managerOverallComments: 'Requires structured milestone monitoring in Q1.',
     isClosed: true,
     completedAt: '2026-01-18T10:00:00.000Z',
@@ -404,7 +404,7 @@ export const SEED_EMPLOYEE_REVIEWS: EmployeeReview[] = [
       { id: 'snap_jk_q1_3', kraId: 'kra_sales_crm', kraName: 'CRM Pipeline Hygiene & Accuracy', targetSnapshot: '95% hygiene score', measurementCriteria: '1: <80% | 3: 95% | 5: 100%', weight: 20, achievement: 'Hygiene score improved to 88%', rating: 3, comments: 'Showing better diligence in CRM notes' },
     ],
     strengths: 'Responsiveness to manager coaching.',
-    improvements: 'Must achieve PIP milestones to retain role.',
+    improvements: 'Must achieve quarterly quota targets to meet role expectations.',
     isClosed: false,
     createdAt: '2026-01-01T09:00:00.000Z',
   },
@@ -635,7 +635,7 @@ export const SEED_EMPLOYEE_REVIEWS: EmployeeReview[] = [
     kraSnapshot: [
       { id: 'snap_ev_q3_1', kraId: 'kra_sales_quota', kraName: 'Department Sales Quota Target', targetSnapshot: '100% cumulative sales quota', measurementCriteria: '1: <80% | 3: 100% | 5: >115%', weight: 50, achievement: 'Team reached 102% of Q3 aggregate sales quota', rating: 4, comments: 'Balanced team revenue contribution' },
       { id: 'snap_ev_q3_2', kraId: 'kra_sales_acquisition', kraName: 'Enterprise Pipeline Expansion', targetSnapshot: '$2.5M qualified pipeline generated', measurementCriteria: '1: <$1.5M | 3: $2.5M | 5: >$3M', weight: 30, achievement: 'Generated $2.8M in enterprise opportunities', rating: 4.5, comments: 'Strong outbound strategy' },
-      { id: 'snap_ev_q3_3', kraId: 'kra_sales_crm', kraName: 'Rep Coaching & Retention', targetSnapshot: '100% bi-weekly deal coaching sessions', measurementCriteria: '1: <80% | 3: 95% | 5: 100%', weight: 20, achievement: 'All coaching sessions executed; active PIP coaching for Jack', rating: 4, comments: 'Good dedication to rep development' },
+      { id: 'snap_ev_q3_3', kraId: 'kra_sales_crm', kraName: 'Rep Coaching & Retention', targetSnapshot: '100% bi-weekly deal coaching sessions', measurementCriteria: '1: <80% | 3: 95% | 5: 100%', weight: 20, achievement: 'All coaching sessions executed; active 1-on-1 coaching for Jack', rating: 4, comments: 'Good dedication to rep development' },
     ],
     strengths: 'Sales motivation and strategic account intervention.',
     improvements: 'Improve forecasting accuracy for mid-tier accounts.',
@@ -699,7 +699,7 @@ export const SEED_EMPLOYEE_REVIEWS: EmployeeReview[] = [
     kraSnapshot: [
       { id: 'snap_ev_q1_1', kraId: 'kra_sales_quota', kraName: 'Department Sales Quota Target', targetSnapshot: '100% cumulative sales quota', measurementCriteria: '1: <80% | 3: 100% | 5: >115%', weight: 50, achievement: 'Finished Q1 at 104% quota', rating: 4.5, comments: 'Well-managed sales cycle' },
       { id: 'snap_ev_q1_2', kraId: 'kra_sales_acquisition', kraName: 'Enterprise Pipeline Expansion', targetSnapshot: '$2.5M qualified pipeline generated', measurementCriteria: '1: <$1.5M | 3: $2.5M | 5: >$3M', weight: 30, achievement: 'Added $2.6M pipeline', rating: 4, comments: 'Consistent enterprise interest' },
-      { id: 'snap_ev_q1_3', kraId: 'kra_sales_crm', kraName: 'Rep Coaching & Retention', targetSnapshot: '100% bi-weekly deal coaching sessions', measurementCriteria: '1: <80% | 3: 95% | 5: 100%', weight: 20, achievement: 'Diligent PIP check-ins logged for Jack', rating: 4, comments: 'Very professional handling of performance management' },
+      { id: 'snap_ev_q1_3', kraId: 'kra_sales_crm', kraName: 'Rep Coaching & Retention', targetSnapshot: '100% bi-weekly deal coaching sessions', measurementCriteria: '1: <80% | 3: 95% | 5: 100%', weight: 20, achievement: 'Diligent weekly coaching check-ins logged for Jack', rating: 4, comments: 'Very professional handling of performance management' },
     ],
     strengths: 'Accountable management, transparent forecasting.',
     improvements: 'Lead national sales summit presentation.',

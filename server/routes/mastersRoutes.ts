@@ -1053,7 +1053,6 @@ mastersRouter.delete('/employees/:id', requireRoles('SUPER_ADMIN'), async (req: 
     const reviewsCol = getDbCollection('employeeReviews');
     const appraisalsCol = getDbCollection('appraisals');
     const feedbackCol = getDbCollection('feedback');
-    const pipsCol = getDbCollection('pips');
     const notifCol = getDbCollection('notifications');
 
     const emp = await empCol.findOne({ id });
@@ -1067,11 +1066,10 @@ mastersRouter.delete('/employees/:id', requireRoles('SUPER_ADMIN'), async (req: 
     // 2. Delete all annual appraisals
     await appraisalsCol.deleteMany({ employeeId: id });
 
-    // 3. Delete all 360 feedback and PIPs
+    // 3. Delete all 360 feedback
     await feedbackCol.deleteMany({
       $or: [{ employeeId: id }, { requestedBy: id }, { reviewerId: id }],
     });
-    await pipsCol.deleteMany({ employeeId: id });
 
     // 4. Delete notifications for this employee / user
     const orNotif: any[] = [{ employeeId: id }];
