@@ -13,7 +13,7 @@ import {
   AuthenticatedRequest,
 } from '../auth.js';
 import { validateBody, LoginSchema, ChangePasswordSchema, RefreshTokenSchema } from '../validation.js';
-import { User, Employee, Role, UserRole } from '../../src/types.js';
+import { User, Employee, Role, UserRole } from '../../src/types/index.js';
 
 export const authRouter = express.Router();
 

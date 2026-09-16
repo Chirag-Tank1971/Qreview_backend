@@ -2,7 +2,7 @@ import express, { Response } from 'express';
 import { getDbCollection } from '../db.js';
 import { authenticateToken, requireRoles, recordAuditLog, AuthenticatedRequest } from '../auth.js';
 import { validateBody, CreateKraSchema, UpdateKraSchema, KraTemplateSchema } from '../validation.js';
-import { Kra, KraTemplate, KraItem } from '../../src/types.js';
+import { Kra, KraTemplate, KraItem } from '../../src/types/index.js';
 
 export const kraRouter = express.Router();
 

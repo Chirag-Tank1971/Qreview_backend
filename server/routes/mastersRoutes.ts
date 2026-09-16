@@ -10,7 +10,7 @@ import {
   invalidateAuthCache,
   revokeUserSessions,
 } from '../auth.js';
-import { Employee, Department, Designation, Cycle, User, UserRole } from '../../src/types.js';
+import { Employee, Department, Designation, Cycle, User, UserRole } from '../../src/types/index.js';
 import { syncEmployeeAppraisalsAndReviews } from '../syncHelpers.js';
 
 export const mastersRouter = express.Router();

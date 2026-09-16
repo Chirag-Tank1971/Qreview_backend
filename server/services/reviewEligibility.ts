@@ -8,7 +8,7 @@ import {
   ReviewKraSnapshot,
   ReviewAction,
   UserRole,
-} from '../../src/types.js';
+} from '../../src/types/index.js';
 import { getDbCollection } from '../db.js';
 import { recordAuditLog } from '../auth.js';
 

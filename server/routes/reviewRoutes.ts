@@ -20,7 +20,7 @@ import {
   Cycle,
   Department,
   ReviewSummaryStats,
-} from '../../src/types.js';
+} from '../../src/types/index.js';
 import { sendNotificationEmail, resolveRecipient } from '../services/emailService.js';
 import { renderSelfAssessmentSubmittedEmail, renderManagerReviewSubmittedEmail } from '../services/emailTemplates.js';
 import {
@@ -1087,23 +1087,24 @@ reviewRouter.put(
         return res.status(404).json({ error: 'Review not found.' });
       }
 
-      if (existing.isClosed || existing.status === 'CLOSED') {
+      if ((existing.isClosed || existing.status === 'CLOSED') && req.user?.role !== 'SUPER_ADMIN') {
         return res.status(400).json({ error: 'Cannot modify a closed review.' });
       }
 
       const allowedTransitions: Record<string, string[]> = {
-        DRAFT: ['ASSIGNED', 'MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED'],
-        ASSIGNED: ['MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED'],
-        MANAGER_PENDING: ['HR_PENDING', 'MANAGER_COMPLETED', 'RETURNED'],
-        MANAGER_COMPLETED: ['HR_PENDING', 'RETURNED'],
-        HR_PENDING: ['HR_COMPLETED', 'CLOSED', 'RETURNED'],
-        HR_COMPLETED: ['CLOSED', 'RETURNED'],
-        RETURNED: ['MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED'],
-        CLOSED: [],
+        DRAFT: ['ASSIGNED', 'MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED', 'HR_COMPLETED', 'CLOSED'],
+        ASSIGNED: ['MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED', 'HR_COMPLETED', 'CLOSED'],
+        MANAGER_PENDING: ['HR_PENDING', 'MANAGER_COMPLETED', 'HR_COMPLETED', 'CLOSED', 'RETURNED'],
+        MANAGER_COMPLETED: ['HR_PENDING', 'HR_COMPLETED', 'CLOSED', 'RETURNED'],
+        HR_PENDING: ['HR_COMPLETED', 'CLOSED', 'RETURNED', 'MANAGER_PENDING'],
+        HR_COMPLETED: ['CLOSED', 'RETURNED', 'HR_PENDING', 'MANAGER_PENDING'],
+        RETURNED: ['MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED', 'HR_COMPLETED', 'CLOSED'],
+        CLOSED: ['HR_COMPLETED', 'HR_PENDING', 'MANAGER_PENDING'],
       };
 
+      const isSuperAdmin = req.user?.role === 'SUPER_ADMIN';
       const validNextStatuses = allowedTransitions[existing.status] || [];
-      if (status !== existing.status && !validNextStatuses.includes(status)) {
+      if (!isSuperAdmin && status !== existing.status && !validNextStatuses.includes(status)) {
         return res.status(400).json({
           error: `Invalid status transition from '${existing.status}' to '${status}'.`,
         });
@@ -1129,8 +1130,8 @@ reviewRouter.put(
       const updatedReview: EmployeeReview = {
         ...existing,
         status: status as ReviewStatus,
-        isClosed: isClosing ? true : existing.isClosed,
-        completedAt: isClosing ? new Date().toISOString() : existing.completedAt,
+        isClosed: isClosing,
+        completedAt: isClosing ? (existing.completedAt || new Date().toISOString()) : undefined,
         actionHistory: [...(existing.actionHistory || []), action],
         updatedAt: new Date().toISOString(),
       };

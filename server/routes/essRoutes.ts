@@ -7,7 +7,7 @@ import {
   Appraisal,
   KraTemplate,
   ReviewPeriod,
-} from '../../src/types.js';
+} from '../../src/types/index.js';
 
 export const essRouter = express.Router();
 

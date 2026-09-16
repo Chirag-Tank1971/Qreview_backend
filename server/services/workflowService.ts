@@ -11,7 +11,7 @@ import {
   KraTemplate,
   Cycle,
   Appraisal,
-} from '../../src/types.js';
+} from '../../src/types/index.js';
 
 export interface ReviewGenerationReport {
   periodId: string;

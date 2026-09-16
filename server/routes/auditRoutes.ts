@@ -9,7 +9,7 @@ import {
   AuditFilterParams,
   AuditSummaryMetrics,
   ReviewPeriod,
-} from '../../src/types.js';
+} from '../../src/types/index.js';
 
 export const auditRouter = Router();
 

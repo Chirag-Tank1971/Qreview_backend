@@ -22,7 +22,7 @@ import {
   Notification,
   User,
   Designation,
-} from '../../src/types.js';
+} from '../../src/types/index.js';
 import { sendNotificationEmail, resolveRecipient } from '../services/emailService.js';
 import { renderAppraisalLetterReleasedEmail } from '../services/emailTemplates.js';
 

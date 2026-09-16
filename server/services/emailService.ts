@@ -1,6 +1,6 @@
 import nodemailer, { Transporter } from 'nodemailer';
 import { getDbCollection } from '../db.js';
-import { EmailLog } from '../../src/types.js';
+import { EmailLog } from '../../src/types/index.js';
 
 let transporter: Transporter | null = null;
 let isEthereal = false;

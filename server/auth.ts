@@ -2,7 +2,7 @@ import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { Request, Response, NextFunction } from 'express';
 import { getDbCollection } from './db.js';
-import { User, UserRole, Employee, Role, EmployeeReview, ReviewStatus, Permission } from '../src/types.js';
+import { User, UserRole, Employee, Role, EmployeeReview, ReviewStatus, Permission } from '../src/types/index.js';
 
 const DEFAULT_SECRET = 'quarterly_review_appraisal_jwt_secret_key_2026_production_entropy_secure';
 if (process.env.NODE_ENV === 'production') {

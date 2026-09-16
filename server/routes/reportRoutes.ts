@@ -9,7 +9,7 @@ import {
   ReviewPeriod,
   Appraisal,
   AuditLog,
-} from '../../src/types.js';
+} from '../../src/types/index.js';
 
 export const reportRouter = Router();
 reportRouter.use('/reports', authenticateToken);

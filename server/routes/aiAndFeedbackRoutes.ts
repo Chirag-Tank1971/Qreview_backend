@@ -8,7 +8,7 @@ import {
   AiReviewSynthesisResult,
   AiTalentInsightsRequest,
   AiTalentInsightsResult,
-} from '../../src/types.js';
+} from '../../src/types/index.js';
 
 export const aiAndFeedbackRouter = Router();
 aiAndFeedbackRouter.use(authenticateToken);

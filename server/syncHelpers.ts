@@ -8,7 +8,7 @@ import {
   Cycle,
   ReviewKraSnapshot,
   AppraisalQuarterRecord,
-} from '../src/types.js';
+} from '../src/types/index.js';
 import {
   checkEmployeeReviewEligibility,
   createQuarterlyReview,

@@ -8,7 +8,7 @@ import {
   Employee,
   Department,
   Cycle,
-} from '../../src/types.js';
+} from '../../src/types/index.js';
 
 export const dashboardRouter = express.Router();
 dashboardRouter.use(authenticateToken);

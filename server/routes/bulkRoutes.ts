@@ -9,7 +9,7 @@ import {
   BulkValidationRowResult,
   BulkImportResult,
   UserRole,
-} from '../../src/types.js';
+} from '../../src/types/index.js';
 
 export const bulkRouter = Router();
 

@@ -22,7 +22,7 @@ import {
   EmailLog,
   DbStatus,
   SystemConfig,
-} from '../src/types.js';
+} from '../src/types/index.js';
 
 let mongoClient: MongoClient | null = null;
 let mongoDb: Db | null = null;

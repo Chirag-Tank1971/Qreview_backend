@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import { getDbCollection } from '../db.js';
-import { ReviewPeriod, EmployeeReview, Employee, Cycle } from '../../src/types.js';
+import { ReviewPeriod, EmployeeReview, Employee, Cycle } from '../../src/types/index.js';
 
 /**
  * Production Background Scheduler using node-cron
