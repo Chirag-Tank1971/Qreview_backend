@@ -1,4 +1,11 @@
 import 'dotenv/config';
+import dns from 'node:dns';
+
+// Force Node.js to prefer IPv4 DNS resolution globally (Render containers do not route IPv6)
+if (typeof dns.setDefaultResultOrder === 'function') {
+  dns.setDefaultResultOrder('ipv4first');
+}
+
 import express from 'express';
 import cors from 'cors';
 import path from 'path';

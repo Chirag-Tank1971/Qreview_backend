@@ -2,6 +2,14 @@ import nodemailer, { Transporter } from 'nodemailer';
 import { getDbCollection } from '../db.js';
 import { EmailLog } from '../../src/types/index.js';
 
+import dns from 'node:dns';
+
+// Cloud platforms like Render often lack outbound IPv6 routing.
+// Force Node.js to prefer IPv4 when resolving addresses (e.g. smtp.gmail.com).
+if (typeof dns.setDefaultResultOrder === 'function') {
+  dns.setDefaultResultOrder('ipv4first');
+}
+
 let transporter: Transporter | null = null;
 let isEthereal = false;
 let transporterVerified = false;
@@ -12,6 +20,7 @@ let transporterVerified = false;
  * Otherwise, creates an Ethereal virtual test account for development.
  *
  * Production fix notes:
+ * - IPv4 is forced (dns.setDefaultResultOrder + family: 4) to avoid ENETUNREACH on Render/Docker.
  * - rejectUnauthorized is always FALSE for Gmail (port 465/587) — Gmail's cert is
  *   trusted globally; the flag only causes issues inside containers/VMs with
  *   missing system CA bundles and provides no real security benefit for Gmail.
@@ -37,11 +46,12 @@ export async function getTransporter(): Promise<Transporter> {
     const isSecurePort = port === 465;
     const secureSetting = process.env.SMTP_SECURE === 'true' || isSecurePort;
 
-    transporter = nodemailer.createTransport({
+    const transportOptions: any = {
       host,
       port,
       secure: secureSetting,
       auth: { user, pass },
+      family: 4, // Force IPv4 to prevent ENETUNREACH on Render
       tls: {
         // NEVER reject authorized for Gmail or any well-known provider.
         // rejectUnauthorized: true causes failures in containers/VMs without full CA bundles.
@@ -57,7 +67,9 @@ export async function getTransporter(): Promise<Transporter> {
       socketTimeout: 30000,
       greetingTimeout: 15000,
       connectionTimeout: 15000,
-    });
+    };
+
+    transporter = nodemailer.createTransport(transportOptions);
     isEthereal = false;
 
     // Verify the connection on first initialization to catch config errors early
