@@ -2,23 +2,7 @@ import 'dotenv/config';
 import { MongoClient, Db } from 'mongodb';
 import fs from 'fs';
 import path from 'path';
-import {
-  SEED_ROLES,
-  SEED_DEPARTMENTS,
-  SEED_DESIGNATIONS,
-  SEED_CYCLES,
-  SEED_KRAS,
-  SEED_KRA_TEMPLATES,
-  SEED_EMPLOYEES,
-  SEED_USERS,
-  SEED_REVIEW_PERIODS,
-  SEED_EMPLOYEE_REVIEWS,
-  SEED_APPRAISALS,
-  SEED_NOTIFICATIONS,
-  SEED_AUDIT_LOGS,
-  SEED_TALENT_RECORDS,
-} from './seedData.js';
-import { SEED_COMPLIANCE_FLAGS } from './seedAuditData.js';
+
 import {
   User,
   Role,
@@ -290,21 +274,21 @@ class InMemoryCollection<T extends { id?: string; _id?: any }> {
 
 // In-Memory Collections Table
 export const memoryDb = {
-  users: new InMemoryCollection<User & { passwordHash: string }>('users', SEED_USERS),
-  roles: new InMemoryCollection<Role>('roles', SEED_ROLES),
-  departments: new InMemoryCollection<Department>('departments', SEED_DEPARTMENTS),
-  designations: new InMemoryCollection<Designation>('designations', SEED_DESIGNATIONS),
-  cycles: new InMemoryCollection<Cycle>('cycles', SEED_CYCLES),
-  kras: new InMemoryCollection<Kra>('kras', SEED_KRAS),
-  kraTemplates: new InMemoryCollection<KraTemplate>('kra_templates', SEED_KRA_TEMPLATES),
-  employees: new InMemoryCollection<Employee>('employees', SEED_EMPLOYEES),
-  reviewPeriods: new InMemoryCollection<ReviewPeriod>('review_periods', SEED_REVIEW_PERIODS),
-  employeeReviews: new InMemoryCollection<EmployeeReview>('employee_reviews', SEED_EMPLOYEE_REVIEWS),
-  appraisals: new InMemoryCollection<Appraisal>('appraisals', SEED_APPRAISALS),
-  notifications: new InMemoryCollection<Notification>('notifications', SEED_NOTIFICATIONS),
-  auditLogs: new InMemoryCollection<AuditLog>('audit_logs', SEED_AUDIT_LOGS),
-  talentRecords: new InMemoryCollection<TalentRecord>('talent_records', SEED_TALENT_RECORDS),
-  complianceFlags: new InMemoryCollection<ComplianceFlag>('compliance_flags', SEED_COMPLIANCE_FLAGS),
+  users: new InMemoryCollection<User & { passwordHash: string }>('users', []),
+  roles: new InMemoryCollection<Role>('roles', []),
+  departments: new InMemoryCollection<Department>('departments', []),
+  designations: new InMemoryCollection<Designation>('designations', []),
+  cycles: new InMemoryCollection<Cycle>('cycles', []),
+  kras: new InMemoryCollection<Kra>('kras', []),
+  kraTemplates: new InMemoryCollection<KraTemplate>('kra_templates', []),
+  employees: new InMemoryCollection<Employee>('employees', []),
+  reviewPeriods: new InMemoryCollection<ReviewPeriod>('review_periods', []),
+  employeeReviews: new InMemoryCollection<EmployeeReview>('employee_reviews', []),
+  appraisals: new InMemoryCollection<Appraisal>('appraisals', []),
+  notifications: new InMemoryCollection<Notification>('notifications', []),
+  auditLogs: new InMemoryCollection<AuditLog>('audit_logs', []),
+  talentRecords: new InMemoryCollection<TalentRecord>('talent_records', []),
+  complianceFlags: new InMemoryCollection<ComplianceFlag>('compliance_flags', []),
   emailLogs: new InMemoryCollection<EmailLog>('email_logs', []),
   systemConfig: new InMemoryCollection<SystemConfig>('system_config', [
     { id: 'default', hodApprovalEnabled: false, selfAssessmentEnabled: false, updatedAt: new Date().toISOString() },
@@ -336,7 +320,7 @@ export async function initDatabase(): Promise<void> {
       
       dbMode = 'MONGODB';
       console.log(`[Database] Connected to MongoDB database '${mongoDb.databaseName}' successfully`);
-      await seedMongoCollectionsIfEmpty(mongoDb);
+      await ensureMongoIndexes(mongoDb);
       return;
     } catch (err: any) {
       console.warn(`[Database] MongoDB connection attempt failed: ${err.message}. Running in Persistent Embedded Mode.`);
@@ -376,56 +360,8 @@ export function getDbCollection<T extends { id?: string; _id?: any }>(collection
   return memoryDb[collectionName];
 }
 
-async function seedMongoCollectionsIfEmpty(db: Db): Promise<void> {
-  console.log('[Database] Checking and syncing MongoDB collections with latest seed schema...');
-  
-  const upsertCollection = async (collectionKey: keyof typeof memoryDb, seedData: any[]) => {
-    const col = getDbCollection(collectionKey);
-    const count = await col.countDocuments();
-    if (count === 0 && seedData.length > 0) {
-      const ops = seedData
-        .filter((doc) => doc && doc.id)
-        .map((doc) => ({
-          updateOne: {
-            filter: { id: doc.id },
-            update: { $set: doc },
-            upsert: true,
-          },
-        }));
-      if (ops.length > 0) {
-        await col.bulkWrite(ops, { ordered: false });
-      }
-    }
-  };
-
-  await upsertCollection('users', SEED_USERS);
-  await upsertCollection('roles', SEED_ROLES);
-  await upsertCollection('departments', SEED_DEPARTMENTS);
-  await upsertCollection('designations', SEED_DESIGNATIONS);
-  await upsertCollection('cycles', SEED_CYCLES);
-  await upsertCollection('kras', SEED_KRAS);
-  await upsertCollection('kraTemplates', SEED_KRA_TEMPLATES);
-  await upsertCollection('employees', SEED_EMPLOYEES);
-
-  try {
-    const periodCol = getDbCollection('reviewPeriods');
-    const periodCount = await periodCol.countDocuments();
-    if (periodCount === 0) {
-      for (const p of SEED_REVIEW_PERIODS) {
-        await periodCol.updateOne({ id: p.id }, { $set: p }, { upsert: true });
-      }
-    }
-  } catch (_e) {
-    await upsertCollection('reviewPeriods', SEED_REVIEW_PERIODS);
-  }
-
-  await upsertCollection('employeeReviews', SEED_EMPLOYEE_REVIEWS);
-  await upsertCollection('appraisals', SEED_APPRAISALS);
-  await upsertCollection('notifications', SEED_NOTIFICATIONS);
-  await upsertCollection('auditLogs', SEED_AUDIT_LOGS);
-  await upsertCollection('talentRecords', SEED_TALENT_RECORDS);
-  await upsertCollection('complianceFlags', SEED_COMPLIANCE_FLAGS);
-
+async function ensureMongoIndexes(db: Db): Promise<void> {
+  console.log('[Database] Ensuring MongoDB collections and indexes are ready...');
   try {
     const revCol = getDbCollection('employeeReviews');
     await revCol.createIndex({ employeeId: 1, reviewPeriodId: 1 }, { unique: true });
@@ -456,7 +392,7 @@ async function seedMongoCollectionsIfEmpty(db: Db): Promise<void> {
   } catch (err) {
     // Indexes might already exist
   }
-  console.log('[Database] MongoDB collections ready and fully synced.');
+  console.log('[Database] MongoDB collections ready and indexed.');
 }
 
 export async function getDatabaseStatus(): Promise<DbStatus> {

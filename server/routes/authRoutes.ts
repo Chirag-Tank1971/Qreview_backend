@@ -13,7 +13,6 @@ import {
   AuthenticatedRequest,
 } from '../auth.js';
 import { validateBody, LoginSchema, ChangePasswordSchema, RefreshTokenSchema } from '../validation.js';
-import { SEED_USERS } from '../seedData.js';
 import { User, Employee, Role, UserRole } from '../../src/types.js';
 
 export const authRouter = express.Router();
@@ -62,10 +61,6 @@ authRouter.post('/login', validateBody(LoginSchema), async (req: Request, res: R
 
     const usersCol = getDbCollection('users');
     let user = await usersCol.findOne({ email: email.toLowerCase().trim() });
-
-    if (!user) {
-      user = SEED_USERS.find((u) => u.email.toLowerCase() === email.toLowerCase().trim()) || null;
-    }
 
     // If user record not found in users collection, check employees collection
     if (!user) {
@@ -280,7 +275,7 @@ authRouter.post('/switch-role', async (req: Request, res: Response) => {
     }
 
     if (allUsers.length === 0) {
-      allUsers = SEED_USERS;
+      allUsers = [];
     }
 
     // Standardize role aliases (e.g. 'ADMIN', 'super_admin', 'EMPLOYEE', 'HR Manager', 'Hiring Manager')
@@ -360,8 +355,7 @@ authRouter.post('/switch-role', async (req: Request, res: Response) => {
     if (!targetUser && targetRole === 'HR') {
       targetUser =
         allUsers.find((u: any) => u.role === 'HR') ||
-        allUsers.find((u: any) => u.email === 'frank.mgr@company.com') ||
-        SEED_USERS.find((u) => u.role === 'HR');
+        allUsers.find((u: any) => u.email === 'frank.mgr@company.com');
     }
 
     // 2. If not matched by userId, match by normalized target role
@@ -376,18 +370,11 @@ authRouter.post('/switch-role', async (req: Request, res: Response) => {
       );
     }
 
-    // 4. Fallback in seed users if dynamic collection didn't have it
-    if (!targetUser && targetRole) {
-      targetUser = SEED_USERS.find((u) => u.role === targetRole);
-    }
-
-    // 5. Final fallback to Super Admin or first available user
+    // 4. Final fallback to Super Admin or first available user
     if (!targetUser) {
       targetUser =
         allUsers.find((u: any) => u.role === 'SUPER_ADMIN') ||
-        SEED_USERS.find((u) => u.role === 'SUPER_ADMIN') ||
-        allUsers[0] ||
-        SEED_USERS[0];
+        allUsers[0];
     }
 
     if (!targetUser) {

@@ -1,7 +1,6 @@
 import { Router, Response } from 'express';
 import { getDbCollection } from '../db.js';
 import { AuthenticatedRequest, authenticateToken, requireRoles } from '../auth.js';
-import { SEED_PHASE8_AUDIT_LOGS, SEED_COMPLIANCE_FLAGS } from '../seedAuditData.js';
 import {
   AuditLogEntry,
   AuditTimelineEvent,
@@ -20,18 +19,7 @@ auditRouter.use(requireRoles('SUPER_ADMIN', 'HR'));
 
 // Database-backed collections for persistent compliance and audit trails
 async function ensureAuditDataInitialized(): Promise<void> {
-  const auditLogsCol = getDbCollection('auditLogs');
-  const complianceFlagsCol = getDbCollection('complianceFlags');
-
-  const auditCount = await auditLogsCol.countDocuments({});
-  if (auditCount === 0) {
-    await auditLogsCol.insertMany(SEED_PHASE8_AUDIT_LOGS as any[]);
-  }
-
-  const flagsCount = await complianceFlagsCol.countDocuments({});
-  if (flagsCount === 0) {
-    await complianceFlagsCol.insertMany(SEED_COMPLIANCE_FLAGS as any[]);
-  }
+  // Queries existing MongoDB database records directly - no mock seed insertion
 }
 
 function normalizeAuditLog(doc: any): AuditLogEntry {

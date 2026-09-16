@@ -165,15 +165,6 @@ export async function verifyRefreshToken(refreshToken: string): Promise<{ user: 
       user = await usersCol.findOne({ email: String(decoded.email).toLowerCase().trim() });
     }
 
-    if (!user) {
-      const { SEED_USERS } = await import('./seedData.js');
-      user = SEED_USERS.find(
-        (u) =>
-          u.id === decoded.id ||
-          (decoded.email && u.email.toLowerCase() === String(decoded.email).toLowerCase().trim())
-      ) || null;
-    }
-
     if (!user || user.active === false) {
       return null;
     }
@@ -212,14 +203,6 @@ export async function verifyTokenString(token: string): Promise<User | null> {
     let user = await usersCol.findOne({ id: decoded.id });
     if (!user && decoded.email) {
       user = await usersCol.findOne({ email: String(decoded.email).toLowerCase().trim() });
-    }
-    if (!user) {
-      const { SEED_USERS } = await import('./seedData.js');
-      user = SEED_USERS.find(
-        (u) =>
-          u.id === decoded.id ||
-          (decoded.email && u.email.toLowerCase() === String(decoded.email).toLowerCase().trim())
-      ) || null;
     }
     if (!user && (decoded.employeeId || decoded.id)) {
       const employeesCol = getDbCollection('employees');
