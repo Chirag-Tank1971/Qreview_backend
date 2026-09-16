@@ -1,6 +1,6 @@
 import { Router, Response } from 'express';
 import { AuthenticatedRequest, authenticateToken, requireRoles } from '../auth.js';
-import { sendNotificationEmail, getRecentEmailLogs, getTransporter } from '../services/emailService.js';
+import { sendNotificationEmail, getRecentEmailLogs, verifyEmailConfig } from '../services/emailService.js';
 import { renderTestEmail } from '../services/emailTemplates.js';
 
 export const emailRouter = Router();
@@ -26,54 +26,32 @@ emailRouter.get('/logs', async (req: AuthenticatedRequest, res: Response) => {
 
 /**
  * GET /api/emails/health
- * Verify SMTP transporter connectivity without sending an email.
- * Returns config summary (no credentials) and live verify result.
+ * Verify Resend API Key validity and HTTPS connectivity over port 443.
  */
 emailRouter.get('/health', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const host = process.env.SMTP_HOST;
-    const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 587;
-    const user = process.env.SMTP_USER;
-    const pass = process.env.SMTP_PASS;
-    const from = process.env.SMTP_FROM;
-    const nodeEnv = process.env.NODE_ENV || 'development';
-
+    const result = await verifyEmailConfig();
     const configPresent = {
-      SMTP_HOST: Boolean(host),
-      SMTP_PORT: Boolean(process.env.SMTP_PORT),
-      SMTP_USER: Boolean(user),
-      SMTP_PASS: Boolean(pass),
-      SMTP_FROM: Boolean(from),
-      SMTP_SECURE: process.env.SMTP_SECURE || '(not set)',
-      NODE_ENV: nodeEnv,
-      configured_host: host ? `${host}:${port}` : '(none)',
+      RESEND_API_KEY: Boolean(process.env.RESEND_API_KEY),
+      RESEND_FROM: result.from,
+      NODE_ENV: process.env.NODE_ENV || 'development',
+      provider: 'Resend (HTTPS / Port 443)',
     };
 
-    if (!host || !user || !pass) {
+    if (!result.ok) {
       return res.status(200).json({
-        status: 'UNCONFIGURED',
-        message: 'SMTP credentials are missing. Email will fall back to Ethereal/mock transport.',
+        status: result.status === 'UNCONFIGURED' ? 'UNCONFIGURED' : 'UNHEALTHY',
+        message: result.message,
         config: configPresent,
+        hint: 'Add RESEND_API_KEY to your environment variables in Render Dashboard or .env file.',
       });
     }
 
-    // Live connection check
-    try {
-      const mailer = await getTransporter();
-      await (mailer as any).verify();
-      return res.json({
-        status: 'HEALTHY',
-        message: `SMTP connection verified successfully: ${host}:${port}`,
-        config: configPresent,
-      });
-    } catch (verifyErr: any) {
-      return res.status(200).json({
-        status: 'UNHEALTHY',
-        message: `SMTP connection verification failed: ${verifyErr.message}`,
-        config: configPresent,
-        hint: 'Check firewall rules, app password validity, and that SMTP_SECURE matches the port (465=true, 587=false).',
-      });
-    }
+    return res.json({
+      status: 'HEALTHY',
+      message: result.message,
+      config: configPresent,
+    });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to check email health.', detail: error.message });
   }
@@ -81,7 +59,7 @@ emailRouter.get('/health', async (req: AuthenticatedRequest, res: Response) => {
 
 /**
  * POST /api/emails/test
- * Send a test email to verify SMTP transporter delivery
+ * Send a test email using Resend HTTPS API to verify end-to-end delivery
  */
 emailRouter.post('/test', async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -104,7 +82,7 @@ emailRouter.post('/test', async (req: AuthenticatedRequest, res: Response) => {
     });
 
     res.json({
-      message: result.status === 'SENT' ? 'Test email dispatched successfully.' : 'Test email dispatch failed or was skipped.',
+      message: result.status === 'SENT' ? 'Test email dispatched successfully via Resend.' : 'Test email dispatch failed or was skipped.',
       log: result,
     });
   } catch (error: any) {

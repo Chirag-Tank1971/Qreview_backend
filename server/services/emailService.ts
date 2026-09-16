@@ -1,122 +1,5 @@
-import nodemailer, { Transporter } from 'nodemailer';
 import { getDbCollection } from '../db.js';
 import { EmailLog } from '../../src/types/index.js';
-
-import dns from 'node:dns';
-
-// Cloud platforms like Render often lack outbound IPv6 routing.
-// Force Node.js to prefer IPv4 when resolving addresses (e.g. smtp.gmail.com).
-if (typeof dns.setDefaultResultOrder === 'function') {
-  dns.setDefaultResultOrder('ipv4first');
-}
-
-let transporter: Transporter | null = null;
-let isEthereal = false;
-let transporterVerified = false;
-
-/**
- * Lazily initialize and return the Nodemailer transporter.
- * If SMTP credentials exist in process.env, connects to real SMTP server.
- * Otherwise, creates an Ethereal virtual test account for development.
- *
- * Production fix notes:
- * - IPv4 is forced (dns.setDefaultResultOrder + family: 4) to avoid ENETUNREACH on Render/Docker.
- * - rejectUnauthorized is always FALSE for Gmail (port 465/587) — Gmail's cert is
- *   trusted globally; the flag only causes issues inside containers/VMs with
- *   missing system CA bundles and provides no real security benefit for Gmail.
- * - Transporter is reset if a previous initialization failed (transporterVerified=false).
- * - Connection is verified on first initialization to surface config errors early.
- */
-export async function getTransporter(): Promise<Transporter> {
-  // Reset if previously unverified (failed init) so we retry
-  if (transporter && !transporterVerified) {
-    console.warn('[EmailService] Previous transporter failed verification — reinitializing...');
-    transporter = null;
-  }
-
-  if (transporter) return transporter;
-
-  const host = process.env.SMTP_HOST;
-  const port = process.env.SMTP_PORT ? Number(process.env.SMTP_PORT) : 587;
-  const user = process.env.SMTP_USER;
-  const pass = process.env.SMTP_PASS;
-
-  if (host && user && pass) {
-    // Configured with custom SMTP
-    const isSecurePort = port === 465;
-    const secureSetting = process.env.SMTP_SECURE === 'true' || isSecurePort;
-
-    const transportOptions: any = {
-      host,
-      port,
-      secure: secureSetting,
-      auth: { user, pass },
-      family: 4, // Force IPv4 to prevent ENETUNREACH on Render
-      tls: {
-        // NEVER reject authorized for Gmail or any well-known provider.
-        // rejectUnauthorized: true causes failures in containers/VMs without full CA bundles.
-        // Gmail's cert is inherently trusted; this flag only adds false security friction.
-        rejectUnauthorized: false,
-        // Explicitly allow modern TLS ciphers
-        minVersion: 'TLSv1.2',
-      },
-      // Connection pool settings for reliability
-      pool: true,
-      maxConnections: 3,
-      maxMessages: 100,
-      socketTimeout: 30000,
-      greetingTimeout: 15000,
-      connectionTimeout: 15000,
-    };
-
-    transporter = nodemailer.createTransport(transportOptions);
-    isEthereal = false;
-
-    // Verify the connection on first initialization to catch config errors early
-    try {
-      await (transporter as any).verify();
-      transporterVerified = true;
-      console.log(`[EmailService] ✅ SMTP transporter verified: ${host}:${port} (secure=${secureSetting})`);
-    } catch (verifyErr: any) {
-      transporterVerified = false;
-      console.error(`[EmailService] ❌ SMTP verification failed for ${host}:${port}: ${verifyErr.message}`);
-      console.error('[EmailService] Check: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_SECURE in .env');
-      // Do NOT null out transporter here — still attempt sends (verify can fail in some
-      // restricted networks but sends still succeed via relay)
-    }
-  } else {
-    // Log which variable is missing to help diagnose production misconfigurations
-    const missing = [!host && 'SMTP_HOST', !user && 'SMTP_USER', !pass && 'SMTP_PASS'].filter(Boolean);
-    console.warn(`[EmailService] Missing SMTP env vars: ${missing.join(', ')}. Falling back to Ethereal test transport.`);
-
-    // Development fallback: automatic Ethereal test inbox
-    try {
-      const testAccount = await nodemailer.createTestAccount();
-      transporter = nodemailer.createTransport({
-        host: 'smtp.ethereal.email',
-        port: 587,
-        secure: false,
-        auth: {
-          user: testAccount.user,
-          pass: testAccount.pass,
-        },
-      });
-      isEthereal = true;
-      transporterVerified = true;
-      console.log(`[EmailService] Initialized Ethereal test account: ${testAccount.user}`);
-    } catch (err: any) {
-      console.warn(`[EmailService] Failed to create Ethereal test account (${err.message}). Using mock transport.`);
-      // Mock transporter fallback if offline
-      transporter = nodemailer.createTransport({
-        jsonTransport: true,
-      });
-      isEthereal = false;
-      transporterVerified = true; // mock always "works"
-    }
-  }
-
-  return transporter;
-}
 
 export interface SendEmailOptions {
   recipientId: string;
@@ -129,8 +12,65 @@ export interface SendEmailOptions {
 }
 
 /**
- * Send an email notification and record the action into the emailLogs database.
- * Never throws an unhandled error so it won't crash callers.
+ * Check connectivity and API key validity against Resend HTTPS API.
+ */
+export async function verifyEmailConfig(): Promise<{
+  ok: boolean;
+  status: 'CONFIGURED' | 'UNCONFIGURED' | 'INVALID_KEY' | 'ERROR';
+  message: string;
+  from: string;
+}> {
+  const apiKey = process.env.RESEND_API_KEY?.trim();
+  const from = process.env.RESEND_FROM || 'Appraisal System <onboarding@resend.dev>';
+
+  if (!apiKey) {
+    return {
+      ok: false,
+      status: 'UNCONFIGURED',
+      message: 'RESEND_API_KEY is not configured in environment variables.',
+      from,
+    };
+  }
+
+  try {
+    // Resend /api-keys endpoint checks if the API key is authentic without sending an email
+    const res = await fetch('https://api.resend.com/api-keys', {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+    });
+
+    if (res.ok) {
+      return {
+        ok: true,
+        status: 'CONFIGURED',
+        message: 'Resend HTTPS API connection verified successfully.',
+        from,
+      };
+    }
+
+    const err = (await res.json().catch(() => ({}))) as any;
+    return {
+      ok: false,
+      status: 'INVALID_KEY',
+      message: `Resend authentication failed (${res.status}): ${err.message || res.statusText}`,
+      from,
+    };
+  } catch (error: any) {
+    return {
+      ok: false,
+      status: 'ERROR',
+      message: `Failed to connect to Resend API: ${error.message}`,
+      from,
+    };
+  }
+}
+
+/**
+ * Send an email notification via Resend HTTPS REST API (port 443).
+ * Records every dispatch (SENT / FAILED / SKIPPED) to the emailLogs database.
+ * Never throws unhandled errors to protect callers.
  */
 export async function sendNotificationEmail(options: SendEmailOptions): Promise<EmailLog> {
   const { recipientId, recipientEmail, recipientName, subject, html, templateType, metadata } = options;
@@ -143,7 +83,7 @@ export async function sendNotificationEmail(options: SendEmailOptions): Promise<
       id: logId,
       recipientId,
       recipientEmail: recipientEmail || 'unknown@invalid',
-      recipientName,
+      recipientName: recipientName || 'Unknown',
       subject,
       templateType,
       status: 'SKIPPED',
@@ -155,38 +95,78 @@ export async function sendNotificationEmail(options: SendEmailOptions): Promise<
     return skippedLog;
   }
 
-  const fromAddress = process.env.SMTP_FROM || '"Appraisal Management System" <no-reply@appraisal-system.internal>';
+  const apiKey = process.env.RESEND_API_KEY?.trim();
+  const fromAddress = process.env.RESEND_FROM || 'Appraisal System <onboarding@resend.dev>';
+
+  // If no API key is provided, log mock and return SKIPPED so dev environments run safely
+  if (!apiKey) {
+    console.warn(`[EmailService] ⚠️ RESEND_API_KEY not configured. Email to ${recipientEmail} simulated: "${subject}"`);
+    const mockLog: EmailLog = {
+      id: logId,
+      recipientId,
+      recipientEmail,
+      recipientName: recipientName || 'Unknown',
+      subject,
+      templateType,
+      status: 'SKIPPED',
+      errorMessage: 'RESEND_API_KEY not configured. Simulated dispatch.',
+      metadata,
+      createdAt: now,
+    };
+    await recordEmailLog(mockLog);
+    return mockLog;
+  }
 
   try {
-    const mailer = await getTransporter();
-    const info = await mailer.sendMail({
-      from: fromAddress,
-      to: recipientName ? `"${recipientName}" <${recipientEmail}>` : recipientEmail,
-      subject,
-      html,
+    const formattedTo = recipientName ? `"${recipientName}" <${recipientEmail}>` : recipientEmail;
+
+    const response = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        from: fromAddress,
+        to: [formattedTo],
+        subject,
+        html,
+      }),
     });
 
-    let previewUrl: string | undefined;
-    if (isEthereal) {
-      previewUrl = nodemailer.getTestMessageUrl(info) || undefined;
-      if (previewUrl) {
-        console.log(`\n📧 [Email Preview] To: ${recipientEmail} | Subject: "${subject}"`);
-        console.log(`   🔗 Web View URL: ${previewUrl}\n`);
-      }
-    } else {
-      console.log(`[EmailService] Sent email to ${recipientEmail} (ID: ${info.messageId})`);
+    const data = (await response.json().catch(() => ({}))) as any;
+
+    if (!response.ok) {
+      const errMsg = data.message || `Resend error (${response.status}): ${response.statusText}`;
+      console.error(`[EmailService] ❌ Failed to send email to ${recipientEmail}:`, errMsg);
+
+      const failedLog: EmailLog = {
+        id: logId,
+        recipientId,
+        recipientEmail,
+        recipientName: recipientName || 'Unknown',
+        subject,
+        templateType,
+        status: 'FAILED',
+        errorMessage: errMsg,
+        metadata,
+        createdAt: now,
+      };
+      await recordEmailLog(failedLog);
+      return failedLog;
     }
+
+    console.log(`[EmailService] ✅ Sent email to ${recipientEmail} via Resend HTTPS (ID: ${data.id})`);
 
     const sentLog: EmailLog = {
       id: logId,
       recipientId,
       recipientEmail,
-      recipientName,
+      recipientName: recipientName || 'Unknown',
       subject,
       templateType,
       status: 'SENT',
-      messageId: info.messageId,
-      previewUrl,
+      messageId: data.id,
       metadata,
       createdAt: now,
     };
@@ -194,28 +174,28 @@ export async function sendNotificationEmail(options: SendEmailOptions): Promise<
     await recordEmailLog(sentLog);
     return sentLog;
   } catch (error: any) {
-    console.error(`[EmailService] Failed to send email to ${recipientEmail}:`, error.message);
+    console.error(`[EmailService] ❌ Exception dispatching email to ${recipientEmail}:`, error.message);
 
-    const failedLog: EmailLog = {
+    const errorLog: EmailLog = {
       id: logId,
       recipientId,
       recipientEmail,
-      recipientName,
+      recipientName: recipientName || 'Unknown',
       subject,
       templateType,
       status: 'FAILED',
-      errorMessage: error.message || 'Unknown SMTP dispatch error',
+      errorMessage: error.message || 'Unknown network error',
       metadata,
       createdAt: now,
     };
 
-    await recordEmailLog(failedLog);
-    return failedLog;
+    await recordEmailLog(errorLog);
+    return errorLog;
   }
 }
 
 /**
- * Persist log into MongoDB / memoryDb
+ * Persist email log into database
  */
 async function recordEmailLog(log: EmailLog): Promise<void> {
   try {
@@ -254,7 +234,7 @@ export async function getRecentEmailLogs(limit: number = 50): Promise<EmailLog[]
   try {
     const emailLogsCol = getDbCollection('emailLogs');
     const logs: EmailLog[] = await (await emailLogsCol.find({})).toArray();
-    return logs.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()).slice(0, limit);
+    return logs.sort((a, b) => new Date(b.createdAt || '').getTime() - new Date(a.createdAt || '').getTime()).slice(0, limit);
   } catch (err) {
     console.error('[EmailService] Failed to retrieve email logs:', err);
     return [];

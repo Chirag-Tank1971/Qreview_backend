@@ -1,11 +1,4 @@
 import 'dotenv/config';
-import dns from 'node:dns';
-
-// Force Node.js to prefer IPv4 DNS resolution globally (Render containers do not route IPv6)
-if (typeof dns.setDefaultResultOrder === 'function') {
-  dns.setDefaultResultOrder('ipv4first');
-}
-
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
@@ -34,7 +27,7 @@ const isProd = process.env.NODE_ENV === 'production' && process.env.ENABLE_PROD_
 const bootLog = console.log;
 
 if (isProd) {
-  const noop = () => {};
+  const noop = () => { };
   console.log = noop;
   console.info = noop;
   console.warn = noop;
