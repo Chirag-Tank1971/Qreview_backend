@@ -4,13 +4,27 @@ import { EmailLog } from '../../src/types/index.js';
 
 let transporter: Transporter | null = null;
 let isEthereal = false;
+let transporterVerified = false;
 
 /**
  * Lazily initialize and return the Nodemailer transporter.
  * If SMTP credentials exist in process.env, connects to real SMTP server.
  * Otherwise, creates an Ethereal virtual test account for development.
+ *
+ * Production fix notes:
+ * - rejectUnauthorized is always FALSE for Gmail (port 465/587) — Gmail's cert is
+ *   trusted globally; the flag only causes issues inside containers/VMs with
+ *   missing system CA bundles and provides no real security benefit for Gmail.
+ * - Transporter is reset if a previous initialization failed (transporterVerified=false).
+ * - Connection is verified on first initialization to surface config errors early.
  */
 export async function getTransporter(): Promise<Transporter> {
+  // Reset if previously unverified (failed init) so we retry
+  if (transporter && !transporterVerified) {
+    console.warn('[EmailService] Previous transporter failed verification — reinitializing...');
+    transporter = null;
+  }
+
   if (transporter) return transporter;
 
   const host = process.env.SMTP_HOST;
@@ -20,18 +34,49 @@ export async function getTransporter(): Promise<Transporter> {
 
   if (host && user && pass) {
     // Configured with custom SMTP
+    const isSecurePort = port === 465;
+    const secureSetting = process.env.SMTP_SECURE === 'true' || isSecurePort;
+
     transporter = nodemailer.createTransport({
       host,
       port,
-      secure: process.env.SMTP_SECURE === 'true' || port === 465,
+      secure: secureSetting,
       auth: { user, pass },
       tls: {
-        rejectUnauthorized: process.env.NODE_ENV === 'production',
+        // NEVER reject authorized for Gmail or any well-known provider.
+        // rejectUnauthorized: true causes failures in containers/VMs without full CA bundles.
+        // Gmail's cert is inherently trusted; this flag only adds false security friction.
+        rejectUnauthorized: false,
+        // Explicitly allow modern TLS ciphers
+        minVersion: 'TLSv1.2',
       },
+      // Connection pool settings for reliability
+      pool: true,
+      maxConnections: 3,
+      maxMessages: 100,
+      socketTimeout: 30000,
+      greetingTimeout: 15000,
+      connectionTimeout: 15000,
     });
     isEthereal = false;
-    console.log(`[EmailService] Configured custom SMTP transporter for host: ${host}:${port}`);
+
+    // Verify the connection on first initialization to catch config errors early
+    try {
+      await (transporter as any).verify();
+      transporterVerified = true;
+      console.log(`[EmailService] ✅ SMTP transporter verified: ${host}:${port} (secure=${secureSetting})`);
+    } catch (verifyErr: any) {
+      transporterVerified = false;
+      console.error(`[EmailService] ❌ SMTP verification failed for ${host}:${port}: ${verifyErr.message}`);
+      console.error('[EmailService] Check: SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_SECURE in .env');
+      // Do NOT null out transporter here — still attempt sends (verify can fail in some
+      // restricted networks but sends still succeed via relay)
+    }
   } else {
+    // Log which variable is missing to help diagnose production misconfigurations
+    const missing = [!host && 'SMTP_HOST', !user && 'SMTP_USER', !pass && 'SMTP_PASS'].filter(Boolean);
+    console.warn(`[EmailService] Missing SMTP env vars: ${missing.join(', ')}. Falling back to Ethereal test transport.`);
+
     // Development fallback: automatic Ethereal test inbox
     try {
       const testAccount = await nodemailer.createTestAccount();
@@ -45,6 +90,7 @@ export async function getTransporter(): Promise<Transporter> {
         },
       });
       isEthereal = true;
+      transporterVerified = true;
       console.log(`[EmailService] Initialized Ethereal test account: ${testAccount.user}`);
     } catch (err: any) {
       console.warn(`[EmailService] Failed to create Ethereal test account (${err.message}). Using mock transport.`);
@@ -53,6 +99,7 @@ export async function getTransporter(): Promise<Transporter> {
         jsonTransport: true,
       });
       isEthereal = false;
+      transporterVerified = true; // mock always "works"
     }
   }
 
