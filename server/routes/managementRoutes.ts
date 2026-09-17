@@ -122,6 +122,22 @@ managementRouter.get(
           ? Number((currentQuarterScores.reduce((acc, val) => acc + val, 0) / currentQuarterScores.length).toFixed(2))
           : 0;
 
+      // 5.1 Accurate Rating Distribution across Target Period Reviews
+      let exceptionalCount = 0; // >= 4.0
+      let proficientCount = 0;  // 3.0 - 3.99
+      let needsFocusCount = 0;  // < 3.0
+      completedReviews.forEach((r) => {
+        const score = typeof r.finalScore === 'number' ? r.finalScore : 0;
+        if (score >= 4.0) {
+          exceptionalCount += 1;
+        } else if (score >= 3.0) {
+          proficientCount += 1;
+        } else {
+          needsFocusCount += 1;
+        }
+      });
+      const inEvaluationCount = Math.max(0, totalReviews - completedCount);
+
       // Previous period performance
       let previousQuarterAverageScore = 0;
       if (previousPeriod) {
@@ -238,6 +254,12 @@ managementRouter.get(
           trendDirection,
           highestPerformingDepartments,
           departmentsRequiringAttention,
+          ratingDistribution: {
+            exceptional: exceptionalCount,
+            proficient: proficientCount,
+            needsFocus: needsFocusCount,
+            inEvaluation: inEvaluationCount,
+          },
         },
         appraisalSummary: {
           currentYear,

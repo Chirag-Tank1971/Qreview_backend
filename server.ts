@@ -1,4 +1,5 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config({ override: true });
 import express from 'express';
 import cors from 'cors';
 import path from 'path';
@@ -16,7 +17,6 @@ import { bulkRouter } from './server/routes/bulkRoutes.js';
 import { auditRouter } from './server/routes/auditRoutes.js';
 import { aiAndFeedbackRouter } from './server/routes/aiAndFeedbackRoutes.js';
 import { emailRouter } from './server/routes/emailRoutes.js';
-import { dashboardRouter } from './server/routes/dashboardRoutes.js';
 import { managementRouter } from './server/routes/managementRoutes.js';
 import { startBackgroundScheduler } from './server/jobs/scheduler.js';
 
@@ -204,7 +204,6 @@ async function startServer() {
   app.use('/api', aiAndFeedbackRouter);
   app.use('/api/emails', emailRouter);
   app.use('/api', managementRouter);
-  app.use('/api', dashboardRouter);
 
   // Always return standard JSON 404 for any unmatched /api routes
   app.all('/api/*', (_req, res) => {

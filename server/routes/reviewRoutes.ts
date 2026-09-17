@@ -211,8 +211,14 @@ reviewRouter.get('/reviews', async (req: AuthenticatedRequest, res: Response) =>
     if (periodId && periodId !== 'ALL') {
       reviewQuery.reviewPeriodId = periodId;
     }
-    if (status && status !== 'ALL') {
-      reviewQuery.status = status;
+    if (status && status !== 'ALL' && status !== 'undefined') {
+      if (status === 'SELF_ASSESSED') {
+        reviewQuery.status = 'MANAGER_PENDING';
+      } else if (status === 'MANAGER_COMPLETED' || status === 'HR_PENDING') {
+        reviewQuery.status = { $in: ['HR_PENDING', 'MANAGER_COMPLETED'] };
+      } else {
+        reviewQuery.status = status;
+      }
     }
 
     let reviews: EmployeeReview[] = await (await reviewCol.find(reviewQuery)).toArray();
@@ -285,6 +291,10 @@ reviewRouter.get('/reviews', async (req: AuthenticatedRequest, res: Response) =>
       if (status === 'SELF_ASSESSED') {
         reviews = reviews.filter(
           (r) => (r.status === 'MANAGER_PENDING' && r.isSelfSubmitted) || r.status === 'MANAGER_PENDING'
+        );
+      } else if (status === 'MANAGER_COMPLETED' || status === 'HR_PENDING') {
+        reviews = reviews.filter(
+          (r) => r.status === 'HR_PENDING' || r.status === 'MANAGER_COMPLETED'
         );
       } else {
         reviews = reviews.filter((r) => r.status === status);
@@ -379,7 +389,7 @@ reviewRouter.get('/reviews/stats', async (req: AuthenticatedRequest, res: Respon
     const total = reviews.length;
     const draft = reviews.filter((r) => r.status === 'DRAFT' || r.status === 'ASSIGNED').length;
     const managerPending = reviews.filter((r) => r.status === 'MANAGER_PENDING').length;
-    const managerCompleted = reviews.filter((r) => r.status === 'MANAGER_COMPLETED').length;
+    const managerCompleted = reviews.filter((r) => r.status === 'MANAGER_COMPLETED' || r.status === 'HR_PENDING').length;
     const hrPending = reviews.filter((r) => r.status === 'HR_PENDING' || r.status === 'HR_COMPLETED').length;
     const closed = reviews.filter((r) => r.status === 'CLOSED' || r.isClosed).length;
 
@@ -391,7 +401,8 @@ reviewRouter.get('/reviews/stats', async (req: AuthenticatedRequest, res: Respon
           )
         : 0;
 
-    const completionRate = total > 0 ? Math.round(((managerCompleted + hrPending + closed) / total) * 100) : 0;
+    const completedReviewsCount = reviews.filter((r) => !['DRAFT', 'ASSIGNED', 'MANAGER_PENDING'].includes(r.status)).length;
+    const completionRate = total > 0 ? Math.round((completedReviewsCount / total) * 100) : 0;
 
     const distribution = {
       outstanding: scoredReviews.filter((r) => (r.finalScore || 0) >= 4.5).length,
@@ -1027,7 +1038,7 @@ reviewRouter.put(
             message: `${req.user?.name || 'Manager'} submitted evaluation scores (${finalScore}) for ${existing.employeeName}. Ready for HR review.`,
             isRead: false,
             priority: 'MEDIUM',
-            metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: 'MANAGER_COMPLETED' },
+            metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: newStatus },
             createdAt: now,
           },
         },

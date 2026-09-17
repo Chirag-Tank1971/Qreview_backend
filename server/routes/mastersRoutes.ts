@@ -1145,7 +1145,7 @@ mastersRouter.delete('/employees/:id', requireRoles('SUPER_ADMIN'), async (req: 
     const usersCol = getDbCollection('users');
     const reviewsCol = getDbCollection('employeeReviews');
     const appraisalsCol = getDbCollection('appraisals');
-    const feedbackCol = getDbCollection('feedback');
+    const feedbackCol = getDbCollection('feedback' as any);
     const notifCol = getDbCollection('notifications');
 
     const emp = await empCol.findOne({ id });
