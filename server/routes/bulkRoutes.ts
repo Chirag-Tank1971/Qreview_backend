@@ -27,7 +27,7 @@ const TEMPLATE_COLUMNS: Record<BulkDatasetType, BulkTemplateColumn[]> = {
     { key: 'fullName', label: 'Full Name', description: 'Employee First and Last Name', required: true, example: 'Aarav Sharma', type: 'string' },
     { key: 'email', label: 'Work Email', description: 'Unique corporate email address', required: true, example: 'aarav.sharma@company.com', type: 'string' },
     { key: 'joiningDate', label: 'Joining Date', description: 'Date of joining (YYYY-MM-DD)', required: true, example: '2025-01-15', type: 'date' },
-    { key: 'cycleCode', label: 'Cycle Code', description: 'Joining Cycle: CYCLE_A to CYCLE_H (Auto-calculated from joining month if blank)', required: false, example: 'CYCLE_A', type: 'enum', options: ['CYCLE_A', 'CYCLE_B', 'CYCLE_C', 'CYCLE_D', 'CYCLE_E', 'CYCLE_F', 'CYCLE_G', 'CYCLE_H'] },
+    { key: 'cycleCode', label: 'Cycle Code', description: 'Appraisal Cycle: CYCLE_JUN or CYCLE_SEP (must be assigned manually, no auto-derivation)', required: true, example: 'CYCLE_JUN', type: 'enum', options: ['CYCLE_JUN', 'CYCLE_SEP'] },
     { key: 'department', label: 'Department', description: 'Department Name or Code', required: true, example: 'Engineering', type: 'string' },
     { key: 'designation', label: 'Designation', description: 'Official Job Designation Title', required: true, example: 'Senior Software Engineer', type: 'string' },
     { key: 'managerCode', label: 'Reporting Manager Code', description: 'Employee Code of Reporting Manager (e.g. EMP-004)', required: false, example: 'EMP-004', type: 'string' },
@@ -40,7 +40,7 @@ const TEMPLATE_COLUMNS: Record<BulkDatasetType, BulkTemplateColumn[]> = {
     { key: 'templateTitle', label: 'Template Title', description: 'Standardized Template Group', required: true, example: 'Engineering Senior Core KRA 2026', type: 'string' },
     { key: 'department', label: 'Department', description: 'Target Department', required: true, example: 'Engineering', type: 'string' },
     { key: 'designation', label: 'Designation', description: 'Applicable Designation Title', required: true, example: 'Senior Software Engineer', type: 'string' },
-    { key: 'cycleCode', label: 'Cycle Code', description: 'Cycle: CYCLE_A to CYCLE_H or ALL', required: true, example: 'CYCLE_A', type: 'enum', options: ['ALL', 'CYCLE_A', 'CYCLE_B', 'CYCLE_C', 'CYCLE_D', 'CYCLE_E', 'CYCLE_F', 'CYCLE_G', 'CYCLE_H'] },
+    { key: 'cycleCode', label: 'Cycle Code', description: 'Cycle: CYCLE_JUN, CYCLE_SEP, or ALL', required: true, example: 'CYCLE_JUN', type: 'enum', options: ['ALL', 'CYCLE_JUN', 'CYCLE_SEP'] },
     { key: 'kraTitle', label: 'KRA Title', description: 'Specific Key Result Area name', required: true, example: 'System Architecture & Scalability', type: 'string' },
     { key: 'weightage', label: 'Weightage (%)', description: 'KRA weight (sum of all KRAs in template = 100)', required: true, example: '30', type: 'number' },
     { key: 'targetDescription', label: 'Target Description', description: 'Measurable metric goal description', required: true, example: 'Deliver zero-downtime microservice migration', type: 'string' },
@@ -58,7 +58,7 @@ const TEMPLATE_COLUMNS: Record<BulkDatasetType, BulkTemplateColumn[]> = {
   ],
   'increment-matrix': [
     { key: 'employeeCode', label: 'Employee Code', description: 'Employee Code', required: true, example: 'EMP-101', type: 'string' },
-    { key: 'cycleCode', label: 'Cycle Code', description: 'Appraisal Cycle Code', required: true, example: 'CYCLE_A', type: 'string' },
+    { key: 'cycleCode', label: 'Cycle Code', description: 'Appraisal Cycle Code', required: true, example: 'CYCLE_JUN', type: 'string' },
     { key: 'finalRating', label: 'Calibrated Rating', description: 'Annual Performance Category', required: true, example: 'OUTSTANDING', type: 'enum', options: ['OUTSTANDING', 'EXCEEDS_EXPECTATIONS', 'MEETS_EXPECTATIONS', 'NEEDS_IMPROVEMENT', 'UNSATISFACTORY'] },
     { key: 'proposedIncrementPercent', label: 'Increment (%)', description: 'Proposed salary increment percentage', required: true, example: '14.5', type: 'number' },
     { key: 'promotionEligible', label: 'Promotion (YES/NO)', description: 'Whether employee is recommended for promotion', required: false, example: 'YES', type: 'string' },
@@ -70,10 +70,10 @@ const TEMPLATE_COLUMNS: Record<BulkDatasetType, BulkTemplateColumn[]> = {
 
 const SAMPLE_DATA: Record<BulkDatasetType, any[]> = {
   employees: [
-    { employeeCode: 'EMP-201', fullName: 'Kavita Nair', email: 'kavita.nair@company.com', joiningDate: '2025-01-10', cycleCode: 'CYCLE_A', department: 'Engineering', designation: 'Senior Software Engineer', managerCode: 'EMP-004', hodCode: 'EMP-001', baseSalary: 1800000, role: 'EMPLOYEE', status: 'ACTIVE' },
-    { employeeCode: 'EMP-202', fullName: 'Rohan Deshmukh', email: 'rohan.deshmukh@company.com', joiningDate: '2025-02-14', cycleCode: 'CYCLE_B', department: 'Product & Design', designation: 'Product Designer', managerCode: 'EMP-001', hodCode: 'EMP-001', baseSalary: 1450000, role: 'EMPLOYEE', status: 'ACTIVE' },
-    { employeeCode: 'EMP-203', fullName: 'Ananya Roy', email: 'ananya.roy@company.com', joiningDate: '2025-03-01', cycleCode: 'CYCLE_C', department: 'Human Resources', designation: 'Talent Acquisition Lead', managerCode: 'EMP-006', hodCode: 'EMP-003', baseSalary: 1600000, role: 'EMPLOYEE', status: 'ACTIVE' },
-    { employeeCode: 'EMP-204', fullName: 'Sameer Gupta', email: 'sameer.gupta@company.com', joiningDate: '2025-04-18', cycleCode: 'CYCLE_D', department: 'Sales & Growth', designation: 'Enterprise Account Executive', managerCode: 'EMP-005', hodCode: 'EMP-002', baseSalary: 1750000, role: 'EMPLOYEE', status: 'ACTIVE' },
+    { employeeCode: 'EMP-201', fullName: 'Kavita Nair', email: 'kavita.nair@company.com', joiningDate: '2025-01-10', cycleCode: 'CYCLE_JUN', department: 'Engineering', designation: 'Senior Software Engineer', managerCode: 'EMP-004', hodCode: 'EMP-001', baseSalary: 1800000, role: 'EMPLOYEE', status: 'ACTIVE' },
+    { employeeCode: 'EMP-202', fullName: 'Rohan Deshmukh', email: 'rohan.deshmukh@company.com', joiningDate: '2025-02-14', cycleCode: 'CYCLE_SEP', department: 'Product & Design', designation: 'Product Designer', managerCode: 'EMP-001', hodCode: 'EMP-001', baseSalary: 1450000, role: 'EMPLOYEE', status: 'ACTIVE' },
+    { employeeCode: 'EMP-203', fullName: 'Ananya Roy', email: 'ananya.roy@company.com', joiningDate: '2025-03-01', cycleCode: 'CYCLE_JUN', department: 'Human Resources', designation: 'Talent Acquisition Lead', managerCode: 'EMP-006', hodCode: 'EMP-003', baseSalary: 1600000, role: 'EMPLOYEE', status: 'ACTIVE' },
+    { employeeCode: 'EMP-204', fullName: 'Sameer Gupta', email: 'sameer.gupta@company.com', joiningDate: '2025-04-18', cycleCode: 'CYCLE_SEP', department: 'Sales & Growth', designation: 'Enterprise Account Executive', managerCode: 'EMP-005', hodCode: 'EMP-002', baseSalary: 1750000, role: 'EMPLOYEE', status: 'ACTIVE' },
   ],
   kras: [
     { templateTitle: 'Sales Enterprise Executive 2026', department: 'Sales & Growth', designation: 'Enterprise Account Executive', cycleCode: 'ALL', kraTitle: 'Net New ARR Bookings', weightage: 40, targetDescription: 'Achieve ₹2.5 Cr in new annualized enterprise contract value', measurementUnit: 'CURRENCY', targetValue: '25000000' },
@@ -86,8 +86,8 @@ const SAMPLE_DATA: Record<BulkDatasetType, any[]> = {
     { employeeCode: 'EMP-004', periodCode: 'Q1_2026', kraTitle: 'Mentorship & Peer Code Reviews', selfScore: 4.2, managerScore: 4.6, managerComments: 'Mentored two junior engineers effectively and led team tech talks.', status: 'MANAGER_COMPLETED' },
   ],
   'increment-matrix': [
-    { employeeCode: 'EMP-004', cycleCode: 'CYCLE_F', finalRating: 'OUTSTANDING', proposedIncrementPercent: 15.0, promotionEligible: 'YES', promotedDesignation: 'Lead Frontend Engineer', bonusAmount: 120000, hodNotes: 'Exemplary cross-functional impact; promoted to Pod Lead.' },
-    { employeeCode: 'EMP-006', cycleCode: 'CYCLE_F', finalRating: 'EXCEEDS_EXPECTATIONS', proposedIncrementPercent: 11.5, promotionEligible: 'NO', promotedDesignation: '', bonusAmount: 75000, hodNotes: 'Strong consistency throughout 4 quarters. Merit increment approved.' },
+    { employeeCode: 'EMP-004', cycleCode: 'CYCLE_SEP', finalRating: 'OUTSTANDING', proposedIncrementPercent: 15.0, promotionEligible: 'YES', promotedDesignation: 'Lead Frontend Engineer', bonusAmount: 120000, hodNotes: 'Exemplary cross-functional impact; promoted to Pod Lead.' },
+    { employeeCode: 'EMP-006', cycleCode: 'CYCLE_SEP', finalRating: 'EXCEEDS_EXPECTATIONS', proposedIncrementPercent: 11.5, promotionEligible: 'NO', promotedDesignation: '', bonusAmount: 75000, hodNotes: 'Strong consistency throughout 4 quarters. Merit increment approved.' },
   ],
 };
 
@@ -108,31 +108,6 @@ bulkRouter.get('/templates/:type', (req: AuthenticatedRequest, res: Response) =>
     sampleData: SAMPLE_DATA[datasetType] || [],
   });
 });
-
-function deriveCycleFromDate(dateInput: any): { fullCode: string; shortCode: string; cycleId: string } {
-  let m = 1;
-  if (dateInput) {
-    const d = new Date(dateInput);
-    if (!isNaN(d.getTime())) {
-      m = d.getUTCMonth() + 1; // 1 to 12
-    }
-  }
-  let shortCode = 'A';
-  if (m === 1) shortCode = 'A';
-  else if (m === 2 || m === 3) shortCode = 'B';
-  else if (m === 4) shortCode = 'C';
-  else if (m === 5 || m === 6) shortCode = 'D';
-  else if (m === 7) shortCode = 'E';
-  else if (m === 8 || m === 9 || m === 10) shortCode = 'F';
-  else if (m === 11) shortCode = 'G';
-  else if (m === 12) shortCode = 'H';
-
-  return {
-    fullCode: `CYCLE_${shortCode}`,
-    shortCode,
-    cycleId: `cycle_${shortCode.toLowerCase()}`,
-  };
-}
 
 /**
  * Synchronizes manager and HOD hierarchy links for all employees in the database.
@@ -311,7 +286,7 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
     const existingEmployees = await (await employeesCol.find({})).toArray();
     const existingDepartments = await (await departmentsCol.find({})).toArray();
     const existingDesignations = await (await designationsCol.find({})).toArray();
-    const existingCycles = await (await cyclesCol.find({})).toArray();
+    const existingCycles = await (await cyclesCol.find({ active: { $ne: false } })).toArray();
     const existingUsers = await (await usersCol.find({})).toArray();
 
     const empCodeMap = new Set(existingEmployees.map((e) => String(e.employeeCode || '').trim().toUpperCase()));
@@ -394,13 +369,9 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
           }
         }
 
-        // Cycle check & auto-derivation
-        if (!cycle) {
-          const derived = deriveCycleFromDate(rawRow.joiningDate);
-          rawRow.cycleCode = derived.fullCode;
-          warnings.push(`Cycle Code was omitted; automatically assigned '${derived.fullCode}' based on joining date.`);
-        } else if (!cycleCodeSet.has(cycle) && !['CYCLE_A', 'CYCLE_B', 'CYCLE_C', 'CYCLE_D', 'CYCLE_E', 'CYCLE_F', 'CYCLE_G', 'CYCLE_H'].includes(cycle)) {
-          errors.push(`Invalid Cycle Code '${cycle}'. Must be one of CYCLE_A to CYCLE_H.`);
+        // Cycle check — must be assigned explicitly, no auto-derivation from joining date
+        if (cycle && !cycleCodeSet.has(cycle) && !['CYCLE_JUN', 'CYCLE_SEP'].includes(cycle)) {
+          errors.push(`Invalid Cycle Code '${cycle}'. Must be CYCLE_JUN or CYCLE_SEP.`);
         }
 
         // Department check
@@ -547,7 +518,7 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
     // Get masters for lookup
     const allDepartments = await (await departmentsCol.find({})).toArray();
     const allDesignations = await (await designationsCol.find({})).toArray();
-    const allCycles = await (await cyclesCol.find({})).toArray();
+    const allCycles = await (await cyclesCol.find({ active: { $ne: false } })).toArray();
 
     const findOrCreateDept = async (deptInput: string) => {
       if (!deptInput) return { id: 'dept_eng', name: 'Engineering', code: 'ENG' };
@@ -590,22 +561,19 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
       return match;
     };
 
-    const mapCycleCodeToId = (code: string) => {
+    const mapCycleCodeToId = (code: string, joiningDate?: string) => {
       const clean = String(code || '').trim().toUpperCase();
-      const cycleMatch = allCycles.find((c) => c.code === clean);
+      const cycleMatch = allCycles.find((c) => c.code === clean || c.id === clean);
       if (cycleMatch) return cycleMatch.id;
-      // standard fallbacks
-      const cycleMap: Record<string, string> = {
-        CYCLE_A: 'cycle_a',
-        CYCLE_B: 'cycle_b',
-        CYCLE_C: 'cycle_c',
-        CYCLE_D: 'cycle_d',
-        CYCLE_E: 'cycle_e',
-        CYCLE_F: 'cycle_f',
-        CYCLE_G: 'cycle_g',
-        CYCLE_H: 'cycle_h',
-      };
-      return cycleMap[clean] || 'cycle_a';
+      // Auto-derive from joining date: Jan-Jul (1-7) -> June, Aug-Dec (8-12) -> September
+      if (joiningDate) {
+        const parsed = new Date(joiningDate);
+        if (!isNaN(parsed.getTime())) {
+          const month = parsed.getMonth() + 1;
+          return month >= 1 && month <= 7 ? 'cycle_d' : 'cycle_f';
+        }
+      }
+      return clean.includes('SEP') ? 'cycle_f' : 'cycle_d';
     };
 
     for (let i = 0; i < rows.length; i++) {
@@ -627,10 +595,10 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
           const existing = await employeesCol.findOne({ $or: [{ employeeCode: code }, { email }] });
           const deptObj = await findOrCreateDept(row.department);
           const desigObj = await findOrCreateDesig(row.designation, deptObj.id);
-          const derivedCycle = deriveCycleFromDate(row.joiningDate);
-          const rawCycleCode = String(row.cycleCode || '').trim().toUpperCase() || derivedCycle.fullCode;
-          const cycleId = mapCycleCodeToId(rawCycleCode);
-          const cycleCodeShort = rawCycleCode.replace('CYCLE_', '') || derivedCycle.shortCode;
+          const rawCycleCode = String(row.cycleCode || '').trim().toUpperCase();
+          const cycleId = mapCycleCodeToId(rawCycleCode, row.joiningDate);
+          const resolvedCycle = allCycles.find((c) => c.id === cycleId);
+          const cycleCodeShort = resolvedCycle?.code || (cycleId === 'cycle_f' ? 'SEP' : 'JUN');
 
           const rawMgrCode = String(
             row.managerCode || row.managerEmployeeCode || row.reportingManagerCode || row.manager || ''
@@ -774,7 +742,7 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
             measurementCriteria: row.measurementCriteria || `${row.measurementUnit || '%'}: 1=Below, 3=Meets, 5=Exceeds`,
           };
 
-          let existingTemplate = await kraTemplatesCol.findOne({ title: tTitle, departmentId: deptObj.id });
+          const existingTemplate = await kraTemplatesCol.findOne({ title: tTitle, departmentId: deptObj.id });
           if (existingTemplate) {
             const currentItems = existingTemplate.items || [];
             currentItems.push(kraItem);

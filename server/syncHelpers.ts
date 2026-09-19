@@ -100,8 +100,8 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
               hodId: emp.hodId,
               hodName: emp.hodName,
               cycleId: emp.cycleId,
-              cycleCode: emp.cycleCode || empCycle?.code || 'A',
-              cycleColor: emp.cycleColor || empCycle?.colorHex || '#1e3a8a',
+              cycleCode: emp.cycleCode || empCycle?.code || 'N/A',
+              cycleColor: emp.cycleColor || empCycle?.colorHex || '#64748b',
               updatedAt: new Date().toISOString(),
             },
           }
@@ -126,7 +126,7 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
     // 2. Annual Appraisal records:
     // Only update master employee metadata for EXISTING unlocked appraisals.
     // Appraisals must NEVER be created automatically on employee save — they are initiated exclusively
-    // by HR/Super Admin through POST /api/appraisals/initiate-cycle for each 8-Cycle cohort.
+    // by HR/Super Admin through POST /api/appraisals/initiate-cycle for each appraisal cycle cohort (June/September).
     const appraisalYear = 2026;
     const existingAppraisal: Appraisal | null = await appraisalsCol.findOne({
       employeeId: emp.id,
@@ -150,9 +150,9 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
             hodId: emp.hodId,
             hodName: emp.hodName,
             cycleId: emp.cycleId,
-            cycleCode: emp.cycleCode || empCycle?.code || 'A',
-            cycleName: emp.cycleName || empCycle?.name || `Cycle ${emp.cycleCode || empCycle?.code || 'A'}`,
-            cycleColor: emp.cycleColor || empCycle?.colorHex || '#1e3a8a',
+            cycleCode: emp.cycleCode || empCycle?.code || 'N/A',
+            cycleName: emp.cycleName || empCycle?.name || 'Unassigned',
+            cycleColor: emp.cycleColor || empCycle?.colorHex || '#64748b',
             currentCtc,
             currency: emp.currency || '₹',
             updatedAt: new Date().toISOString(),

@@ -98,10 +98,10 @@ npm start
 | `POST /api/auth/login` | User Authentication | Login with corporate credentials, returns JWT token |
 | `GET /api/auth/me` | Current Profile | Returns authenticated user info and permissions |
 | `POST /api/auth/switch-role`| Persona Switch | Fast switch for testing RBAC across user roles |
-| `GET /api/employees` | Employee Directory | Filterable list across cohorts (Cycle A to H) |
+| `GET /api/employees` | Employee Directory | Filterable list across cohorts (June / September cycles) |
 | `GET /api/kras` | KRA Goal Library | KRA definitions with 100% weightage invariants |
 | `GET /api/reviews` | Quarterly Reviews | 4-Quarter review scores (Q1, Q2, Q3, Q4) |
-| `GET /api/appraisals` | Annual Appraisals | 8-Cycle cohort rollups, promotions, increment percentages |
+| `GET /api/appraisals` | Annual Appraisals | June/September cohort rollups, promotions, increment percentages |
 | `POST /api/ai/synthesize-review` | AI Review Narrative | Gemini 3.8 Flash automated review synthesis |
 | `POST /api/ai/bias-check` | AI Tone Harmonizer | Detection of subjective bias and corrective rewrites |
 | `GET /api/audit/logs` | Audit Trail | Immutable compliance logs of all appraisal actions |

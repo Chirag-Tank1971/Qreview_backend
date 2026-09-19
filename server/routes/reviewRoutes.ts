@@ -29,6 +29,8 @@ import {
   returnReview,
   completeHRReview,
   saveManagerDraft,
+  hodApproveReview,
+  hodReturnReview,
 } from '../services/workflowService.js';
 import {
   checkEmployeeReviewEligibility,
@@ -390,8 +392,10 @@ reviewRouter.get('/reviews/stats', async (req: AuthenticatedRequest, res: Respon
     const draft = reviews.filter((r) => r.status === 'DRAFT' || r.status === 'ASSIGNED').length;
     const managerPending = reviews.filter((r) => r.status === 'MANAGER_PENDING').length;
     const managerCompleted = reviews.filter((r) => r.status === 'MANAGER_COMPLETED' || r.status === 'HR_PENDING').length;
+    const hodPending = reviews.filter((r) => r.status === 'HOD_PENDING').length;
     const hrPending = reviews.filter((r) => r.status === 'HR_PENDING' || r.status === 'HR_COMPLETED').length;
     const closed = reviews.filter((r) => r.status === 'CLOSED' || r.isClosed).length;
+    const exceptions = reviews.filter((r) => r.status === 'HOD_PENDING' && !r.hodId).length;
 
     const scoredReviews = reviews.filter((r) => (r.finalScore || 0) > 0);
     const avgScore =
@@ -417,8 +421,10 @@ reviewRouter.get('/reviews/stats', async (req: AuthenticatedRequest, res: Respon
       draft,
       managerPending,
       managerCompleted,
+      hodPending,
       hrPending,
       closed,
+      exceptions,
       averageScore: avgScore,
       completionRate,
       distribution,
@@ -582,11 +588,10 @@ reviewRouter.get(
       let reviews: EmployeeReview[] = await (await reviewCol.find({})).toArray();
 
       if (role === 'HOD') {
-        const hodDeptId = req.employeeProfile?.departmentId;
-        reviews = reviews.filter((r) => {
-          const isDept = (hodDeptId && r.departmentId === hodDeptId) || r.hodId === managerEmployeeId;
-          return isDept && r.status === 'MANAGER_PENDING';
-        });
+        // Strictly scoped to reviews where this HOD is the employee's configured HOD —
+        // not every review in the HOD's department (an HOD role does not imply ownership
+        // of every employee's review in that department).
+        reviews = reviews.filter((r) => r.hodId === managerEmployeeId && r.status === 'HOD_PENDING');
       } else if (role === 'REPORTING_MANAGER' || role === 'MANAGER') {
         const allEmployees: Employee[] = await (await employeesCol.find({})).toArray();
         const directReportIds = new Set(
@@ -608,7 +613,12 @@ reviewRouter.get(
       } else {
         // SUPER_ADMIN and HR
         reviews = reviews.filter(
-          (r) => r.status === 'MANAGER_PENDING' || r.status === 'HR_PENDING' || r.status === 'RETURNED' || r.status === 'DRAFT'
+          (r) =>
+            r.status === 'MANAGER_PENDING' ||
+            r.status === 'HOD_PENDING' ||
+            r.status === 'HR_PENDING' ||
+            r.status === 'RETURNED' ||
+            r.status === 'DRAFT'
         );
       }
 
@@ -673,12 +683,17 @@ reviewRouter.post(
       if (departmentId && departmentId !== 'ALL') {
         employees = employees.filter((e) => e.departmentId === departmentId);
       }
-      if (cycleId && cycleId !== 'ALL') {
-        employees = employees.filter((e) => e.cycleId === cycleId);
-      }
-
       const allTemplates: KraTemplate[] = await (await tmplCol.find({})).toArray();
       const allCycles: Cycle[] = await (await cycleCol.find({})).toArray();
+
+      if (cycleId && cycleId !== 'ALL') {
+        const targetCycle = allCycles.find((c) => c.id === cycleId || c.code === cycleId);
+        employees = employees.filter(
+          (e) =>
+            e.cycleId === cycleId ||
+            (targetCycle && (e.cycleId === targetCycle.id || e.cycleCode === targetCycle.code))
+        );
+      }
       const existingReviews: EmployeeReview[] = await (await reviewCol.find({ reviewPeriodId })).toArray();
 
       let createdCount = 0;
@@ -812,6 +827,8 @@ reviewRouter.post(
           isAppraisalMonthDue,
           managerId: emp.managerId || emp.hodId || '',
           managerName: emp.managerName || emp.hodName || 'Unassigned Manager',
+          hodId: emp.hodId,
+          hodName: emp.hodName,
           status: 'MANAGER_PENDING',
           finalScore: 0,
           kraSnapshot,
@@ -962,13 +979,17 @@ reviewRouter.put(
     const isSubmitting = !isDraft;
 
     let newStatus: ReviewStatus = existing.status;
+    let submittedByManager = false;
     if (isSubmitting) {
       if (req.user?.role === 'HR' || req.user?.role === 'SUPER_ADMIN') {
         newStatus = 'HR_COMPLETED';
       } else {
-        newStatus = 'HR_PENDING';
+        // Manager submissions must pass through the mandatory HOD stage first.
+        newStatus = 'HOD_PENDING';
+        submittedByManager = true;
       }
     }
+    const managerSubmitHodMissing = submittedByManager && !existing.hodId;
 
     const userRole = req.user?.role || 'MANAGER';
     const userName = req.user?.name || (userRole === 'HOD' ? 'Department HOD' : userRole === 'HR' ? 'HR Administrator' : 'Manager');
@@ -977,11 +998,13 @@ reviewRouter.put(
     const action: ReviewAction = {
       id: `act_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       reviewId: id,
-      action: isSubmitting ? 'SUBMITTED' : 'DRAFT_SAVED',
+      action: managerSubmitHodMissing ? 'HOD_MISSING_EXCEPTION' : isSubmitting ? 'SUBMITTED' : 'DRAFT_SAVED',
       performedBy: req.user?.id || 'system',
       performedByName: userName,
       performedByRole: userRole,
-      remarks: isSubmitting
+      remarks: managerSubmitHodMissing
+        ? `${roleLabel} submitted evaluation scores with final weighted score: ${finalScore}. No HOD is configured for ${existing.employeeName} — review is blocked pending HOD assignment.`
+        : isSubmitting
         ? `${roleLabel} submitted evaluation scores with final weighted score: ${finalScore}`
         : 'Saved score and comment drafts',
       performedAt: new Date().toISOString(),
@@ -1025,25 +1048,47 @@ reviewRouter.put(
       const notifsCol = getDbCollection('notifications');
       const now = new Date().toISOString();
 
-      // Notify HR
-      await notifsCol.updateOne(
-        { 'metadata.reviewId': id, type: 'MANAGER_SUBMITTED', userRole: 'HR' },
-        {
-          $set: {
-            id: `notif_${id}_hr`,
-            userId: 'ALL',
-            userRole: 'HR',
-            type: 'MANAGER_SUBMITTED',
-            title: `Quarterly Review Scored: ${existing.employeeName}`,
-            message: `${req.user?.name || 'Manager'} submitted evaluation scores (${finalScore}) for ${existing.employeeName}. Ready for HR review.`,
-            isRead: false,
-            priority: 'MEDIUM',
-            metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: newStatus },
-            createdAt: now,
+      if (submittedByManager && managerSubmitHodMissing) {
+        // No HOD configured for this employee — alert HR instead of a non-existent HOD.
+        await notifsCol.updateOne(
+          { 'metadata.reviewId': id, type: 'HOD_MISSING_EXCEPTION', userRole: 'HR' },
+          {
+            $set: {
+              id: `notif_${id}_hod_missing`,
+              userId: 'ALL',
+              userRole: 'HR',
+              type: 'HOD_MISSING_EXCEPTION',
+              title: `Review Blocked: No HOD Configured for ${existing.employeeName}`,
+              message: `${req.user?.name || 'Manager'} submitted a review for ${existing.employeeName}, but no HOD is assigned to this employee. Assign an HOD to unblock the review.`,
+              isRead: false,
+              priority: 'HIGH',
+              metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: newStatus },
+              createdAt: now,
+            },
           },
-        },
-        { upsert: true }
-      );
+          { upsert: true }
+        );
+      } else if (submittedByManager) {
+        // Notify the assigned HOD
+        await notifsCol.updateOne(
+          { 'metadata.reviewId': id, type: 'HOD_PENDING', userId: existing.hodId },
+          {
+            $set: {
+              id: `notif_${id}_hod`,
+              userId: existing.hodId,
+              userRole: 'HOD',
+              type: 'HOD_PENDING',
+              title: `Review Ready for Your Approval: ${existing.employeeName}`,
+              message: `${req.user?.name || 'Manager'} submitted evaluation scores (${finalScore}) for ${existing.employeeName}. Ready for HOD review.`,
+              isRead: false,
+              priority: 'MEDIUM',
+              metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: newStatus },
+              createdAt: now,
+            },
+          },
+          { upsert: true }
+        );
+      }
 
       // Notify Employee
       await notifsCol.updateOne(
@@ -1102,14 +1147,19 @@ reviewRouter.put(
         return res.status(400).json({ error: 'Cannot modify a closed review.' });
       }
 
+      // NOTE: Quarterly Reviews must pass through the mandatory HOD_PENDING stage before
+      // reaching HR — non-Super-Admin HR can no longer jump Manager-stage statuses directly
+      // to HR_PENDING/HR_COMPLETED/CLOSED via this manual override tool. Super Admin bypasses
+      // this table entirely (see isSuperAdmin short-circuit below) and is unaffected.
       const allowedTransitions: Record<string, string[]> = {
-        DRAFT: ['ASSIGNED', 'MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED', 'HR_COMPLETED', 'CLOSED'],
-        ASSIGNED: ['MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED', 'HR_COMPLETED', 'CLOSED'],
-        MANAGER_PENDING: ['HR_PENDING', 'MANAGER_COMPLETED', 'HR_COMPLETED', 'CLOSED', 'RETURNED'],
-        MANAGER_COMPLETED: ['HR_PENDING', 'HR_COMPLETED', 'CLOSED', 'RETURNED'],
-        HR_PENDING: ['HR_COMPLETED', 'CLOSED', 'RETURNED', 'MANAGER_PENDING'],
-        HR_COMPLETED: ['CLOSED', 'RETURNED', 'HR_PENDING', 'MANAGER_PENDING'],
-        RETURNED: ['MANAGER_PENDING', 'HR_PENDING', 'MANAGER_COMPLETED', 'HR_COMPLETED', 'CLOSED'],
+        DRAFT: ['ASSIGNED', 'MANAGER_PENDING'],
+        ASSIGNED: ['MANAGER_PENDING'],
+        MANAGER_PENDING: ['HOD_PENDING', 'RETURNED'],
+        MANAGER_COMPLETED: ['HOD_PENDING', 'RETURNED'],
+        HOD_PENDING: ['HR_PENDING', 'MANAGER_PENDING'],
+        HR_PENDING: ['HR_COMPLETED', 'CLOSED', 'RETURNED', 'MANAGER_PENDING', 'HOD_PENDING'],
+        HR_COMPLETED: ['CLOSED', 'RETURNED', 'HR_PENDING'],
+        RETURNED: ['MANAGER_PENDING', 'HOD_PENDING'],
         CLOSED: ['HR_COMPLETED', 'HR_PENDING', 'MANAGER_PENDING'],
       };
 
@@ -1516,6 +1566,61 @@ reviewRouter.post(
         id: req.user!.id,
         name: req.user!.name,
         role: req.user!.role,
+      });
+
+      res.json(updated);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to return review.' });
+    }
+  }
+);
+
+/**
+ * POST /api/reviews/:id/hod-approve
+ * HOD approves the manager's assessment. Transitions: HOD_PENDING -> HR_PENDING
+ */
+reviewRouter.post(
+  '/reviews/:id/hod-approve',
+  authorizeReviewAccess('hod_approve'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const updated = await hodApproveReview(id, req.body.hodComments, {
+        id: req.user!.id,
+        name: req.user!.name,
+        role: req.user!.role,
+        employeeId: req.user!.employeeId,
+      });
+
+      res.json(updated);
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to approve review.' });
+    }
+  }
+);
+
+/**
+ * POST /api/reviews/:id/hod-return
+ * HOD returns the review to the reporting manager with a MANDATORY reason.
+ * Transitions: HOD_PENDING -> MANAGER_PENDING
+ */
+reviewRouter.post(
+  '/reviews/:id/hod-return',
+  authorizeReviewAccess('hod_return'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { id } = req.params;
+      const reason = req.body.reason || req.body.returnReason;
+
+      if (!reason || !reason.trim()) {
+        return res.status(400).json({ error: 'Return reason is mandatory. Please provide specific feedback.' });
+      }
+
+      const updated = await hodReturnReview(id, reason, {
+        id: req.user!.id,
+        name: req.user!.name,
+        role: req.user!.role,
+        employeeId: req.user!.employeeId,
       });
 
       res.json(updated);

@@ -8,7 +8,6 @@ import {
   HodCalibrationSchema,
   HrApprovalSchema,
   AcknowledgementSchema,
-  FinalizeAppraisalSchema,
 } from '../validation.js';
 import {
   Appraisal,
@@ -93,12 +92,12 @@ appraisalRouter.get(
       const appraisalsCol = getDbCollection('appraisals');
 
       const allCycles: Cycle[] = await (await cyclesCol.find({})).toArray();
-      // Filter cycles where appraisalMonth matches
-      const matchingCycles = allCycles.filter((c) => c.appraisalMonth === month && (!cycleId || c.id === cycleId));
+      // Filter active cycles where appraisalMonth matches
+      const matchingCycles = allCycles.filter((c) => c.active !== false && c.appraisalMonth === month && (!cycleId || c.id === cycleId));
       const matchingCycleIds = new Set(matchingCycles.map((c) => c.id));
       const matchingCycleCodes = new Set(matchingCycles.map((c) => c.code));
 
-      let activeEmployees: Employee[] = await (await employeesCol.find({ status: 'ACTIVE' })).toArray();
+      const activeEmployees: Employee[] = await (await employeesCol.find({ status: 'ACTIVE' })).toArray();
       // Filter employees assigned to these cycles
       let dueEmployees = activeEmployees.filter(
         (e) => (e.cycleId && matchingCycleIds.has(e.cycleId)) || (e.cycleCode && matchingCycleCodes.has(e.cycleCode))
@@ -444,7 +443,7 @@ appraisalRouter.get(
 /**
  * GET /api/appraisals/analytics/executive
  * Comprehensive Executive Dashboard data: Cross-department budget pools, Bell Curve Normalization curves,
- * attrition flight-risk retention analytics, and 8-Cycle execution benchmarks.
+ * attrition flight-risk retention analytics, and appraisal cycle execution benchmarks.
  */
 appraisalRouter.get(
   '/appraisals/analytics/executive',
@@ -463,7 +462,8 @@ appraisalRouter.get(
         (d) => d.active !== false && d.isActive !== false && d.status !== 'INACTIVE'
       );
       const allEmployees: Employee[] = await (await employeesCol.find({ status: { $ne: 'INACTIVE' } })).toArray();
-      const allCycles: Cycle[] = await (await cyclesCol.find({})).toArray();
+      const allCyclesRaw: Cycle[] = await (await cyclesCol.find({})).toArray();
+      const allCycles: Cycle[] = allCyclesRaw.filter((c) => c.active !== false);
 
       if (cycleId && cycleId !== 'ALL') {
         allAppraisals = allAppraisals.filter((a) => a.cycleId === cycleId);
@@ -687,7 +687,7 @@ appraisalRouter.get(
         }
       });
 
-      // 8-Cycle Progress Comparison
+      // Appraisal Cycle Progress Comparison
       const cycleProgressComparison = allCycles.map((c) => {
         const monthNames = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'];
         const cycleAppraisals = allAppraisals.filter((a) => a.cycleId === c.id || a.cycleCode === c.code);
@@ -814,7 +814,7 @@ appraisalRouter.get('/appraisals/:id', async (req: AuthenticatedRequest, res: Re
 
 /**
  * POST /api/appraisals/initiate-cycle
- * Batch roll up 4-quarter reviews and initiate annual appraisals for an 8-Cycle cohort (Super Admin & HR only)
+ * Batch roll up 4-quarter reviews and initiate annual appraisals for an appraisal cycle cohort (Super Admin & HR only)
  */
 appraisalRouter.post(
   '/appraisals/initiate-cycle',
@@ -840,7 +840,12 @@ appraisalRouter.post(
       const auditLogsCol = getDbCollection('auditLogs');
       const notificationsCol = getDbCollection('notifications');
 
-      const eligibleEmployees: Employee[] = await (await employeesCol.find({ cycleId, status: { $ne: 'INACTIVE' } })).toArray();
+      const eligibleEmployees: Employee[] = await (
+        await employeesCol.find({
+          $or: [{ cycleId: cycle.id }, { cycleCode: cycle.code }],
+          status: { $ne: 'INACTIVE' },
+        })
+      ).toArray();
 
       if (eligibleEmployees.length === 0) {
         return res.status(400).json({ error: `No active employees found assigned to ${cycle.name}` });
@@ -997,7 +1002,7 @@ appraisalRouter.post(
  */
 appraisalRouter.put(
   '/appraisals/:id/manager-recommend',
-  requireRoles('REPORTING_MANAGER', 'MANAGER', 'SUPER_ADMIN', 'HR'),
+  requireRoles('REPORTING_MANAGER', 'MANAGER', 'SUPER_ADMIN'),
   validateBody(ManagerRecommendationSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
@@ -1021,6 +1026,13 @@ appraisalRouter.put(
 
       if (appraisal.isLocked) {
         return res.status(400).json({ error: 'Cannot modify a locked appraisal record' });
+      }
+
+      // Mandatory-stage guard: manager can only submit/revise before HOD has calibrated
+      if (!['PENDING', 'MANAGER_RECOMMENDED'].includes(appraisal.status)) {
+        return res.status(400).json({
+          error: `Cannot submit manager recommendation in status "${appraisal.status}". Must be PENDING or MANAGER_RECOMMENDED.`,
+        });
       }
 
       // Safeguard: Check employee status
@@ -1071,26 +1083,49 @@ appraisalRouter.put(
 
       await appraisalsCol.updateOne({ id }, { $set: updatedDoc });
 
-      // Notify HOD
+      const hodMissing = !appraisal.hodId;
+
+      // Notify HOD, or HR if no HOD is configured for this employee (missing-HOD exception)
       const notifsCol = getDbCollection('notifications');
-      await notifsCol.updateOne(
-        { 'metadata.appraisalId': id, type: 'HOD_ACTION_REQUIRED' },
-        {
-          $set: {
-            id: `notif_${id}_hod`,
-            userId: appraisal.hodId || undefined,
-            userRole: 'HOD',
-            type: 'HOD_ACTION_REQUIRED',
-            title: `Manager Appraisal Submitted: ${appraisal.employeeName}`,
-            message: `${user?.name || 'Manager'} submitted recommendation (${incPercent}% increment${promotionRecommended ? ' + Promotion' : ''}) for ${appraisal.employeeName}. Ready for HOD calibration.`,
-            isRead: false,
-            priority: 'HIGH',
-            metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals' },
-            createdAt: new Date().toISOString(),
+      if (hodMissing) {
+        await notifsCol.updateOne(
+          { 'metadata.appraisalId': id, type: 'APPRAISAL_HOD_MISSING_EXCEPTION' },
+          {
+            $set: {
+              id: `notif_${id}_hod_missing`,
+              userId: 'ALL',
+              userRole: 'HR',
+              type: 'APPRAISAL_HOD_MISSING_EXCEPTION',
+              title: `Action Required: No HOD Assigned - ${appraisal.employeeName}`,
+              message: `Manager recommendation submitted for ${appraisal.employeeName}, but no HOD is configured for this employee. Assign an HOD via Employee Master to unblock calibration.`,
+              isRead: false,
+              priority: 'HIGH',
+              metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals' },
+              createdAt: new Date().toISOString(),
+            },
           },
-        },
-        { upsert: true }
-      );
+          { upsert: true }
+        );
+      } else {
+        await notifsCol.updateOne(
+          { 'metadata.appraisalId': id, type: 'HOD_ACTION_REQUIRED' },
+          {
+            $set: {
+              id: `notif_${id}_hod`,
+              userId: appraisal.hodId,
+              userRole: 'HOD',
+              type: 'HOD_ACTION_REQUIRED',
+              title: `Manager Appraisal Submitted: ${appraisal.employeeName}`,
+              message: `${user?.name || 'Manager'} submitted recommendation (${incPercent}% increment${promotionRecommended ? ' + Promotion' : ''}) for ${appraisal.employeeName}. Ready for HOD calibration.`,
+              isRead: false,
+              priority: 'HIGH',
+              metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals' },
+              createdAt: new Date().toISOString(),
+            },
+          },
+          { upsert: true }
+        );
+      }
 
       // Audit log
       if (user) {
@@ -1099,7 +1134,7 @@ appraisalRouter.put(
           user.name,
           user.role,
           'APPRAISAL_CALIBRATION',
-          'MANAGER_RECOMMENDATION_SUBMITTED',
+          hodMissing ? 'MANAGER_RECOMMENDATION_SUBMITTED_HOD_MISSING' : 'MANAGER_RECOMMENDATION_SUBMITTED',
           id,
           String(appraisal.proposedIncrementPercentage || 0),
           `Suggested ${incPercent}% increment, Promotion: ${promotionRecommended ? 'YES' : 'NO'}`,
@@ -1123,7 +1158,7 @@ appraisalRouter.put(
  */
 appraisalRouter.put(
   '/appraisals/:id/hod-calibrate',
-  requireRoles('SUPER_ADMIN', 'HR', 'HOD'),
+  requireRoles('SUPER_ADMIN', 'HOD'),
   validateBody(HodCalibrationSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
@@ -1138,18 +1173,21 @@ appraisalRouter.put(
         return res.status(404).json({ error: 'Appraisal record not found' });
       }
 
-      // HOD Department Verification (Must precede all state and status checks to enforce strict department boundary)
-      if (user?.role === 'HOD') {
-        const isDeptMatch =
-          (req.employeeProfile?.departmentId && appraisal.departmentId === req.employeeProfile.departmentId) ||
-          (req.employeeProfile?.departmentName && appraisal.departmentName?.toLowerCase() === req.employeeProfile.departmentName.toLowerCase());
-        if (appraisal.hodId !== user.employeeId && !isDeptMatch) {
-          return res.status(403).json({ error: 'Unauthorized: You can only calibrate appraisals within your department.' });
-        }
+      // Strict HOD ownership: only the employee's actually-configured HOD may calibrate,
+      // not any HOD-role user in the department (SUPER_ADMIN bypasses).
+      if (user?.role === 'HOD' && appraisal.hodId !== user.employeeId) {
+        return res.status(403).json({ error: 'Unauthorized: Only the designated HOD or Super Admin can calibrate this appraisal.' });
       }
 
       if (appraisal.isLocked) {
         return res.status(400).json({ error: 'Cannot modify a locked appraisal record' });
+      }
+
+      // Mandatory-stage guard: HOD can only calibrate after the manager has submitted a recommendation
+      if (!['MANAGER_RECOMMENDED', 'HOD_CALIBRATED'].includes(appraisal.status)) {
+        return res.status(400).json({
+          error: `Cannot calibrate appraisal in status "${appraisal.status}". Must be MANAGER_RECOMMENDED or HOD_CALIBRATED.`,
+        });
       }
 
       // Safeguard: Check employee status
@@ -1257,6 +1295,17 @@ appraisalRouter.put(
         return res.status(404).json({ error: 'Appraisal record not found' });
       }
 
+      if (appraisal.isLocked) {
+        return res.status(400).json({ error: 'Cannot modify a locked appraisal record' });
+      }
+
+      // Mandatory-stage guard: HR cannot approve until HOD calibration is complete
+      if (!['HOD_CALIBRATED', 'HR_APPROVED'].includes(appraisal.status)) {
+        return res.status(400).json({
+          error: `Cannot approve appraisal in status "${appraisal.status}". HOD calibration must be completed first.`,
+        });
+      }
+
       // Safeguard: Check employee status
       const employeesCol = getDbCollection('employees');
       const empRecord = await employeesCol.findOne({ id: appraisal.employeeId });
@@ -1349,7 +1398,7 @@ appraisalRouter.put(
  */
 appraisalRouter.put(
   '/appraisals/:id/lock',
-  requireRoles('HR', 'SUPER_ADMIN'),
+  requireRoles('SUPER_ADMIN'),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const user = req.user;
@@ -1362,6 +1411,30 @@ appraisalRouter.put(
         return res.status(404).json({ error: 'Appraisal record not found' });
       }
 
+      if (appraisal.isLocked) {
+        return res.status(400).json({ error: 'Appraisal is already locked.' });
+      }
+
+      // Mandatory-stage guard: only lock once HR has given final approval
+      if (appraisal.status !== 'HR_APPROVED') {
+        return res.status(400).json({
+          error: `Cannot lock appraisal in status "${appraisal.status}". Must be HR_APPROVED.`,
+        });
+      }
+
+      // Pre-flight check: block lock while the employee has unfinalized/pending quarterly reviews
+      const reviewsCol = getDbCollection('employeeReviews');
+      const pendingReviews = await (await reviewsCol.find({
+        employeeId: appraisal.employeeId,
+        status: { $in: ['DRAFT', 'ASSIGNED', 'MANAGER_PENDING', 'RETURNED'] },
+      })).toArray();
+
+      if (pendingReviews.length > 0) {
+        return res.status(400).json({
+          error: `Cannot lock appraisal: Employee has ${pendingReviews.length} quarterly review(s) still pending completion/evaluation.`,
+        });
+      }
+
       const lockedAt = new Date().toISOString();
       await appraisalsCol.updateOne(
         { id },
@@ -1370,6 +1443,8 @@ appraisalRouter.put(
             status: 'LOCKED',
             isLocked: true,
             lockedAt,
+            lockedById: user?.id || user?.employeeId || '',
+            lockedByName: user?.name || 'Super Admin',
             updatedAt: lockedAt,
           },
         }
@@ -1649,105 +1724,3 @@ appraisalRouter.put(
   }
 });
 
-/**
- * POST /api/appraisals/:id/finalize
- * Section 29: Finalizes and locks the annual salary appraisal.
- * Applies the revised compensation to the employee profile and emits notifications.
- * Super Admin & HR only.
- */
-appraisalRouter.post(
-  '/appraisals/:id/finalize',
-  requireRoles('SUPER_ADMIN', 'HR'),
-  validateBody(FinalizeAppraisalSchema),
-  async (req: AuthenticatedRequest, res: Response) => {
-    try {
-      const { id } = req.params;
-      const { remarks, updateEmployeeCtc = true } = req.body;
-
-      const appraisalsCol = getDbCollection('appraisals');
-      const appraisal: Appraisal | null = await appraisalsCol.findOne({ id });
-
-      if (!appraisal) {
-        return res.status(404).json({ error: 'Appraisal record not found.' });
-      }
-
-      if (appraisal.isLocked || appraisal.status === 'LOCKED') {
-        return res.status(400).json({ error: 'This appraisal is already finalized and locked.' });
-      }
-
-      // Pre-flight check: ensure employee has no unfinalized / pending reviews in active cycles
-      const reviewsCol = getDbCollection('employeeReviews');
-      const pendingReviews = await (await reviewsCol.find({
-        employeeId: appraisal.employeeId,
-        status: { $in: ['DRAFT', 'ASSIGNED', 'MANAGER_PENDING', 'RETURNED'] },
-      })).toArray();
-
-      if (pendingReviews.length > 0) {
-        return res.status(400).json({
-          error: `Cannot finalize appraisal: Employee has ${pendingReviews.length} quarterly review(s) still pending completion/evaluation.`,
-        });
-      }
-
-      const now = new Date().toISOString();
-      const updatedAppraisal: Appraisal = {
-        ...appraisal,
-        status: 'LOCKED',
-        isLocked: true,
-        finalizedAt: now,
-        lockedAt: now,
-        updatedAt: now,
-      };
-
-      await appraisalsCol.updateOne({ id }, { $set: updatedAppraisal });
-
-      // Update employee's currentCtc in employees collection if revisedCtc exists
-      if (updateEmployeeCtc && appraisal.revisedCtc && appraisal.employeeId) {
-        const employeesCol = getDbCollection('employees');
-        await employeesCol.updateOne(
-          { id: appraisal.employeeId },
-          {
-            $set: {
-              currentCtc: appraisal.revisedCtc,
-              updatedAt: now,
-            },
-          }
-        );
-      }
-
-      // Record Audit Log
-      await recordAuditLog(
-        req.user!.id,
-        req.user!.name,
-        req.user!.role,
-        'ANNUAL_APPRAISAL',
-        'APPRAISAL_FINALIZED',
-        id,
-        appraisal.status,
-        'LOCKED',
-        remarks || `Appraisal permanently finalized. Revised CTC: ₹${appraisal.revisedCtc?.toLocaleString() || appraisal.currentCtc?.toLocaleString()}`
-      );
-
-      // Notify Employee
-      const notifCol = getDbCollection('notifications');
-      await notifCol.insertOne({
-        id: `notif_${id}_finalized_${Date.now()}`,
-        userId: appraisal.employeeId,
-        userRole: 'EMPLOYEE',
-        type: 'LETTER_RELEASED',
-        title: `Appraisal Finalized: ${appraisal.cycleName}`,
-        message: `Your annual appraisal for ${appraisal.cycleName} has been officially approved and finalized.`,
-        isRead: false,
-        priority: 'HIGH',
-        metadata: { appraisalId: id, cycleId: appraisal.cycleId },
-        createdAt: now,
-      });
-
-      console.log(`[Appraisal] Finalized: ${id} for "${appraisal.employeeName}" (${appraisal.employeeCode}) by "${req.user?.name}" [${req.user?.role}]`);
-
-      res.json(updatedAppraisal);
-    } catch (err: any) {
-      console.error('Error in POST /api/appraisals/:id/finalize:', err);
-      res.status(500).json({ error: 'Failed to finalize appraisal: ' + (err.message || '') });
-    }
-  }
-);

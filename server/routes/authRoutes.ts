@@ -282,7 +282,7 @@ authRouter.post('/switch-role', async (req: Request, res: Response) => {
     const roleNormalized = typeof role === 'string' ? role.trim().toUpperCase() : '';
     const cleaned = roleNormalized.replace(/[\s\-_]+/g, '');
     let targetRole: UserRole | string = roleNormalized;
-    let targetEmail: string | null = null;
+    const targetEmail: string | null = null;
 
     if (['ADMIN', 'SUPERADMIN', 'SYSTEMADMIN'].includes(cleaned)) {
       targetRole = 'SUPER_ADMIN';

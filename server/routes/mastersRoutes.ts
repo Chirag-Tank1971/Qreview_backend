@@ -9,6 +9,7 @@ import {
   authorizeEmployeeAccess,
   invalidateAuthCache,
   revokeUserSessions,
+  generateTempPassword,
 } from '../auth.js';
 import { Employee, Department, Designation, Cycle, User, UserRole } from '../../src/types/index.js';
 import { syncEmployeeAppraisalsAndReviews } from '../syncHelpers.js';
@@ -323,7 +324,7 @@ mastersRouter.delete('/designations/:id', requireRoles('SUPER_ADMIN', 'HR'), asy
 });
 
 // ==========================================
-// 3. CYCLES (8-Cycle Framework)
+// 3. CYCLES (Appraisal Cycle Framework: June/September)
 // ==========================================
 
 /**
@@ -332,7 +333,8 @@ mastersRouter.delete('/designations/:id', requireRoles('SUPER_ADMIN', 'HR'), asy
 mastersRouter.get('/cycles', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const cyclesCol = getDbCollection('cycles');
-    const cycles = await (await cyclesCol.find({})).toArray();
+    const filter = req.query.includeInactive === 'true' ? {} : { active: { $ne: false } };
+    const cycles = await (await cyclesCol.find(filter)).toArray();
     res.json(cycles);
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to fetch appraisal cycles.' });
@@ -509,7 +511,7 @@ mastersRouter.get('/employees/:id', authorizeEmployeeAccess('id'), async (req: A
 
 /**
  * POST /api/employees
- * Admin/HR creates employee and assigns Manager, HOD, 8-Cycle cohort, KRA Template, CTC, and User Account
+ * Admin/HR creates employee and assigns Manager, HOD, appraisal cycle cohort, KRA Template, CTC, and User Account
  */
 mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
   try {
@@ -527,6 +529,7 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       managerId,
       hodId,
       cycleId,
+      startingReviewPeriodId,
       currentKraTemplateId,
       status,
       currentCtc,
@@ -536,9 +539,9 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       initialPassword,
     } = req.body;
 
-    if (!employeeCode || !name || !email || !departmentId || !designationId || !joiningDate || !cycleId || !managerId || !hodId) {
+    if (!employeeCode || !name || !email || !departmentId || !designationId || !joiningDate || !cycleId || !hodId || !startingReviewPeriodId) {
       return res.status(400).json({
-        error: 'Required fields missing: employeeCode, name, email, departmentId, designationId, joiningDate, cycleId, managerId, hodId',
+        error: 'Required fields missing: employeeCode, name, email, departmentId, designationId, joiningDate, cycleId, hodId, startingReviewPeriodId',
       });
     }
 
@@ -557,24 +560,50 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
     const desCol = getDbCollection('designations');
     const cyclesCol = getDbCollection('cycles');
 
+    const des = await desCol.findOne({ id: designationId });
+    const isTargetHod =
+      systemRole === 'HOD' ||
+      Boolean(des && (des.level >= 4 || des.name?.toLowerCase().includes('vp') || des.name?.toLowerCase().includes('head')));
+    const isTargetManager =
+      systemRole === 'MANAGER' ||
+      Boolean(des && (des.level >= 3 || des.name?.toLowerCase().includes('manager') || des.name?.toLowerCase().includes('lead')));
+
     // Validate Reporting Manager & HOD
-    const mgr = await empCol.findOne({ id: managerId });
-    if (!mgr) {
-      return res.status(400).json({ error: 'Selected Reporting Manager was not found in the employee directory.' });
-    }
-    const allDepts = await (await deptCol.find({})).toArray();
-    const deptHodIds = new Set(allDepts.map((d: any) => d.hodId).filter(Boolean));
-    if (deptHodIds.has(managerId) || mgr.systemRole === 'HOD') {
+    let managerName: string | undefined;
+    if (managerId) {
+      const mgr = await empCol.findOne({ id: managerId });
+      if (!mgr) {
+        return res.status(400).json({ error: 'Selected Reporting Manager was not found in the employee directory.' });
+      }
+      const allDepts = await (await deptCol.find({})).toArray();
+      const deptHodIds = new Set(allDepts.map((d: any) => d.hodId).filter(Boolean));
+      const isMgrHod = deptHodIds.has(managerId) || mgr.systemRole === 'HOD';
+
+      // Managers and HODs can report to HODs. For individual contributors, only restrict if departmental managers exist.
+      if (isMgrHod && !isTargetHod && !isTargetManager) {
+        const otherMgrs = await empCol.find({
+          departmentId,
+          id: { $ne: managerId },
+          status: { $ne: 'INACTIVE' },
+          systemRole: { $in: ['MANAGER', 'REPORTING_MANAGER'] },
+        }).toArray();
+        if (otherMgrs.length > 0) {
+          return res.status(400).json({
+            error: 'An HOD cannot be assigned as an L1 Reporting Manager for individual contributors when departmental managers exist. Please select a departmental reporting manager.',
+          });
+        }
+      }
+      if (mgr.departmentId !== departmentId && !isTargetHod) {
+        return res.status(400).json({
+          error: 'Reporting Manager must belong to the same department as the employee.',
+        });
+      }
+      managerName = mgr.name;
+    } else if (!isTargetHod && status !== 'INACTIVE') {
       return res.status(400).json({
-        error: 'An HOD cannot be assigned as an L1 Reporting Manager. Please select a departmental reporting manager.',
+        error: 'Reporting Manager is required. Self-managed employees are not permitted.',
       });
     }
-    if (mgr.departmentId !== departmentId) {
-      return res.status(400).json({
-        error: 'Reporting Manager must belong to the same department as the employee.',
-      });
-    }
-    const managerName = mgr.name;
 
     const hod = await empCol.findOne({ id: hodId });
     if (!hod) {
@@ -623,8 +652,8 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
 
     // Fetch related names
     const dept = await deptCol.findOne({ id: departmentId });
-    const des = await desCol.findOne({ id: designationId });
     const cycle = await cyclesCol.findOne({ id: cycleId });
+    const startingPeriod = await getDbCollection('reviewPeriods').findOne({ id: startingReviewPeriodId });
 
     const exitDate = relievingDate || pastEmployeeDate || (status === 'INACTIVE' ? new Date().toISOString() : undefined);
 
@@ -645,9 +674,11 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       hodId: hodId || undefined,
       hodName,
       cycleId,
-      cycleCode: cycle?.code || 'A',
-      cycleName: cycle?.name || 'Cycle A',
-      cycleColor: cycle?.colorHex || '#1e3a8a',
+      cycleCode: cycle?.code || 'N/A',
+      cycleName: cycle?.name || 'Unassigned',
+      cycleColor: cycle?.colorHex || '#64748b',
+      startingReviewPeriodId,
+      startingReviewPeriodName: startingPeriod?.name || undefined,
       currentKraTemplateId: currentKraTemplateId || undefined,
       currentCtc: numericCtc,
       currency: currency || '₹',
@@ -683,7 +714,7 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
           const tempPassword =
             initialPassword && initialPassword.trim().length >= 6
               ? initialPassword.trim()
-              : `Welcome@${new Date().getFullYear()}`;
+              : generateTempPassword();
           const defaultHash = bcrypt.hashSync(tempPassword, 10);
 
           await usersCol.insertOne({
@@ -803,6 +834,7 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       managerId,
       hodId,
       cycleId,
+      startingReviewPeriodId,
       currentKraTemplateId,
       status,
       currentCtc,
@@ -898,8 +930,24 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       }
     }
 
+    if (startingReviewPeriodId !== undefined) {
+      updateData.startingReviewPeriodId = startingReviewPeriodId;
+      const startingPeriod = await getDbCollection('reviewPeriods').findOne({ id: startingReviewPeriodId });
+      updateData.startingReviewPeriodName = startingPeriod?.name || undefined;
+    }
+
+    const targetDesId = designationId || emp.designationId;
+    const currentDes = targetDesId ? await desCol.findOne({ id: targetDesId }) : null;
+    const effectiveRole = systemRole || emp.systemRole;
+    const isTargetHod =
+      effectiveRole === 'HOD' ||
+      Boolean(currentDes && (currentDes.level >= 4 || currentDes.name?.toLowerCase().includes('vp') || currentDes.name?.toLowerCase().includes('head')));
+    const isTargetManager =
+      effectiveRole === 'MANAGER' ||
+      Boolean(currentDes && (currentDes.level >= 3 || currentDes.name?.toLowerCase().includes('manager') || currentDes.name?.toLowerCase().includes('lead')));
+
     if (managerId !== undefined) {
-      if (!managerId && status !== 'INACTIVE' && emp.status !== 'INACTIVE') {
+      if (!managerId && !isTargetHod && status !== 'INACTIVE' && emp.status !== 'INACTIVE') {
         return res.status(400).json({ error: 'Reporting Manager is required. Self-managed employees are not permitted.' });
       }
       if (managerId) {
@@ -909,13 +957,25 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
         }
         const allDepts = await (await deptCol.find({})).toArray();
         const deptHodIds = new Set(allDepts.map((d: any) => d.hodId).filter(Boolean));
-        if (deptHodIds.has(managerId) || mgr.systemRole === 'HOD') {
-          return res.status(400).json({
-            error: 'An HOD cannot be assigned as an L1 Reporting Manager. Please select a departmental reporting manager.',
-          });
+        const isMgrHod = deptHodIds.has(managerId) || mgr.systemRole === 'HOD';
+
+        // Managers and HODs can report to HODs. For individual contributors, only restrict if departmental managers exist.
+        if (isMgrHod && !isTargetHod && !isTargetManager) {
+          const targetDept = departmentId || emp.departmentId;
+          const otherMgrs = await empCol.find({
+            departmentId: targetDept,
+            id: { $ne: managerId },
+            status: { $ne: 'INACTIVE' },
+            systemRole: { $in: ['MANAGER', 'REPORTING_MANAGER'] },
+          }).toArray();
+          if (otherMgrs.length > 0) {
+            return res.status(400).json({
+              error: 'An HOD cannot be assigned as an L1 Reporting Manager for individual contributors when departmental managers exist. Please select a departmental reporting manager.',
+            });
+          }
         }
         const targetDeptId = departmentId || emp.departmentId;
-        if (mgr.departmentId !== targetDeptId) {
+        if (mgr.departmentId !== targetDeptId && !isTargetHod) {
           return res.status(400).json({
             error: 'Reporting Manager must belong to the same department as the employee.',
           });
@@ -992,7 +1052,7 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
           const tempPassword =
             initialPassword && initialPassword.trim().length >= 6
               ? initialPassword.trim()
-              : `Welcome@${new Date().getFullYear()}`;
+              : generateTempPassword();
           const defaultHash = bcrypt.hashSync(tempPassword, 10);
 
           await usersCol.insertOne({

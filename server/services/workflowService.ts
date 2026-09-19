@@ -283,6 +283,39 @@ export function calculateWeightedScore(kraSnapshot: ReviewKraSnapshot[]): number
 }
 
 /**
+ * Merges incoming KRA rating/comment fields onto the existing review's KRA snapshot,
+ * matching entries by id, kraId, kraName, or title. Shared by saveManagerDraft and
+ * submitManagerReview so both stay in sync.
+ */
+export function mergeKraSnapshot(
+  existingSnapshot: ReviewKraSnapshot[] | undefined,
+  incomingKras: any[] | undefined
+): ReviewKraSnapshot[] {
+  const base = existingSnapshot || [];
+  if (!incomingKras || !Array.isArray(incomingKras)) return base;
+
+  return base.map((existingKra) => {
+    const incoming = incomingKras.find(
+      (k: any) =>
+        k.id === existingKra.id ||
+        k.kraId === existingKra.kraId ||
+        k.kraName === existingKra.kraName ||
+        k.title === existingKra.title
+    );
+    if (incoming) {
+      return {
+        ...existingKra,
+        rating: Number(incoming.rating) || 0,
+        achievement: incoming.achievement || '',
+        comments: incoming.comments || '',
+        issueReason: incoming.issueReason || '',
+      };
+    }
+    return existingKra;
+  });
+}
+
+/**
  * Manager saves draft of review
  */
 export async function saveManagerDraft(
@@ -317,25 +350,7 @@ export async function saveManagerDraft(
 
   const incomingKras = payload.kraSnapshot || payload.kraRatings;
   if (incomingKras && Array.isArray(incomingKras)) {
-    updatedSnapshot = (review.kraSnapshot || []).map((existingKra) => {
-      const incoming = incomingKras.find(
-        (k: any) =>
-          k.id === existingKra.id ||
-          k.kraId === existingKra.kraId ||
-          k.kraName === existingKra.kraName ||
-          k.title === existingKra.title
-      );
-      if (incoming) {
-        return {
-          ...existingKra,
-          rating: Number(incoming.rating) || 0,
-          achievement: incoming.achievement || '',
-          comments: incoming.comments || '',
-          issueReason: incoming.issueReason || '',
-        };
-      }
-      return existingKra;
-    });
+    updatedSnapshot = mergeKraSnapshot(review.kraSnapshot, incomingKras);
     finalScore = calculateWeightedScore(updatedSnapshot);
   }
 
@@ -414,25 +429,7 @@ export async function submitManagerReview(
   let updatedSnapshot = review.kraSnapshot || [];
   const incomingKras = payload.kraSnapshot || payload.kraRatings;
   if (incomingKras && Array.isArray(incomingKras)) {
-    updatedSnapshot = (review.kraSnapshot || []).map((existingKra) => {
-      const incoming = incomingKras.find(
-        (k: any) =>
-          k.id === existingKra.id ||
-          k.kraId === existingKra.kraId ||
-          k.kraName === existingKra.kraName ||
-          k.title === existingKra.title
-      );
-      if (incoming) {
-        return {
-          ...existingKra,
-          rating: Number(incoming.rating) || 0,
-          achievement: incoming.achievement || '',
-          comments: incoming.comments || '',
-          issueReason: incoming.issueReason || '',
-        };
-      }
-      return existingKra;
-    });
+    updatedSnapshot = mergeKraSnapshot(review.kraSnapshot, incomingKras);
   }
 
   // Strict Validation: ratings must be between 1 and 5
@@ -445,16 +442,19 @@ export async function submitManagerReview(
   const finalScore = calculateWeightedScore(updatedSnapshot);
   const now = new Date().toISOString();
 
-  const nextStatus: ReviewStatus = 'HR_PENDING';
+  const nextStatus: ReviewStatus = 'HOD_PENDING';
+  const hodMissing = !review.hodId;
 
   const action: ReviewAction = {
     id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
     reviewId,
-    action: 'SUBMITTED',
+    action: hodMissing ? 'HOD_MISSING_EXCEPTION' : 'SUBMITTED',
     performedBy: user.id,
     performedByName: user.name,
     performedByRole: user.role,
-    remarks: `Reporting manager submitted review with final weighted score ${finalScore}. Transitioned to ${nextStatus}.`,
+    remarks: hodMissing
+      ? `Reporting manager submitted review with final weighted score ${finalScore}. No HOD is configured for ${review.employeeName} — review is blocked pending HOD assignment.`
+      : `Reporting manager submitted review with final weighted score ${finalScore}. Transitioned to ${nextStatus}.`,
     performedAt: now,
   };
 
@@ -474,7 +474,7 @@ export async function submitManagerReview(
 
   await reviewCol.updateOne({ id: reviewId }, { $set: updated });
 
-  // Notify HR and auto-resolve previous return/assignment notifications
+  // Notify HOD (or HR, if no HOD is configured) and auto-resolve previous return/assignment notifications
   const notifCol = getDbCollection('notifications');
   await notifCol.updateMany(
     {
@@ -484,13 +484,106 @@ export async function submitManagerReview(
     },
     { $set: { isRead: true } }
   );
+  if (hodMissing) {
+    await notifCol.insertOne({
+      id: `notif_${reviewId}_hod_missing_${Date.now()}`,
+      userId: 'ALL',
+      userRole: 'HR',
+      type: 'HOD_MISSING_EXCEPTION',
+      title: `Review Blocked: No HOD Configured for ${review.employeeName}`,
+      message: `${user.name} submitted a review for ${review.employeeName}, but no HOD is assigned to this employee. Assign an HOD to unblock the review.`,
+      isRead: false,
+      priority: 'HIGH',
+      metadata: { reviewId, periodId: review.reviewPeriodId, status: nextStatus },
+      createdAt: now,
+    });
+  } else {
+    await notifCol.insertOne({
+      id: `notif_${reviewId}_hod_pending_${Date.now()}`,
+      userId: review.hodId,
+      userRole: 'HOD',
+      type: 'HOD_PENDING',
+      title: `Review Ready for Your Approval: ${review.employeeName}`,
+      message: `${user.name} submitted performance review for ${review.employeeName} (${review.reviewPeriodName}) with score ${finalScore}.`,
+      isRead: false,
+      priority: 'HIGH',
+      metadata: { reviewId, periodId: review.reviewPeriodId, status: nextStatus },
+      createdAt: now,
+    });
+  }
+
+  await recordAuditLog(
+    user.id,
+    user.name,
+    user.role,
+    'EMPLOYEE_REVIEWS',
+    hodMissing ? 'REVIEW_HOD_MISSING_EXCEPTION' : 'REVIEW_SUBMITTED',
+    reviewId,
+    review.status,
+    nextStatus,
+    hodMissing
+      ? `Review submitted for ${review.employeeName} but blocked: no HOD configured.`
+      : `Submitted review for ${review.employeeName} with final score: ${finalScore}`
+  );
+
+  return updated;
+}
+
+/**
+ * HOD approves the manager's assessment
+ * Transitions: HOD_PENDING -> HR_PENDING
+ */
+export async function hodApproveReview(
+  reviewId: string,
+  hodComments: string | undefined,
+  user: { id: string; name: string; role: any; employeeId?: string }
+): Promise<EmployeeReview> {
+  if (user.role !== 'SUPER_ADMIN' && user.role !== 'HOD') {
+    throw new Error('Forbidden: Only the designated HOD or Super Admin can approve a review.');
+  }
+
+  const reviewCol = getDbCollection('employeeReviews');
+  const review: EmployeeReview | null = await reviewCol.findOne({ id: reviewId });
+  if (!review) {
+    throw new Error('Review not found.');
+  }
+  if (review.isClosed) {
+    throw new Error('Cannot approve a closed review.');
+  }
+
+  const now = new Date().toISOString();
+  const action: ReviewAction = {
+    id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    reviewId,
+    action: 'HOD_APPROVED',
+    performedBy: user.id,
+    performedByName: user.name,
+    performedByRole: user.role,
+    remarks: hodComments ? `Approved by HOD: ${hodComments}` : 'Approved by HOD.',
+    performedAt: now,
+  };
+
+  const updated: EmployeeReview = {
+    ...review,
+    status: 'HR_PENDING',
+    actionHistory: [...(review.actionHistory || []), action],
+    updatedAt: now,
+  };
+
+  await reviewCol.updateOne({ id: reviewId }, { $set: updated });
+
+  const notifCol = getDbCollection('notifications');
+  await notifCol.updateMany(
+    { 'metadata.reviewId': reviewId, type: 'HOD_PENDING', isRead: false },
+    { $set: { isRead: true } }
+  );
   await notifCol.insertOne({
-    id: `notif_${reviewId}_hr_pending_${Date.now()}`,
+    id: `notif_${reviewId}_hod_approved_${Date.now()}`,
     userId: 'ALL',
     userRole: 'HR',
-    type: 'MANAGER_SUBMITTED',
+    type: 'HOD_APPROVED',
     title: `Review Ready for HR Approval: ${review.employeeName}`,
-    message: `${user.name} submitted performance review for ${review.employeeName} (${review.reviewPeriodName}) with score ${finalScore}.`,
+    message: `${user.name} (HOD) approved the performance review for ${review.employeeName} (${review.reviewPeriodName}).`,
     isRead: false,
     priority: 'HIGH',
     metadata: { reviewId, periodId: review.reviewPeriodId, status: 'HR_PENDING' },
@@ -502,11 +595,95 @@ export async function submitManagerReview(
     user.name,
     user.role,
     'EMPLOYEE_REVIEWS',
-    'REVIEW_SUBMITTED',
+    'REVIEW_HOD_APPROVED',
     reviewId,
-    review.status,
-    nextStatus,
-    `Submitted review for ${review.employeeName} with final score: ${finalScore}`
+    'HOD_PENDING',
+    'HR_PENDING',
+    `HOD approved review for ${review.employeeName}.${hodComments ? ` Comments: ${hodComments}` : ''}`
+  );
+
+  return updated;
+}
+
+/**
+ * HOD returns review to the reporting manager for correction
+ * STRICT RULE: Return reason is MANDATORY
+ * Transitions: HOD_PENDING -> MANAGER_PENDING
+ */
+export async function hodReturnReview(
+  reviewId: string,
+  reason: string,
+  user: { id: string; name: string; role: any; employeeId?: string }
+): Promise<EmployeeReview> {
+  if (user.role !== 'SUPER_ADMIN' && user.role !== 'HOD') {
+    throw new Error('Forbidden: Only the designated HOD or Super Admin can return a review.');
+  }
+
+  if (!reason || !reason.trim()) {
+    throw new Error('Return reason is mandatory. Please provide specific feedback for the manager.');
+  }
+
+  const reviewCol = getDbCollection('employeeReviews');
+  const review: EmployeeReview | null = await reviewCol.findOne({ id: reviewId });
+  if (!review) {
+    throw new Error('Review not found.');
+  }
+  if (review.isClosed) {
+    throw new Error('Cannot return a closed review.');
+  }
+
+  const now = new Date().toISOString();
+  const action: ReviewAction = {
+    id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+    reviewId,
+    action: 'HOD_RETURNED',
+    performedBy: user.id,
+    performedByName: user.name,
+    performedByRole: user.role,
+    remarks: `Returned by HOD: ${reason.trim()}`,
+    performedAt: now,
+  };
+
+  const updated: EmployeeReview = {
+    ...review,
+    status: 'MANAGER_PENDING',
+    actionHistory: [...(review.actionHistory || []), action],
+    updatedAt: now,
+  };
+
+  await reviewCol.updateOne({ id: reviewId }, { $set: updated });
+
+  const notifCol = getDbCollection('notifications');
+  await notifCol.updateMany(
+    { 'metadata.reviewId': reviewId, type: 'HOD_PENDING', isRead: false },
+    { $set: { isRead: true } }
+  );
+
+  if (review.managerId) {
+    await notifCol.insertOne({
+      id: `notif_${reviewId}_hod_returned_${Date.now()}`,
+      userId: review.managerId,
+      userRole: 'MANAGER',
+      type: 'RETURNED',
+      title: `Review Returned by HOD: ${review.employeeName}`,
+      message: `The HOD returned the review for ${review.employeeName}. Reason: ${reason.trim()}`,
+      isRead: false,
+      priority: 'HIGH',
+      metadata: { reviewId, periodId: review.reviewPeriodId, reason: reason.trim() },
+      createdAt: now,
+    });
+  }
+
+  await recordAuditLog(
+    user.id,
+    user.name,
+    user.role,
+    'EMPLOYEE_REVIEWS',
+    'REVIEW_HOD_RETURNED',
+    reviewId,
+    'HOD_PENDING',
+    'MANAGER_PENDING',
+    `Review returned to manager by HOD for ${review.employeeName}. Reason: ${reason.trim()}`
   );
 
   return updated;

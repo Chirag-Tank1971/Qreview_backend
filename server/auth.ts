@@ -1,23 +1,55 @@
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
 import { getDbCollection } from './db.js';
 import { User, UserRole, Employee, Role, EmployeeReview, ReviewStatus, Permission } from '../src/types/index.js';
 
-const DEFAULT_SECRET = 'quarterly_review_appraisal_jwt_secret_key_2026_production_entropy_secure';
-if (process.env.NODE_ENV === 'production') {
-  if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) {
-    console.warn(
-      '[Security Notice] No custom JWT_SECRET (>= 32 chars) provided in environment. ' +
-      'Using secure default secret. For production hardening, add a custom JWT_SECRET in your Render dashboard.'
-    );
-  }
+const isProduction = process.env.NODE_ENV === 'production';
+
+// Dev-only convenience fallback so local development works with zero setup.
+// NEVER used in production — a missing/weak secret in production is a fatal startup error instead.
+const DEV_FALLBACK_SECRET = 'quarterly_review_appraisal_jwt_secret_key_2026_dev_only_entropy';
+
+if (isProduction && (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32)) {
+  throw new Error(
+    '[Fatal] JWT_SECRET must be set to a value of at least 32 characters in production. ' +
+    'Refusing to start with an insecure or missing secret.'
+  );
 }
 
 const JWT_SECRET = process.env.JWT_SECRET && process.env.JWT_SECRET.length >= 32
   ? process.env.JWT_SECRET
-  : DEFAULT_SECRET;
-const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET || `${JWT_SECRET}_refresh_key_2026`;
+  : DEV_FALLBACK_SECRET;
+// JWT_REFRESH_SECRET stays optional: if not explicitly set, it's derived from JWT_SECRET
+// (in both dev and production) so existing deployments that only configured JWT_SECRET
+// keep working unchanged. Recommended hardening: set JWT_REFRESH_SECRET independently.
+const JWT_REFRESH_SECRET = process.env.JWT_REFRESH_SECRET && process.env.JWT_REFRESH_SECRET.length >= 32
+  ? process.env.JWT_REFRESH_SECRET
+  : `${JWT_SECRET}_refresh_key_2026`;
+
+/**
+ * Generates a random, human-typable temporary password (12 chars, mixed case + digits)
+ * for auto-provisioned accounts. Never a fixed/predictable string.
+ */
+export function generateTempPassword(): string {
+  const upper = 'ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const lower = 'abcdefghijkmnpqrstuvwxyz';
+  const digits = '23456789';
+  const all = upper + lower + digits;
+  const pick = (charset: string) => charset[crypto.randomInt(charset.length)];
+
+  const required = [pick(upper), pick(lower), pick(digits)];
+  const rest = Array.from({ length: 9 }, () => pick(all));
+  const chars = [...required, ...rest];
+
+  // Fisher-Yates shuffle so the fixed-position required chars aren't predictable
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = crypto.randomInt(i + 1);
+    [chars[i], chars[j]] = [chars[j], chars[i]];
+  }
+  return chars.join('');
+}
 
 // Dev: 8 hours for convenient local/Postman testing | Production: 15 minutes for security
 export const ACCESS_TOKEN_EXPIRY = process.env.NODE_ENV === 'production' ? '15m' : '8h';
@@ -703,6 +735,56 @@ export function authorizeReviewAccess(
         if (review.status !== 'HR_PENDING') {
           return res.status(400).json({
             error: `Cannot complete review in status "${review.status}". Must be HR_PENDING.`,
+          });
+        }
+
+        req.review = review;
+        return next();
+      }
+
+      // HOD Approve action
+      if (action === 'hod_approve') {
+        const isAssignedHod = role === 'HOD' && review.hodId === userEmpId;
+        const isSuperAdmin = role === 'SUPER_ADMIN';
+
+        if (!isAssignedHod && !isSuperAdmin) {
+          return res.status(403).json({
+            error: 'Forbidden: Only the designated HOD or Super Admin can approve this review.',
+          });
+        }
+
+        if (review.isClosed) {
+          return res.status(400).json({ error: 'Cannot approve a closed review.' });
+        }
+
+        if (review.status !== 'HOD_PENDING') {
+          return res.status(400).json({
+            error: `Cannot approve review in status "${review.status}". Must be HOD_PENDING.`,
+          });
+        }
+
+        req.review = review;
+        return next();
+      }
+
+      // HOD Return action
+      if (action === 'hod_return') {
+        const isAssignedHod = role === 'HOD' && review.hodId === userEmpId;
+        const isSuperAdmin = role === 'SUPER_ADMIN';
+
+        if (!isAssignedHod && !isSuperAdmin) {
+          return res.status(403).json({
+            error: 'Forbidden: Only the designated HOD or Super Admin can return this review.',
+          });
+        }
+
+        if (review.isClosed) {
+          return res.status(400).json({ error: 'Cannot return a closed review.' });
+        }
+
+        if (review.status !== 'HOD_PENDING') {
+          return res.status(400).json({
+            error: `Cannot return review in status "${review.status}". Must be HOD_PENDING.`,
           });
         }
 

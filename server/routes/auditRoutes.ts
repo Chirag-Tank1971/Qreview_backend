@@ -579,7 +579,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
         code: employee.employeeCode,
         department: employee.departmentName,
         designation: employee.designationName,
-        cycle: employee.cycleName || employee.cycleCode || 'Cycle F (September)',
+        cycle: employee.cycleName || employee.cycleCode || 'Unassigned',
       },
       timeline: events,
     });

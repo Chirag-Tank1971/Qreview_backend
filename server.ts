@@ -58,22 +58,16 @@ async function startServer() {
     // 4. Exact match against configured origins
     if (configuredOrigins.includes(cleanOrigin)) return true;
 
-    // 5. Allow any Vercel deployment preview / production domain (*.vercel.app)
-    if (/^https:\/\/[a-zA-Z0-9._-]+\.vercel\.app$/i.test(cleanOrigin)) {
-      return true;
-    }
-
-    // 6. Allow any Render host domain (*.onrender.com)
-    if (/^https:\/\/[a-zA-Z0-9._-]+\.onrender\.com$/i.test(cleanOrigin)) {
-      return true;
-    }
-
-    // 7. Allow localhost / 127.0.0.1 on any port
+    // 5. Allow localhost / 127.0.0.1 on any port (harmless in production, useful for local
+    //    testing against a production API)
     if (/^http:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(cleanOrigin)) {
       return true;
     }
 
-    // 8. Support wildcard subdomain patterns in configuredOrigins (e.g. *.mycompany.com)
+    // 6. Support wildcard subdomain patterns in configuredOrigins (e.g. *.mycompany.com)
+    // Note: blanket trust of any *.vercel.app / *.onrender.com origin was intentionally
+    // removed — those are shared hosting domains anyone can deploy to. Set the exact
+    // production frontend URL(s) in ALLOWED_ORIGINS instead.
     for (const pattern of configuredOrigins) {
       if (pattern.startsWith('*.')) {
         const rootDomain = pattern.slice(2);
@@ -165,6 +159,19 @@ async function startServer() {
   });
   // Apply rate limiter only to the login endpoint
   app.use('/api/auth/login', loginRateLimiter);
+
+  // General rate limiter: generous cap so it doesn't interfere with normal usage
+  // (bulk import/export, report generation, etc.), but stops unbounded API abuse/scripting.
+  const generalApiRateLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 minutes
+    max: 300,
+    standardHeaders: true,
+    legacyHeaders: false,
+    message: {
+      error: 'Too many requests from this IP. Please slow down and try again shortly.',
+    },
+  });
+  app.use('/api', generalApiRateLimiter);
 
   // Initialize Database (MongoDB / Document Collections Engine)
   await initDatabase();

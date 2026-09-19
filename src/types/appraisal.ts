@@ -83,6 +83,8 @@ export interface Appraisal {
   effectiveDate?: string;
   isLocked: boolean;
   lockedAt?: string;
+  lockedById?: string;
+  lockedByName?: string;
   finalizedAt?: string;
   letterIssued?: boolean;
   letterReleased?: boolean;

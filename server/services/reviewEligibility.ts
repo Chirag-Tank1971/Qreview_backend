@@ -26,6 +26,7 @@ export interface ReviewEligibilityResult {
     alreadyHasReview: boolean;
     periodActiveOrUpcoming: boolean;
     tenureMet: boolean;
+    startingPeriodMet: boolean;
   };
 }
 
@@ -121,7 +122,7 @@ export async function checkEmployeeReviewEligibility(
   const alreadyHasReview = Boolean(existingReview);
 
   // 4. KRA Template check
-  let hasKraTemplate = false;
+  let hasKraTemplate: boolean;
   try {
     const allTemplates: KraTemplate[] = await (await templatesCol.find({})).toArray();
     let template = allTemplates.find((t) => t.id === emp.currentKraTemplateId);
@@ -148,12 +149,27 @@ export async function checkEmployeeReviewEligibility(
   const tenureDays = calculatePeriodTenureDays(joiningDate, period.startDate, period.endDate);
   const tenureMet = tenureDays >= minTenureDays;
 
-  // Automatic eligibility: All core checks pass + period is ACTIVE + tenureMet
-  const coreEligible = statusActive && hasManager && hasKraTemplate && !alreadyHasReview;
-  const eligible = coreEligible && period.status === 'ACTIVE' && tenureMet;
+  // 7. Starting review period check: employee configured to start reviews from a later period
+  let startingPeriodMet = true;
+  let startingPeriodName: string | undefined;
+  if (emp.startingReviewPeriodId) {
+    const startPeriod = await getDbCollection('reviewPeriods').findOne({ id: emp.startingReviewPeriodId });
+    if (startPeriod) {
+      startingPeriodName = startPeriod.name;
+      const isPeriodTooEarly =
+        period.year < startPeriod.year || (period.year === startPeriod.year && period.quarter < startPeriod.quarter);
+      startingPeriodMet = !isPeriodTooEarly;
+    }
+    // If the referenced starting period can't be found, fail open (don't block on a dangling reference).
+  }
 
-  // Can manual override: Core checks pass + period is active or upcoming
-  const canInitiateManually = coreEligible && periodActiveOrUpcoming;
+  // Automatic eligibility: All core checks pass + period is ACTIVE + tenureMet + startingPeriodMet
+  const coreEligible = statusActive && hasManager && hasKraTemplate && !alreadyHasReview;
+  const eligible = coreEligible && period.status === 'ACTIVE' && tenureMet && startingPeriodMet;
+
+  // Can manual override: Core checks pass + period is active or upcoming + startingPeriodMet
+  // (starting period is a deliberate HR configuration, not overridable like a tenure shortfall)
+  const canInitiateManually = coreEligible && periodActiveOrUpcoming && startingPeriodMet;
   const requiresManualOverride = canInitiateManually && !tenureMet;
 
   let reason: string | undefined;
@@ -167,6 +183,8 @@ export async function checkEmployeeReviewEligibility(
     reason = 'No active KRA template found for this employee.';
   } else if (!periodActiveOrUpcoming) {
     reason = `Review period status is ${period.status}; must be ACTIVE or UPCOMING.`;
+  } else if (!startingPeriodMet) {
+    reason = `This employee is configured to start reviews from ${startingPeriodName}.`;
   } else if (!tenureMet) {
     reason = `Tenure within quarter is ${tenureDays} days, which is less than the required ${minTenureDays} days.`;
   }
@@ -185,6 +203,7 @@ export async function checkEmployeeReviewEligibility(
       alreadyHasReview,
       periodActiveOrUpcoming,
       tenureMet,
+      startingPeriodMet,
     },
   };
 }
@@ -350,8 +369,8 @@ export async function createQuarterlyReview(options: CreateQuarterlyReviewOption
     hodId: emp.hodId,
     hodName: emp.hodName,
     cycleId: emp.cycleId,
-    cycleCode: emp.cycleCode || empCycle?.code || 'A',
-    cycleColor: emp.cycleColor || empCycle?.colorHex || '#1e3a8a',
+    cycleCode: emp.cycleCode || empCycle?.code || 'N/A',
+    cycleColor: emp.cycleColor || empCycle?.colorHex || '#64748b',
     reviewPeriodId: period.id,
     reviewPeriodName: period.name,
     isAppraisalMonthDue: isAppraisalQuarter,

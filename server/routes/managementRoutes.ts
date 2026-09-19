@@ -98,6 +98,7 @@ managementRouter.get(
       const completedReviews = currentReviews.filter((r) => r.status === 'CLOSED' || r.isClosed);
       const completedCount = completedReviews.length;
       const managerPendingCount = currentReviews.filter((r) => r.status === 'MANAGER_PENDING').length;
+      const hodPendingCount = currentReviews.filter((r) => r.status === 'HOD_PENDING').length;
       const hrPendingCount = currentReviews.filter((r) => r.status === 'HR_PENDING' || r.status === 'HR_COMPLETED').length;
       const returnedCount = currentReviews.filter((r) => r.status === 'RETURNED').length;
 
@@ -222,7 +223,7 @@ managementRouter.get(
       // 7. Appraisal Triggers Summary
       const currentMonth = new Date().getMonth() + 1;
       const currentYear = new Date().getFullYear();
-      const allCycles: Cycle[] = await (await cycleCol.find({})).toArray();
+      const allCycles: Cycle[] = await (await cycleCol.find({ active: { $ne: false } })).toArray();
       const currentMonthCycleIds = new Set(allCycles.filter((c) => c.appraisalMonth === currentMonth).map((c) => c.id));
       const appraisalDueCount = activeEmployees.filter((e) => e.cycleId && currentMonthCycleIds.has(e.cycleId)).length;
 
@@ -240,6 +241,7 @@ managementRouter.get(
           totalQuarterlyReviews: totalReviews,
           completedReviews: completedCount,
           pendingManagerReviews: managerPendingCount,
+          pendingHodReviews: hodPendingCount,
           pendingHrReviews: hrPendingCount,
           returnedReviews: returnedCount,
           overdueReviews: overdueReviewsCount,
@@ -322,7 +324,7 @@ managementRouter.get(
 
       const allDepts: Department[] = await (await deptCol.find({})).toArray();
       const allEmps: Employee[] = await (await empCol.find({ status: { $ne: 'INACTIVE' } })).toArray();
-      const allCycles: Cycle[] = await (await cycleCol.find({})).toArray();
+      const allCycles: Cycle[] = await (await cycleCol.find({ active: { $ne: false } })).toArray();
       const targetYear = targetPeriod?.year || new Date().getFullYear();
       const allAppraisals: Appraisal[] = await (await appraisalCol.find({ appraisalYear: targetYear })).toArray();
 
@@ -352,6 +354,8 @@ managementRouter.get(
         const managerPending = deptReviews.filter(
           (r) => ['MANAGER_PENDING', 'ASSIGNED', 'DRAFT', 'PENDING', 'MANAGER_REVIEW', 'SELF_SUBMITTED'].includes(r.status)
         ).length;
+
+        const hodPending = deptReviews.filter((r) => r.status === 'HOD_PENDING').length;
 
         const hrPending = deptReviews.filter(
           (r) => ['HR_PENDING', 'HR_COMPLETED', 'MANAGER_COMPLETED', 'HR_REVIEW', 'MANAGER_SUBMITTED', 'CALIBRATION'].includes(r.status)
@@ -411,6 +415,7 @@ managementRouter.get(
           completionRate: reviewCompletionRate,
           reviewCompletionRate,
           managerPending,
+          hodPending,
           hrPending,
           returnedCount,
           overdueCount,
@@ -768,7 +773,8 @@ managementRouter.get(
 
       const appraisals: Appraisal[] = await (await appraisalCol.find(query)).toArray();
       const allDepts: Department[] = await (await deptCol.find({})).toArray();
-      const allCycles: Cycle[] = await (await cycleCol.find({})).toArray();
+      const allCyclesRaw: Cycle[] = await (await cycleCol.find({})).toArray();
+      const allCycles: Cycle[] = allCyclesRaw.filter((c) => c.active !== false);
       const allEmployees: Employee[] = await (await empCol.find({ status: { $ne: 'INACTIVE' } })).toArray();
 
       const totalDue = appraisals.length;

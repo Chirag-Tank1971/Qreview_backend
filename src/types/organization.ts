@@ -52,6 +52,8 @@ export interface Employee {
   cycleCode: string;
   cycleName?: string;
   cycleColor?: string;
+  startingReviewPeriodId: string;
+  startingReviewPeriodName?: string;
   currentKraTemplateId?: string;
   currentKraTemplateName?: string;
   status: EmployeeStatus;

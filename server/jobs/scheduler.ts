@@ -127,7 +127,7 @@ export function startBackgroundScheduler(): void {
         const overdueReviews: EmployeeReview[] = await (
           await reviewCol.find({
             reviewPeriodId: activePeriod.id,
-            status: { $in: ['MANAGER_PENDING', 'DRAFT', 'RETURNED'] },
+            status: { $in: ['MANAGER_PENDING', 'DRAFT', 'RETURNED', 'HOD_PENDING'] },
           })
         ).toArray();
 
@@ -145,6 +145,29 @@ export function startBackgroundScheduler(): void {
             metadata: { periodId: activePeriod.id, overdueCount: overdueReviews.length },
             createdAt: new Date().toISOString(),
           });
+
+          // Escalate overdue HOD-stage reviews directly to the specific HOD, not just HR.
+          const overdueHodReviews = overdueReviews.filter((r) => r.status === 'HOD_PENDING' && r.hodId);
+          for (const r of overdueHodReviews) {
+            await notifCol.updateOne(
+              { 'metadata.reviewId': r.id, type: 'ESCALATION', userId: r.hodId },
+              {
+                $set: {
+                  id: `notif_escalation_hod_${r.id}`,
+                  userId: r.hodId,
+                  userRole: 'HOD',
+                  type: 'ESCALATION',
+                  title: `Overdue: HOD Review Pending for ${r.employeeName}`,
+                  message: `The ${activePeriod.name} review for ${r.employeeName} has been awaiting your approval past the due date (${new Date(activePeriod.dueDate).toLocaleDateString()}).`,
+                  isRead: false,
+                  priority: 'HIGH',
+                  metadata: { reviewId: r.id, periodId: activePeriod.id, status: 'HOD_PENDING' },
+                  createdAt: new Date().toISOString(),
+                },
+              },
+              { upsert: true }
+            );
+          }
         }
       }
     } catch (err: any) {
@@ -163,7 +186,9 @@ export function startBackgroundScheduler(): void {
       const empCol = getDbCollection('employees');
       const notifCol = getDbCollection('notifications');
 
-      const cycles: Cycle[] = await (await cycleCol.find({ appraisalMonth: currentMonth })).toArray();
+      const cycles: Cycle[] = await (
+        await cycleCol.find({ appraisalMonth: currentMonth, active: { $ne: false } })
+      ).toArray();
       if (cycles.length === 0) return;
 
       const cycleIds = new Set(cycles.map((c) => c.id));
