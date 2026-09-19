@@ -77,6 +77,12 @@ export interface Appraisal {
   managerRecommendation?: any;
   hodRemarks?: string;
   hodCalibration?: any;
+  hodReturn?: {
+    reason: string;
+    returnedBy: string;
+    returnedByName: string;
+    returnedAt: string;
+  };
   hrRemarks?: string;
   hrApproval?: any;
   remarks?: string;

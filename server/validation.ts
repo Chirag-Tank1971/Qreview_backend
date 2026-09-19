@@ -212,6 +212,14 @@ export const HodCalibrationSchema = z.object({
   notes: z.string().max(3000).optional().or(z.literal('')),
 });
 
+export const HodReturnSchema = z.object({
+  reason: z
+    .string()
+    .trim()
+    .min(3, 'Reason must be at least 3 characters')
+    .max(3000),
+});
+
 export const HrApprovalSchema = z.object({
   finalIncrementPercent: z
     .number()
@@ -220,6 +228,21 @@ export const HrApprovalSchema = z.object({
   finalRating: z.string().min(1, 'Final rating is required'),
   revisedCtc: z.number().min(0, 'Revised CTC must be positive').optional(),
   effectiveDate: z.string().min(4, 'Effective date is required'),
+  notes: z.string().max(3000).optional().or(z.literal('')),
+});
+
+export const LockAppraisalSchema = z.object({
+  finalIncrementPercent: z
+    .number()
+    .min(0, 'Increment percentage cannot be negative')
+    .max(100, 'Increment percentage cannot exceed 100%')
+    .optional(),
+  finalRating: z.string().min(1).optional(),
+  revisedCtc: z.number().min(0, 'Revised CTC must be positive').optional(),
+  effectiveDate: z.string().min(4).optional(),
+  promotionApproved: z.boolean().optional(),
+  promotionDesignationId: z.string().optional(),
+  promotionDesignationName: z.string().optional(),
   notes: z.string().max(3000).optional().or(z.literal('')),
 });
 

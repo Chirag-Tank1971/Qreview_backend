@@ -6,7 +6,9 @@ import {
   validateBody,
   ManagerRecommendationSchema,
   HodCalibrationSchema,
+  HodReturnSchema,
   HrApprovalSchema,
+  LockAppraisalSchema,
   AcknowledgementSchema,
 } from '../validation.js';
 import {
@@ -1081,7 +1083,7 @@ appraisalRouter.put(
         updatedAt: new Date().toISOString(),
       };
 
-      await appraisalsCol.updateOne({ id }, { $set: updatedDoc });
+      await appraisalsCol.updateOne({ id }, { $set: updatedDoc, $unset: { hodReturn: '' } });
 
       const hodMissing = !appraisal.hodId;
 
@@ -1275,6 +1277,102 @@ appraisalRouter.put(
 );
 
 /**
+ * PUT /api/appraisals/:id/hod-return
+ * HOD sends the appraisal back to the Reporting Manager for rework instead of calibrating it forward
+ */
+appraisalRouter.put(
+  '/appraisals/:id/hod-return',
+  requireRoles('SUPER_ADMIN', 'HOD'),
+  validateBody(HodReturnSchema),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.user;
+      const { id } = req.params;
+      const { reason } = req.body;
+
+      const appraisalsCol = getDbCollection('appraisals');
+      const appraisal: Appraisal | null = await appraisalsCol.findOne({ id });
+
+      if (!appraisal) {
+        return res.status(404).json({ error: 'Appraisal record not found' });
+      }
+
+      // Strict HOD ownership: only the employee's actually-configured HOD may return it, not any HOD-role user.
+      if (user?.role === 'HOD' && appraisal.hodId !== user.employeeId) {
+        return res.status(403).json({ error: 'Unauthorized: Only the designated HOD or Super Admin can return this appraisal.' });
+      }
+
+      if (appraisal.isLocked) {
+        return res.status(400).json({ error: 'Cannot modify a locked appraisal record' });
+      }
+
+      // Mandatory-stage guard: HOD can only return an appraisal that is awaiting/has had HOD calibration.
+      if (!['MANAGER_RECOMMENDED', 'HOD_CALIBRATED'].includes(appraisal.status)) {
+        return res.status(400).json({
+          error: `Cannot return appraisal in status "${appraisal.status}". Must be MANAGER_RECOMMENDED or HOD_CALIBRATED.`,
+        });
+      }
+
+      const updatedDoc: Partial<Appraisal> = {
+        status: 'PENDING',
+        remarks: `Returned to Reporting Manager by ${user?.name || 'HOD'}: ${reason}`,
+        hodReturn: {
+          reason,
+          returnedBy: user?.id || user?.employeeId || '',
+          returnedByName: user?.name || 'Head of Department',
+          returnedAt: new Date().toISOString(),
+        },
+        updatedAt: new Date().toISOString(),
+      };
+
+      await appraisalsCol.updateOne({ id }, { $set: updatedDoc, $unset: { hodCalibration: '' } });
+
+      // Notify the Reporting Manager that the appraisal needs rework
+      const notifsCol = getDbCollection('notifications');
+      await notifsCol.updateOne(
+        { 'metadata.appraisalId': id, type: 'HOD_ACTION_REQUIRED', userRole: 'MANAGER' },
+        {
+          $set: {
+            id: `notif_${id}_hod_returned_manager`,
+            userId: appraisal.managerId || 'ALL',
+            userRole: 'MANAGER',
+            type: 'HOD_ACTION_REQUIRED',
+            title: `Appraisal Returned: ${appraisal.employeeName}`,
+            message: `${user?.name || 'HOD'} returned the appraisal recommendation for ${appraisal.employeeName} for rework. Reason: ${reason}`,
+            isRead: false,
+            priority: 'HIGH',
+            metadata: { appraisalId: id, cycleId: appraisal.cycleId, activeSection: 'appraisals', status: 'PENDING', openDetail: true },
+            createdAt: new Date().toISOString(),
+          },
+        },
+        { upsert: true }
+      );
+
+      if (user) {
+        await recordAuditLog(
+          user.id,
+          user.name,
+          user.role,
+          'APPRAISAL_CALIBRATION',
+          'HOD_RETURNED_TO_MANAGER',
+          id,
+          appraisal.status,
+          'PENDING',
+          reason
+        );
+      }
+
+      const refreshed = await appraisalsCol.findOne({ id });
+      console.log(`[Appraisal] HOD returned to manager: ${id} for "${appraisal.employeeName}" (${appraisal.employeeCode}), by "${user?.name}" [${user?.role}]`);
+      res.json(refreshed);
+    } catch (err: any) {
+      console.error('Error in PUT /api/appraisals/:id/hod-return:', err);
+      res.status(500).json({ error: err.message || 'Failed to return appraisal to manager' });
+    }
+  }
+);
+
+/**
  * PUT /api/appraisals/:id/hr-approve
  * HR confirms final increment, revised CTC, effective date, and generates formal letter
  */
@@ -1399,10 +1497,21 @@ appraisalRouter.put(
 appraisalRouter.put(
   '/appraisals/:id/lock',
   requireRoles('SUPER_ADMIN'),
+  validateBody(LockAppraisalSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const user = req.user;
       const { id } = req.params;
+      const {
+        finalIncrementPercent,
+        finalRating,
+        revisedCtc: revisedCtcOverride,
+        effectiveDate,
+        promotionApproved,
+        promotionDesignationId,
+        promotionDesignationName,
+        notes,
+      } = req.body;
 
       const appraisalsCol = getDbCollection('appraisals');
       const appraisal: Appraisal | null = await appraisalsCol.findOne({ id });
@@ -1435,6 +1544,19 @@ appraisalRouter.put(
         });
       }
 
+      // Super Admin may make last-mile edits before the final lock; when present, these
+      // final values supersede whatever HR had approved and become what gets locked in
+      // and reflected on the official appraisal letter.
+      const currentCtc = appraisal.currentCtc;
+      const finalInc = finalIncrementPercent !== undefined ? Number(finalIncrementPercent) : appraisal.approvedIncrementPercentage || 0;
+      const incrementAmount = Math.round((currentCtc * finalInc) / 100);
+      const finalRevisedCtc = revisedCtcOverride !== undefined ? Number(revisedCtcOverride) : currentCtc + incrementAmount;
+      const finalRatingValue = finalRating || appraisal.finalRating;
+      const finalEffectiveDate = effectiveDate || appraisal.effectiveDate || `${appraisal.appraisalYear}-10-01`;
+      const finalPromotionRecommended = promotionApproved !== undefined ? Boolean(promotionApproved) : Boolean(appraisal.promotionRecommended);
+      const finalPromotionDesignationId = promotionDesignationId || appraisal.promotionDesignationId;
+      const finalPromotionDesignationName = promotionDesignationName || appraisal.promotionDesignationName;
+
       const lockedAt = new Date().toISOString();
       await appraisalsCol.updateOne(
         { id },
@@ -1445,24 +1567,38 @@ appraisalRouter.put(
             lockedAt,
             lockedById: user?.id || user?.employeeId || '',
             lockedByName: user?.name || 'Super Admin',
+            approvedIncrementPercentage: finalInc,
+            incrementAmount,
+            revisedCtc: finalRevisedCtc,
+            finalRating: finalRatingValue,
+            effectiveDate: finalEffectiveDate,
+            promotionRecommended: finalPromotionRecommended,
+            promotionDesignationId: finalPromotionDesignationId,
+            promotionDesignationName: finalPromotionDesignationName,
+            'hrApproval.finalIncrementPercent': finalInc,
+            'hrApproval.revisedCtc': finalRevisedCtc,
+            'hrApproval.finalRating': finalRatingValue,
+            'hrApproval.effectiveDate': finalEffectiveDate,
+            'hrApproval.letterGeneratedAt': lockedAt,
+            'hrApproval.notes': notes || appraisal.hrApproval?.notes,
             updatedAt: lockedAt,
           },
         }
       );
 
-      // Update Employee Master Record
+      // Update Employee Master Record with the final locked-in values (not the pre-edit snapshot)
       const employeesCol = getDbCollection('employees');
       const employee: Employee | null = await employeesCol.findOne({ id: appraisal.employeeId });
 
       if (employee) {
         const empUpdate: Partial<Employee> = {
-          currentCtc: appraisal.revisedCtc,
+          currentCtc: finalRevisedCtc,
           lastAppraisalDate: lockedAt,
         };
 
-        if (appraisal.promotionRecommended && appraisal.promotionDesignationId) {
-          empUpdate.designationId = appraisal.promotionDesignationId;
-          empUpdate.designationName = appraisal.promotionDesignationName;
+        if (finalPromotionRecommended && finalPromotionDesignationId) {
+          empUpdate.designationId = finalPromotionDesignationId;
+          empUpdate.designationName = finalPromotionDesignationName;
         }
 
         await employeesCol.updateOne({ id: employee.id }, { $set: empUpdate });
@@ -1499,7 +1635,7 @@ appraisalRouter.put(
               employeeName: appraisal.employeeName,
               cycleName: appraisal.cycleName || 'Annual Cycle',
               appraisalUrl: `${baseUrl}/#portal`,
-              effectiveDate: appraisal.effectiveDate,
+              effectiveDate: finalEffectiveDate,
             });
             await sendNotificationEmail({
               recipientId: appraisal.employeeId,
@@ -1525,13 +1661,13 @@ appraisalRouter.put(
           'APPRAISAL_LOCKED',
           id,
           'UNLOCKED',
-          `Locked appraisal. Updated Employee CTC to ${appraisal.currency}${appraisal.revisedCtc.toLocaleString()}`,
+          `Locked appraisal. Updated Employee CTC to ${appraisal.currency}${finalRevisedCtc.toLocaleString()}`,
           ''
         );
       }
 
       const refreshed = await appraisalsCol.findOne({ id });
-      console.log(`[Appraisal] Appraisal locked & finalized: ${id} for "${appraisal.employeeName}" (${appraisal.employeeCode}), Revised CTC: ${appraisal.currency}${appraisal.revisedCtc.toLocaleString()}, by "${user?.name}" [${user?.role}]`);
+      console.log(`[Appraisal] Appraisal locked & finalized: ${id} for "${appraisal.employeeName}" (${appraisal.employeeCode}), Revised CTC: ${appraisal.currency}${finalRevisedCtc.toLocaleString()}, by "${user?.name}" [${user?.role}]`);
       res.json(refreshed);
     } catch (err: any) {
       console.error('Error in PUT /api/appraisals/:id/lock:', err);
