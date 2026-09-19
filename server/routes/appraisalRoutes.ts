@@ -207,6 +207,10 @@ appraisalRouter.get('/appraisals', async (req: AuthenticatedRequest, res: Respon
     const empMap = new Map<string, Employee>();
     allEmployees.forEach((e) => empMap.set(e.id, e));
 
+    // Drop orphaned appraisals whose employee record no longer exists
+    // (e.g. removed outside the normal delete-employee cascade)
+    appraisals = appraisals.filter((a) => empMap.has(a.employeeId));
+
     // Strict RBAC Scoping:
     if (user.role === 'EMPLOYEE') {
       // Employees can STRICTLY ONLY view their own appraisal record
