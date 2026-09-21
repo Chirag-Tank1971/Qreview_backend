@@ -12,9 +12,8 @@ import {
 
 export const managementRouter = express.Router();
 
-// Enforce authentication & Executive Management role restriction (not admin)
-managementRouter.use(authenticateToken);
-managementRouter.use(requireRoles('MANAGEMENT'));
+// Enforce authentication & Executive Management role restriction for management endpoints only
+managementRouter.use(['/dashboard/management', '/management'], authenticateToken, requireRoles('MANAGEMENT'));
 
 /**
  * Audit logger helper for Management actions

@@ -257,3 +257,76 @@ export const LockAppraisalSchema = z.object({
 export const AcknowledgementSchema = z.object({
   comments: z.string().trim().max(2000).optional(),
 });
+
+// ============================================================================
+// 5. PERFORMANCE IMPROVEMENT PLAN (PIP) SCHEMAS
+// ============================================================================
+
+export const PipGoalSchema = z.object({
+  id: z.string().optional(),
+  description: z.string().trim().min(3, 'Goal description is required').max(1000),
+  targetMetric: z.string().max(500).optional(),
+  dueDate: z.string().optional(),
+  status: z.enum(['PENDING', 'MET', 'MISSED']).optional().default('PENDING'),
+});
+
+export const CreatePipSchema = z.object({
+  employeeId: z.string().min(1, 'Employee is required'),
+  reason: z.string().trim().min(10, 'Reason must be at least 10 characters').max(3000),
+  category: z.string().max(200).optional(),
+  triggeredByReviewId: z.string().optional(),
+  startDate: z.string().min(4, 'Start date is required'),
+  // HR/Admin explicitly choose the plan length in days — no fixed 30/60/90 preset.
+  durationDays: z
+    .number()
+    .int('Duration must be a whole number of days')
+    .min(7, 'Duration must be at least 7 days')
+    .max(365, 'Duration cannot exceed 365 days'),
+  goals: z.array(PipGoalSchema).min(1, 'At least one improvement goal is required'),
+  publish: z.boolean().optional().default(false),
+});
+
+export const UpdatePipSchema = CreatePipSchema.partial().extend({
+  employeeId: z.string().min(1).optional(),
+});
+
+export const PipGoalRatingEntrySchema = z.object({
+  goalId: z.string().min(1),
+  rating: z.number().int().min(1).max(5),
+});
+
+export const PipCheckInSchema = z.object({
+  notes: z.string().trim().min(3, 'Check-in notes must be at least 3 characters').max(3000),
+  // Optional per-goal progress rating (1-5) the manager/HOD can log alongside the check-in.
+  goalRatings: z.array(PipGoalRatingEntrySchema).max(50).optional(),
+});
+
+export const PipAcknowledgementSchema = z.object({
+  comments: z.string().trim().max(2000).optional(),
+});
+
+export const PipOutcomeSchema = z
+  .object({
+    decision: z.enum(['SUCCEEDED', 'FAILED', 'EXTENDED']),
+    notes: z.string().max(3000).optional().or(z.literal('')),
+    // Required only when extending — HR/Admin again explicitly chooses the additional days.
+    additionalDays: z
+      .number()
+      .int('Additional days must be a whole number')
+      .min(1, 'Additional days must be at least 1')
+      .max(365)
+      .optional(),
+  })
+  .refine((data) => data.decision !== 'EXTENDED' || (data.additionalDays && data.additionalDays > 0), {
+    message: 'Additional days are required when extending a plan',
+    path: ['additionalDays'],
+  });
+
+export const PipCancelSchema = z.object({
+  reason: z.string().trim().min(3, 'A cancellation reason is required').max(2000),
+});
+
+export const PipFailureResolutionSchema = z.object({
+  action: z.enum(['NEW_PIP_STARTED', 'TERMINATION_PROCESSED', 'ESCALATED_TO_MANAGEMENT', 'NO_FURTHER_ACTION']),
+  notes: z.string().max(2000).optional().or(z.literal('')),
+});

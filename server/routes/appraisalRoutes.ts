@@ -26,6 +26,7 @@ import {
 } from '../../src/types/index.js';
 import { sendNotificationEmail, resolveRecipient } from '../services/emailService.js';
 import { renderAppraisalLetterReleasedEmail } from '../services/emailTemplates.js';
+import { getActivePipForEmployee } from '../services/pipService.js';
 
 export const appraisalRouter = Router();
 
@@ -863,6 +864,7 @@ appraisalRouter.post(
 
       let createdCount = 0;
       let updatedCount = 0;
+      let skippedForPipCount = 0;
 
       for (const emp of eligibleEmployees) {
         const existing: Appraisal | null = await appraisalsCol.findOne({
@@ -871,6 +873,15 @@ appraisalRouter.post(
         });
 
         if (existing && !overrideExisting) {
+          continue;
+        }
+
+        // Employees currently on an active performance improvement plan are not eligible for
+        // annual appraisal/increment processing until the plan resolves (succeeds, fails, or
+        // is cancelled) — never silently include them.
+        const activePip = await getActivePipForEmployee(emp.id);
+        if (activePip) {
+          skippedForPipCount++;
           continue;
         }
 
@@ -987,16 +998,17 @@ appraisalRouter.post(
           'BATCH_INITIATE_COHORT',
           cycle.id,
           '',
-          `Initiated ${createdCount + updatedCount} appraisals for ${cycle.name} (${appraisalYear})`,
+          `Initiated ${createdCount + updatedCount} appraisals for ${cycle.name} (${appraisalYear})${skippedForPipCount > 0 ? `; skipped ${skippedForPipCount} on active PIP` : ''}`,
           'Generated rolling 4-quarter performance rollups and standard increment recommendations.'
         );
       }
 
       res.json({
-        message: `Successfully initiated ${cycle.name} cohort appraisals for ${appraisalYear}.`,
+        message: `Successfully initiated ${cycle.name} cohort appraisals for ${appraisalYear}.${skippedForPipCount > 0 ? ` ${skippedForPipCount} employee(s) on an active performance improvement plan were skipped.` : ''}`,
         cycleName: cycle.name,
         createdCount,
         updatedCount,
+        skippedForPipCount,
         totalEligible: eligibleEmployees.length,
       });
     } catch (err: any) {
@@ -1053,6 +1065,9 @@ appraisalRouter.put(
       }
       if (empRecord && empRecord.status === 'NOTICE') {
         return res.status(400).json({ error: 'Cannot submit recommendation: Employee is currently serving NOTICE period and ineligible for annual increment/promotion.' });
+      }
+      if (await getActivePipForEmployee(appraisal.employeeId)) {
+        return res.status(400).json({ error: 'Cannot submit recommendation: Employee is currently on an active performance improvement plan and ineligible for annual increment/promotion until it resolves.' });
       }
 
       // Role check: If caller is MANAGER, verify they are the assigned reporting manager
@@ -1208,6 +1223,9 @@ appraisalRouter.put(
       }
       if (empRecord && empRecord.status === 'NOTICE') {
         return res.status(400).json({ error: 'Cannot calibrate appraisal: Employee is currently serving NOTICE period and ineligible for annual increment/promotion.' });
+      }
+      if (await getActivePipForEmployee(appraisal.employeeId)) {
+        return res.status(400).json({ error: 'Cannot calibrate appraisal: Employee is currently on an active performance improvement plan and ineligible for annual increment/promotion until it resolves.' });
       }
 
       const currentCtc = appraisal.currentCtc;
@@ -1420,6 +1438,9 @@ appraisalRouter.put(
       }
       if (empRecord && empRecord.status === 'NOTICE') {
         return res.status(400).json({ error: 'Cannot approve appraisal: Employee is currently serving NOTICE period and ineligible for annual increment/promotion.' });
+      }
+      if (await getActivePipForEmployee(appraisal.employeeId)) {
+        return res.status(400).json({ error: 'Cannot approve appraisal: Employee is currently on an active performance improvement plan and ineligible for annual increment/promotion until it resolves.' });
       }
 
       const currentCtc = appraisal.currentCtc;

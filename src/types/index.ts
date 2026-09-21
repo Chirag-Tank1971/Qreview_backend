@@ -6,3 +6,4 @@ export * from './appraisal.js';
 export * from './governance.js';
 export * from './bulk.js';
 export * from './ai.js';
+export * from './pip.js';

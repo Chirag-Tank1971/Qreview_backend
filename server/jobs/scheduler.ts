@@ -1,6 +1,6 @@
 import cron from 'node-cron';
 import { getDbCollection } from '../db.js';
-import { ReviewPeriod, EmployeeReview, Employee, Cycle } from '../../src/types/index.js';
+import { ReviewPeriod, EmployeeReview, Employee, Cycle, PerformanceImprovementPlan } from '../../src/types/index.js';
 import { syncAllActiveEmployees } from '../syncHelpers.js';
 
 /**
@@ -232,6 +232,100 @@ export function startBackgroundScheduler(): void {
       }
     } catch (err: any) {
       console.error('[Scheduler] Error in monthly appraisal check:', err.message);
+    }
+  });
+
+  // 4. Daily at 08:45 AM: Remind the manager/HOD of any employee on an active PIP if no
+  // check-in has been logged in the last 7 days — keeps the plan from going silently stale.
+  cron.schedule('45 8 * * *', async () => {
+    try {
+      console.log('[Scheduler] Running daily PIP check-in reminder job...');
+      const pipCol = getDbCollection('performanceImprovementPlans');
+      const notifCol = getDbCollection('notifications');
+
+      const activePips: PerformanceImprovementPlan[] = await (
+        await pipCol.find({ status: { $in: ['ACTIVE', 'EXTENDED'] } })
+      ).toArray();
+
+      const CHECKIN_REMINDER_THRESHOLD_DAYS = 7;
+      const now = Date.now();
+      const todayKey = new Date().toISOString().slice(0, 10);
+      let remindersSent = 0;
+
+      for (const pip of activePips) {
+        const lastCheckIn = pip.checkIns.length > 0 ? pip.checkIns[pip.checkIns.length - 1] : null;
+        const lastActivityDate = new Date(lastCheckIn ? lastCheckIn.date : pip.startDate).getTime();
+        const daysSinceLastCheckIn = (now - lastActivityDate) / (1000 * 60 * 60 * 24);
+        if (daysSinceLastCheckIn < CHECKIN_REMINDER_THRESHOLD_DAYS) continue;
+
+        const recipients = [
+          pip.managerId ? { id: pip.managerId, role: 'MANAGER' as const } : null,
+          pip.hodId && pip.hodId !== pip.managerId ? { id: pip.hodId, role: 'HOD' as const } : null,
+        ].filter((r): r is { id: string; role: 'MANAGER' | 'HOD' } => !!r);
+
+        for (const recipient of recipients) {
+          const notifId = `notif_pip_checkin_${pip.id}_${recipient.id}_${todayKey}`;
+          const existing = await notifCol.findOne({ id: notifId });
+          if (existing) continue;
+          await notifCol.insertOne({
+            id: notifId,
+            userId: recipient.id,
+            userRole: recipient.role,
+            type: 'REMINDER',
+            title: `Check-In Overdue: ${pip.employeeName}'s Performance Plan`,
+            message: `No check-in has been logged for ${pip.employeeName}'s performance improvement plan in ${Math.floor(daysSinceLastCheckIn)} days. Regular check-ins are required to track progress.`,
+            isRead: false,
+            priority: 'HIGH',
+            metadata: { pipId: pip.id, employeeId: pip.employeeId, subTab: 'pip' },
+            createdAt: new Date().toISOString(),
+          });
+          remindersSent++;
+        }
+      }
+      console.log(`[Scheduler] Dispatched ${remindersSent} PIP check-in reminders.`);
+    } catch (err: any) {
+      console.error('[Scheduler] Error in PIP check-in reminder job:', err.message);
+    }
+  });
+
+  // 5. Daily at 09:15 AM: Escalate to HR any PIP that has passed its end date without a
+  // recorded outcome (SUCCEEDED/FAILED/EXTENDED) — prevents plans from silently expiring
+  // unresolved, which matters if a later termination is ever challenged.
+  cron.schedule('15 9 * * *', async () => {
+    try {
+      console.log('[Scheduler] Checking for PIPs past end date with no recorded outcome...');
+      const pipCol = getDbCollection('performanceImprovementPlans');
+      const notifCol = getDbCollection('notifications');
+
+      const activePips: PerformanceImprovementPlan[] = await (
+        await pipCol.find({ status: { $in: ['ACTIVE', 'EXTENDED'] } })
+      ).toArray();
+
+      const now = Date.now();
+      const overduePips = activePips.filter((p) => new Date(p.endDate).getTime() < now);
+
+      if (overduePips.length > 0) {
+        const todayKey = new Date().toISOString().slice(0, 10);
+        const notifId = `notif_pip_outcome_escalation_${todayKey}`;
+        const existing = await notifCol.findOne({ id: notifId });
+        if (!existing) {
+          await notifCol.insertOne({
+            id: notifId,
+            userId: 'ALL',
+            userRole: 'HR',
+            type: 'ESCALATION',
+            title: `Action Required: ${overduePips.length} Performance Plan(s) Past End Date`,
+            message: `${overduePips.length} performance improvement plan(s) have passed their scheduled end date without a recorded outcome: ${overduePips.map((p) => p.employeeName).join(', ')}. Please review and record Succeeded/Failed/Extended.`,
+            isRead: false,
+            priority: 'HIGH',
+            metadata: { pipIds: overduePips.map((p) => p.id), overdueCount: overduePips.length, subTab: 'pip' },
+            createdAt: new Date().toISOString(),
+          });
+          console.warn(`[Scheduler] Escalated ${overduePips.length} PIPs past end date with no outcome to HR.`);
+        }
+      }
+    } catch (err: any) {
+      console.error('[Scheduler] Error in PIP outcome escalation job:', err.message);
     }
   });
 

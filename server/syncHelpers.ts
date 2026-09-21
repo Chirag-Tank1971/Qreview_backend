@@ -15,45 +15,6 @@ import {
   buildKraSnapshotFromTemplate,
 } from './services/reviewEligibility.js';
 
-export function computeAppraisalMatrix(avgScore: number) {
-  if (avgScore <= 0) {
-    return {
-      recommendedRating: 'PENDING' as const,
-      suggestedIncrementMin: 0,
-      suggestedIncrementMax: 0,
-      defaultIncrement: 0,
-    };
-  } else if (avgScore >= 4.5) {
-    return {
-      recommendedRating: 'OUTSTANDING' as const,
-      suggestedIncrementMin: 15,
-      suggestedIncrementMax: 20,
-      defaultIncrement: 16.5,
-    };
-  } else if (avgScore >= 3.8) {
-    return {
-      recommendedRating: 'EXCEEDS_EXPECTATIONS' as const,
-      suggestedIncrementMin: 10,
-      suggestedIncrementMax: 14,
-      defaultIncrement: 12.0,
-    };
-  } else if (avgScore >= 2.8) {
-    return {
-      recommendedRating: 'MEETS_EXPECTATIONS' as const,
-      suggestedIncrementMin: 5,
-      suggestedIncrementMax: 9,
-      defaultIncrement: 7.0,
-    };
-  } else {
-    return {
-      recommendedRating: 'NEEDS_IMPROVEMENT' as const,
-      suggestedIncrementMin: 0,
-      suggestedIncrementMax: 4,
-      defaultIncrement: 2.0,
-    };
-  }
-}
-
 /**
  * Synchronize appraisal & quarterly review records for a single employee
  */

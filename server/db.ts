@@ -22,6 +22,7 @@ import {
   EmailLog,
   DbStatus,
   SystemConfig,
+  PerformanceImprovementPlan,
 } from '../src/types/index.js';
 
 let mongoClient: MongoClient | null = null;
@@ -290,6 +291,7 @@ export const memoryDb = {
   talentRecords: new InMemoryCollection<TalentRecord>('talent_records', []),
   complianceFlags: new InMemoryCollection<ComplianceFlag>('compliance_flags', []),
   emailLogs: new InMemoryCollection<EmailLog>('email_logs', []),
+  performanceImprovementPlans: new InMemoryCollection<PerformanceImprovementPlan>('performance_improvement_plans', []),
   systemConfig: new InMemoryCollection<SystemConfig>('system_config', [
     { id: 'default', hodApprovalEnabled: false, selfAssessmentEnabled: false, updatedAt: new Date().toISOString() },
   ]),
@@ -350,6 +352,7 @@ const MONGO_COLLECTION_MAP: Record<string, string> = {
   complianceFlags: 'compliance_flags',
   emailLogs: 'email_logs',
   systemConfig: 'system_config',
+  performanceImprovementPlans: 'performance_improvement_plans',
 };
 
 export function getDbCollection<T extends { id?: string; _id?: any }>(collectionName: keyof typeof memoryDb): any {
@@ -387,6 +390,12 @@ async function ensureMongoIndexes(db: Db): Promise<void> {
     const notifCol = getDbCollection('notifications');
     await notifCol.createIndex({ userId: 1 });
     await notifCol.createIndex({ isRead: 1 });
+
+    const pipCol = getDbCollection('performanceImprovementPlans');
+    await pipCol.createIndex({ employeeId: 1 });
+    await pipCol.createIndex({ status: 1 });
+    await pipCol.createIndex({ managerId: 1 });
+    await pipCol.createIndex({ hodId: 1 });
 
     await getDbCollection('users').createIndex({ email: 1 }, { unique: true });
   } catch (err) {
