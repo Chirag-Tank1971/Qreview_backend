@@ -1,8 +1,6 @@
 export type BulkDatasetType =
   | 'employees'
   | 'kras'
-  | 'quarterly-scores'
-  | 'increment-matrix'
   | 'EMPLOYEES'
   | 'REVIEWS'
   | 'SALARIES'

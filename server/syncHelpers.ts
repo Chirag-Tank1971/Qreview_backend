@@ -12,6 +12,7 @@ import {
 import {
   checkEmployeeReviewEligibility,
   createQuarterlyReview,
+  buildKraSnapshotFromTemplate,
 } from './services/reviewEligibility.js';
 
 export function computeAppraisalMatrix(avgScore: number) {
@@ -61,11 +62,9 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
     const reviewsCol = getDbCollection('employeeReviews');
     const appraisalsCol = getDbCollection('appraisals');
     const periodsCol = getDbCollection('reviewPeriods');
-    const templatesCol = getDbCollection('kraTemplates');
     const cyclesCol = getDbCollection('cycles');
 
     const allPeriods: ReviewPeriod[] = await (await periodsCol.find({})).toArray();
-    const allTemplates: KraTemplate[] = await (await templatesCol.find({})).toArray();
     const allCycles: Cycle[] = await (await cyclesCol.find({})).toArray();
 
     const empCycle = allCycles.find((c) => c.id === emp.cycleId || c.code === emp.cycleCode);
@@ -166,16 +165,89 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
 }
 
 /**
- * Synchronize all active employees across the company
+ * Re-syncs an employee's not-yet-scored review(s) to match their currently assigned
+ * KRA scorecard.
+ *
+ * A review's kraSnapshot is frozen at creation time — if the employee's
+ * currentKraTemplateId changes afterward (a KRA assigned/re-assigned via the employee
+ * editor, bulk upload, etc.), any review created before that point is left showing
+ * stale or fallback KRAs. `syncEmployeeAppraisalsAndReviews` deliberately never
+ * touches kraSnapshot, since blindly overwriting it could wipe out real ratings
+ * already entered — so callers that just changed an employee's KRA assignment must
+ * invoke this afterward.
+ *
+ * Only reviews with zero recorded progress (no ratings, achievements, or comments on
+ * any KRA item) are rewritten; anything with real work in it is left untouched, same
+ * as the closed-review protection in syncEmployeeAppraisalsAndReviews.
  */
-export async function syncAllActiveEmployees() {
+export async function resyncUnscoredReviewKraSnapshots(employeeId: string): Promise<void> {
   try {
     const empCol = getDbCollection('employees');
-    const activeEmployees: Employee[] = await (await empCol.find({ status: 'ACTIVE' })).toArray();
+    const reviewsCol = getDbCollection('employeeReviews');
+    const templatesCol = getDbCollection('kraTemplates');
+
+    const emp: Employee | null = await empCol.findOne({ id: employeeId });
+    if (!emp || !emp.currentKraTemplateId) return;
+
+    const template: KraTemplate | null = await templatesCol.findOne({ id: emp.currentKraTemplateId });
+    if (!template || !template.items || template.items.length === 0) return;
+
+    const openReviews: EmployeeReview[] = await (
+      await reviewsCol.find({ employeeId, isClosed: { $ne: true }, status: { $ne: 'CLOSED' } })
+    ).toArray();
+
+    for (const review of openReviews) {
+      const snapshot = review.kraSnapshot || [];
+      const hasAnyProgress = snapshot.some(
+        (k: ReviewKraSnapshot) =>
+          (Number(k.rating) || 0) > 0 ||
+          (Number(k.selfRating) || 0) > 0 ||
+          Boolean(k.comments?.trim()) ||
+          Boolean(k.selfComments?.trim()) ||
+          Boolean(k.achievement?.trim()) ||
+          Boolean(k.selfAchievement?.trim())
+      );
+      if (hasAnyProgress) continue;
+
+      await reviewsCol.updateOne(
+        { id: review.id },
+        {
+          $set: {
+            kraSnapshot: buildKraSnapshotFromTemplate(template),
+            updatedAt: new Date().toISOString(),
+          },
+        }
+      );
+    }
+  } catch (err) {
+    console.error('Error resyncing review KRA snapshots:', err);
+  }
+}
+
+/**
+ * Synchronize all active employees across the company — re-evaluates each one's review/
+ * appraisal eligibility and auto-generates anything newly eligible (e.g. a KRA was just
+ * assigned, or tenure has now crossed the minimum threshold). Used both by the manual
+ * "Sync" admin action and the daily automated sync job in jobs/scheduler.ts.
+ *
+ * Includes PROBATION employees, not just ACTIVE — checkEmployeeReviewEligibility treats
+ * PROBATION as review-eligible by default (systemConfig.includeProbationInReviews), so
+ * excluding them here would silently skip a whole employee status from ever being
+ * auto-generated a review. Fetching both is always safe: the per-employee eligibility
+ * check inside syncEmployeeAppraisalsAndReviews still applies that config correctly.
+ */
+export async function syncAllActiveEmployees(): Promise<{ employeesProcessed: number }> {
+  try {
+    const empCol = getDbCollection('employees');
+    const activeEmployees: Employee[] = await (
+      await empCol.find({ status: { $in: ['ACTIVE', 'PROBATION'] } })
+    ).toArray();
     for (const emp of activeEmployees) {
       await syncEmployeeAppraisalsAndReviews(emp);
     }
+    return { employeesProcessed: activeEmployees.length };
   } catch (err) {
     console.error('Error during batch sync of active employees:', err);
+    return { employeesProcessed: 0 };
   }
 }

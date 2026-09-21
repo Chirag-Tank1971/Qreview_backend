@@ -67,6 +67,11 @@ export interface Employee {
   systemRole?: UserRole;
   userId?: string;
   lastAppraisalDate?: string;
+  confirmationDate?: string;
+  gender?: 'Male' | 'Female' | 'Other' | string;
+  employmentType?: 'Permanent' | 'Contract' | 'Intern' | string;
+  probationPeriodDays?: number;
+  companyName?: string;
   createdAt?: string;
   updatedAt?: string;
 }

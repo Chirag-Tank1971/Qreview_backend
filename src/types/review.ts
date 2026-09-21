@@ -35,12 +35,15 @@ export interface ReviewKraSnapshot {
   measurementCriteria?: string;
   weight: number;
   achievement?: string;
-  rating: number; // 1 to 5
+  rating: number; // 1 to 5 — Manager's own independent rating
   comments?: string;
   issueReason?: string;
   selfRating?: number;
   selfAchievement?: string;
   selfComments?: string;
+  hodRating?: number; // 1 to 5 — HOD's own independent rating (never derived from/overwrites Manager's `rating`)
+  hodAchievement?: string;
+  hodComments?: string;
 }
 
 export interface ReviewAction {
@@ -65,6 +68,8 @@ export interface ReviewAction {
   performedByRole: UserRole;
   remarks: string;
   performedAt: string;
+  /** Set only on HR-initiated 'RETURNED' actions — who HR sent the review back to. Drives the "Returned by HR" badge and the resubmission skip-routing. */
+  returnTarget?: 'MANAGER' | 'HOD';
 }
 
 export interface EmployeeReview {
@@ -89,7 +94,9 @@ export interface EmployeeReview {
   hrId?: string;
   hrName?: string;
   status: ReviewStatus;
-  finalScore?: number;
+  finalScore?: number; // Official score: Manager's own score until HOD also scores, then the average of the two
+  managerScore?: number; // Manager's own weighted score (independent of HOD's)
+  hodScore?: number; // HOD's own weighted score (independent of Manager's)
   selfScore?: number;
   isSelfSubmitted?: boolean;
   selfSubmittedAt?: string;
@@ -99,6 +106,7 @@ export interface EmployeeReview {
   strengths?: string;
   improvements?: string;
   managerOverallComments?: string;
+  hodOverallComments?: string;
   employeeComments?: string;
   hrComments?: string;
   kraSnapshot: ReviewKraSnapshot[];

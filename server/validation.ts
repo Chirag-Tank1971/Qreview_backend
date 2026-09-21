@@ -105,10 +105,15 @@ export const KraTemplateItemSchema = z.object({
 export const KraTemplateSchema = z.object({
   title: z.string().trim().min(3, 'Template title must be at least 3 characters'),
   name: z.string().optional(),
-  departmentId: z.string().min(1, 'Department is required'),
+  employeeId: z.string().optional(),
+  employeeCode: z.string().optional(),
+  employeeName: z.string().optional(),
+  departmentId: z.string().optional(),
   departmentName: z.string().optional(),
   designationId: z.string().optional(),
   designationName: z.string().optional(),
+  cycleId: z.string().optional(),
+  cycleCode: z.string().optional(),
   items: z.array(KraTemplateItemSchema).min(1, 'At least one KRA item is required'),
   active: z.boolean().optional().default(true),
 }).refine(
@@ -142,6 +147,9 @@ export const ReviewKraSnapshotItemSchema = z.object({
   achievement: z.string().optional(),
   comments: z.string().optional(),
   issueReason: z.string().optional(),
+  hodRating: z.number().min(0, 'Rating cannot be negative').max(5, 'Rating cannot exceed 5').optional(),
+  hodAchievement: z.string().optional(),
+  hodComments: z.string().optional(),
 });
 
 export const SubmitSelfAssessmentSchema = z.object({

@@ -1,6 +1,7 @@
 import cron from 'node-cron';
 import { getDbCollection } from '../db.js';
 import { ReviewPeriod, EmployeeReview, Employee, Cycle } from '../../src/types/index.js';
+import { syncAllActiveEmployees } from '../syncHelpers.js';
 
 /**
  * Production Background Scheduler using node-cron
@@ -8,6 +9,20 @@ import { ReviewPeriod, EmployeeReview, Employee, Cycle } from '../../src/types/i
  */
 export function startBackgroundScheduler(): void {
   console.log('[Scheduler] Initializing automated background cron tasks...');
+
+  // 0. Daily at 07:00 AM: Auto-generate quarterly reviews for any employee who has newly
+  // become eligible (KRA assigned, tenure now met, manager assigned, etc.) without requiring
+  // HR to save their record or click "Sync" manually. Runs before the 08:00/08:30 reminder
+  // jobs below so anyone picked up today is included in those same-day reminders.
+  cron.schedule('0 7 * * *', async () => {
+    try {
+      console.log('[Scheduler] Running daily automatic review/appraisal eligibility sync...');
+      const { employeesProcessed } = await syncAllActiveEmployees();
+      console.log(`[Scheduler] Daily sync complete — re-evaluated ${employeesProcessed} active/probation employees.`);
+    } catch (err: any) {
+      console.error('[Scheduler] Error in daily automatic review sync job:', err.message);
+    }
+  });
 
   // 1. Daily at 08:00 AM: Check and send evaluation reminders to managers for pending reviews
   cron.schedule('0 8 * * *', async () => {

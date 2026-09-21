@@ -650,6 +650,118 @@ reviewRouter.get('/reviews/:id', authorizeReviewAccess('read'), async (req: Auth
 });
 
 /**
+ * Resolves exactly which employees a batch-generate run would touch for a given period/
+ * department/cycle scope — same status, department, cycle, existing-review, and tenure
+ * filtering the POST /reviews/generate-batch route below uses to actually create reviews.
+ * Shared by that route and the read-only preview endpoint so the "Eligible Employees in
+ * Scope" count shown before generating can never drift from what actually gets generated.
+ */
+async function resolveBatchEligibleEmployees(
+  reviewPeriodId: string,
+  departmentId: string | undefined,
+  cycleId: string | undefined,
+  overrideExisting: boolean
+): Promise<{ period: ReviewPeriod; eligible: Employee[]; skippedExisting: number; skippedTenure: number; skippedNoKra: number }> {
+  const periodCol = getDbCollection('reviewPeriods');
+  const empCol = getDbCollection('employees');
+  const cycleCol = getDbCollection('cycles');
+  const reviewCol = getDbCollection('employeeReviews');
+
+  const period: ReviewPeriod | null = await periodCol.findOne({ id: reviewPeriodId });
+  if (!period) {
+    throw new Error('Review period not found.');
+  }
+
+  let employees: Employee[] = await (await empCol.find({})).toArray();
+  employees = employees.filter((e) => e.status === 'ACTIVE' || e.status === 'PROBATION');
+
+  if (departmentId && departmentId !== 'ALL') {
+    employees = employees.filter((e) => e.departmentId === departmentId);
+  }
+
+  const allCycles: Cycle[] = await (await cycleCol.find({})).toArray();
+  if (cycleId && cycleId !== 'ALL') {
+    const targetCycle = allCycles.find((c) => c.id === cycleId || c.code === cycleId);
+    employees = employees.filter(
+      (e) =>
+        e.cycleId === cycleId ||
+        (targetCycle && (e.cycleId === targetCycle.id || e.cycleCode === targetCycle.code))
+    );
+  }
+
+  const existingReviews: EmployeeReview[] = await (await reviewCol.find({ reviewPeriodId })).toArray();
+
+  const eligible: Employee[] = [];
+  let skippedExisting = 0;
+  let skippedTenure = 0;
+  let skippedNoKra = 0;
+
+  for (const emp of employees) {
+    const existing = existingReviews.find((r) => r.employeeId === emp.id);
+    if (existing && !overrideExisting) {
+      skippedExisting++;
+      continue;
+    }
+
+    const eligibility = await checkEmployeeReviewEligibility(emp, period);
+    // An employee with no KRA scorecard assigned is never eligible — a review must never be
+    // generated using a fallback/borrowed/generic template (see resolveBatchEligibleEmployees
+    // callers below, and createQuarterlyReview/checkEmployeeReviewEligibility in
+    // reviewEligibility.ts, which enforce the same rule).
+    if (!eligibility.checks.hasKraTemplate) {
+      skippedNoKra++;
+      continue;
+    }
+    if (!eligibility.checks.tenureMet) {
+      skippedTenure++;
+      continue;
+    }
+
+    eligible.push(emp);
+  }
+
+  return { period, eligible, skippedExisting, skippedTenure, skippedNoKra };
+}
+
+/**
+ * GET /api/reviews/generate-batch/preview
+ * Read-only count of exactly how many (and which) employees a batch-generate run with this
+ * scope would touch — lets the UI show an accurate "Eligible Employees in Scope" number
+ * before committing to generation.
+ */
+reviewRouter.get(
+  '/reviews/generate-batch/preview',
+  requireRoles('SUPER_ADMIN', 'HR'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { reviewPeriodId, departmentId, cycleId, overrideExisting } = req.query;
+
+      if (!reviewPeriodId) {
+        return res.status(400).json({ error: 'reviewPeriodId is required.' });
+      }
+
+      const result = await resolveBatchEligibleEmployees(
+        String(reviewPeriodId),
+        departmentId ? String(departmentId) : undefined,
+        cycleId ? String(cycleId) : undefined,
+        overrideExisting === 'true'
+      );
+
+      res.json({
+        eligibleCount: result.eligible.length,
+        skippedExisting: result.skippedExisting,
+        skippedTenure: result.skippedTenure,
+        skippedNoKra: result.skippedNoKra,
+      });
+    } catch (error: any) {
+      res.status(error.message === 'Review period not found.' ? 404 : 500).json({
+        error: error.message || 'Failed to preview eligible employees.',
+      });
+    }
+  }
+);
+
+/**
  * POST /api/reviews/generate-batch
  * Generates reviews for active employees for a given reviewPeriodId, taking immutable snapshot of KRA template
  * Super Admin, HR, and HOD only
@@ -665,108 +777,48 @@ reviewRouter.post(
         return res.status(400).json({ error: 'reviewPeriodId is required.' });
       }
 
-      const periodCol = getDbCollection('reviewPeriods');
-      const empCol = getDbCollection('employees');
       const tmplCol = getDbCollection('kraTemplates');
       const cycleCol = getDbCollection('cycles');
       const reviewCol = getDbCollection('employeeReviews');
       const notifCol = getDbCollection('notifications');
 
-      const period: ReviewPeriod | null = await periodCol.findOne({ id: reviewPeriodId });
-      if (!period) {
-        return res.status(404).json({ error: 'Review period not found.' });
+      let period: ReviewPeriod;
+      let employees: Employee[];
+      let skippedCount = 0;
+      try {
+        const result = await resolveBatchEligibleEmployees(reviewPeriodId, departmentId, cycleId, Boolean(overrideExisting));
+        period = result.period;
+        employees = result.eligible;
+        skippedCount = result.skippedExisting + result.skippedTenure + result.skippedNoKra;
+      } catch (resolveErr: any) {
+        return res.status(resolveErr.message === 'Review period not found.' ? 404 : 500).json({
+          error: resolveErr.message || 'Failed to resolve eligible employees.',
+        });
       }
 
-      let employees: Employee[] = await (await empCol.find({})).toArray();
-      employees = employees.filter((e) => e.status === 'ACTIVE' || e.status === 'PROBATION');
-
-      if (departmentId && departmentId !== 'ALL') {
-        employees = employees.filter((e) => e.departmentId === departmentId);
-      }
       const allTemplates: KraTemplate[] = await (await tmplCol.find({})).toArray();
       const allCycles: Cycle[] = await (await cycleCol.find({})).toArray();
-
-      if (cycleId && cycleId !== 'ALL') {
-        const targetCycle = allCycles.find((c) => c.id === cycleId || c.code === cycleId);
-        employees = employees.filter(
-          (e) =>
-            e.cycleId === cycleId ||
-            (targetCycle && (e.cycleId === targetCycle.id || e.cycleCode === targetCycle.code))
-        );
-      }
       const existingReviews: EmployeeReview[] = await (await reviewCol.find({ reviewPeriodId })).toArray();
 
       let createdCount = 0;
-      let skippedCount = 0;
+      let skippedNoKraAtCreate = 0;
       const newReviews: EmployeeReview[] = [];
 
       for (const emp of employees) {
         const existing = existingReviews.find((r) => r.employeeId === emp.id);
-        if (existing && !overrideExisting) {
-          skippedCount++;
-          continue;
-        }
 
-        // Tenure eligibility check: Skip employees who do not meet the minimum tenure for the quarter
-        const eligibility = await checkEmployeeReviewEligibility(emp, period);
-        if (!eligibility.checks.tenureMet) {
-          skippedCount++;
-          continue;
-        }
-
-        // Find best matching KRA template:
-        // 1. Explicit template ID on employee
-        // 2. Matching designationId
-        // 3. Matching departmentId
-        // 4. Default fallback template
-        let template = allTemplates.find((t) => t.id === emp.currentKraTemplateId);
-        if (!template && emp.designationId) {
-          template = allTemplates.find((t) => t.designationId === emp.designationId);
-        }
-        if (!template && emp.departmentId) {
-          template = allTemplates.find((t) => t.departmentId === emp.departmentId);
-        }
-        if (!template && allTemplates.length > 0) {
-          template = allTemplates[0];
-        }
+        // Only the employee's own assigned KRA scorecard is used — no designation/department/
+        // any-template guessing (that could silently attach a different employee's personal
+        // scorecard), and no generic fallback KRAs. resolveBatchEligibleEmployees already
+        // filtered to employees with hasKraTemplate === true, so this should always resolve;
+        // the check here is a defensive guard against a template being deleted concurrently.
+        const template = emp.currentKraTemplateId
+          ? allTemplates.find((t) => t.id === emp.currentKraTemplateId)
+          : undefined;
 
         if (!template || !template.items || template.items.length === 0) {
-          // If no template exists, provide generic fallback KRA items
-          template = {
-            id: 'fallback_tmpl',
-            title: 'General Performance KRA',
-            departmentId: emp.departmentId,
-            totalWeight: 100,
-            active: true,
-            createdAt: new Date().toISOString(),
-            updatedAt: new Date().toISOString(),
-            items: [
-              {
-                id: 'item_fb_1',
-                title: 'Core Deliverables & Execution',
-                description: 'Timely and accurate delivery of core quarterly deliverables',
-                target: 'Complete assigned quarterly goals within SLA',
-                measurementCriteria: '1: Below SLA | 3: Meets SLA | 5: Exceeds SLA',
-                weight: 50,
-              },
-              {
-                id: 'item_fb_2',
-                title: 'Quality & Process Discipline',
-                description: 'Adherence to quality standards and zero defect slip rates',
-                target: 'Maintain high standards and zero critical defect slippages',
-                measurementCriteria: '1: Defects reported | 3: Clean execution | 5: Optimization',
-                weight: 30,
-              },
-              {
-                id: 'item_fb_3',
-                title: 'Team Collaboration & Initiative',
-                description: 'Peer collaboration, cross-functional synergy, and proactive initiatives',
-                target: 'Active cross-functional participation and peer support',
-                measurementCriteria: '1: Low initiative | 3: Solid support | 5: Proactive leadership',
-                weight: 20,
-              },
-            ],
-          };
+          skippedNoKraAtCreate++;
+          continue;
         }
 
         // Determine if appraisal month is due in this quarter
@@ -894,12 +946,13 @@ reviewRouter.post(
         );
       }
 
-      console.log(`[Review] Batch generated: ${createdCount} reviews created (${skippedCount} skipped) for period "${period.name}" by "${req.user?.name}" [${req.user?.role}]`);
+      const totalSkipped = skippedCount + skippedNoKraAtCreate;
+      console.log(`[Review] Batch generated: ${createdCount} reviews created (${totalSkipped} skipped) for period "${period.name}" by "${req.user?.name}" [${req.user?.role}]`);
 
       res.status(201).json({
         message: `Successfully generated ${createdCount} quarterly reviews for ${period.name}.`,
         createdCount,
-        skippedCount,
+        skippedCount: totalSkipped,
         periodName: period.name,
       });
     } catch (error: any) {
@@ -975,14 +1028,23 @@ reviewRouter.put(
       };
     });
 
-    const finalScore = Number(totalWeightedScore.toFixed(2));
+    const managerScore = Number(totalWeightedScore.toFixed(2));
     const isSubmitting = !isDraft;
+
+    // If HR returned this review directly to the manager (status 'RETURNED'), resubmission
+    // must go straight back to HR — not through HOD again. HOD's own score (if any) is left
+    // completely untouched here; only the manager's fields are ever written by this route.
+    const wasReturnedByHrToManager = existing.status === 'RETURNED';
 
     let newStatus: ReviewStatus = existing.status;
     let submittedByManager = false;
+    let skippedHodForHrReturn = false;
     if (isSubmitting) {
       if (req.user?.role === 'HR' || req.user?.role === 'SUPER_ADMIN') {
         newStatus = 'HR_COMPLETED';
+      } else if (wasReturnedByHrToManager) {
+        newStatus = 'HR_PENDING';
+        skippedHodForHrReturn = true;
       } else {
         // Manager submissions must pass through the mandatory HOD stage first.
         newStatus = 'HOD_PENDING';
@@ -990,6 +1052,13 @@ reviewRouter.put(
       }
     }
     const managerSubmitHodMissing = submittedByManager && !existing.hodId;
+
+    // Official finalScore: Manager's own score until HOD has also independently scored,
+    // at which point it becomes the average of the two (HOD's own score is never altered here).
+    const finalScore =
+      existing.hodScore !== undefined && existing.hodScore !== null
+        ? Number(((managerScore + existing.hodScore) / 2).toFixed(2))
+        : managerScore;
 
     const userRole = req.user?.role || 'MANAGER';
     const userName = req.user?.name || (userRole === 'HOD' ? 'Department HOD' : userRole === 'HR' ? 'HR Administrator' : 'Manager');
@@ -1004,6 +1073,8 @@ reviewRouter.put(
       performedByRole: userRole,
       remarks: managerSubmitHodMissing
         ? `${roleLabel} submitted evaluation scores with final weighted score: ${finalScore}. No HOD is configured for ${existing.employeeName} — review is blocked pending HOD assignment.`
+        : skippedHodForHrReturn
+        ? `${roleLabel} resubmitted evaluation scores (${managerScore}) after HR return — sent directly back to HR without another HOD pass.`
         : isSubmitting
         ? `${roleLabel} submitted evaluation scores with final weighted score: ${finalScore}`
         : 'Saved score and comment drafts',
@@ -1014,6 +1085,7 @@ reviewRouter.put(
       ...existing,
       kraSnapshot: updatedSnapshot,
       finalScore,
+      managerScore,
       strengths: strengths !== undefined ? strengths : existing.strengths,
       improvements: improvements !== undefined ? improvements : existing.improvements,
       managerOverallComments:
@@ -1060,6 +1132,26 @@ reviewRouter.put(
               type: 'HOD_MISSING_EXCEPTION',
               title: `Review Blocked: No HOD Configured for ${existing.employeeName}`,
               message: `${req.user?.name || 'Manager'} submitted a review for ${existing.employeeName}, but no HOD is assigned to this employee. Assign an HOD to unblock the review.`,
+              isRead: false,
+              priority: 'HIGH',
+              metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: newStatus },
+              createdAt: now,
+            },
+          },
+          { upsert: true }
+        );
+      } else if (skippedHodForHrReturn) {
+        // HR returned this directly to the manager — resubmission goes straight back to HR.
+        await notifsCol.updateOne(
+          { 'metadata.reviewId': id, type: 'HR_PENDING', userRole: 'HR' },
+          {
+            $set: {
+              id: `notif_${id}_hr_resubmit`,
+              userId: 'ALL',
+              userRole: 'HR',
+              type: 'HR_PENDING',
+              title: `Review Resubmitted: ${existing.employeeName}`,
+              message: `${req.user?.name || 'Manager'} resubmitted evaluation scores (${managerScore}) for ${existing.employeeName} after your return. Ready for your review.`,
               isRead: false,
               priority: 'HIGH',
               metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: newStatus },
@@ -1130,10 +1222,15 @@ reviewRouter.put(
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const { id } = req.params;
-      const { status, remarks } = req.body;
+      const { status, remarks, target } = req.body;
 
       if (!status) {
         return res.status(400).json({ error: 'Status is required.' });
+      }
+
+      // A return action requires a mandatory, specific reason — same rule as the HOD return flow.
+      if (status === 'RETURNED' && (!remarks || !String(remarks).trim())) {
+        return res.status(400).json({ error: 'Return reason is mandatory. Please provide specific feedback.' });
       }
 
       const reviewCol = getDbCollection('employeeReviews');
@@ -1146,6 +1243,16 @@ reviewRouter.put(
       if ((existing.isClosed || existing.status === 'CLOSED') && req.user?.role !== 'SUPER_ADMIN') {
         return res.status(400).json({ error: 'Cannot modify a closed review.' });
       }
+
+      // HR can return a review straight to the HOD instead of the Manager (e.g. HOD already
+      // approved but HR wants them to reconsider their own scoring). This only changes WHERE
+      // the review lands — the actual DB status still uses the existing enum values (HOD_PENDING),
+      // and the returnTarget below carries the distinction for badges/audit history.
+      const returnTarget: 'MANAGER' | 'HOD' = status === 'RETURNED' && target === 'HOD' ? 'HOD' : 'MANAGER';
+      if (status === 'RETURNED' && returnTarget === 'HOD' && !existing.hodId) {
+        return res.status(400).json({ error: 'Cannot return to HOD: no HOD is configured for this employee.' });
+      }
+      const effectiveStatus: ReviewStatus = status === 'RETURNED' && returnTarget === 'HOD' ? 'HOD_PENDING' : status;
 
       // NOTE: Quarterly Reviews must pass through the mandatory HOD_PENDING stage before
       // reaching HR — non-Super-Admin HR can no longer jump Manager-stage statuses directly
@@ -1165,32 +1272,33 @@ reviewRouter.put(
 
       const isSuperAdmin = req.user?.role === 'SUPER_ADMIN';
       const validNextStatuses = allowedTransitions[existing.status] || [];
-      if (!isSuperAdmin && status !== existing.status && !validNextStatuses.includes(status)) {
+      if (!isSuperAdmin && effectiveStatus !== existing.status && !validNextStatuses.includes(effectiveStatus)) {
         return res.status(400).json({
-          error: `Invalid status transition from '${existing.status}' to '${status}'.`,
+          error: `Invalid status transition from '${existing.status}' to '${effectiveStatus}'.`,
         });
       }
 
-      const isClosing = status === 'CLOSED';
+      const isClosing = effectiveStatus === 'CLOSED';
       let actionType: ReviewAction['action'] = 'SUBMITTED';
       if (status === 'RETURNED') actionType = 'RETURNED';
-      else if (status === 'HR_COMPLETED' || status === 'MANAGER_COMPLETED' || status === 'HOD_COMPLETED') actionType = 'APPROVED';
-      else if (status === 'CLOSED') actionType = 'CLOSED';
+      else if (effectiveStatus === 'HR_COMPLETED' || effectiveStatus === 'MANAGER_COMPLETED' || effectiveStatus === 'HOD_COMPLETED') actionType = 'APPROVED';
+      else if (effectiveStatus === 'CLOSED') actionType = 'CLOSED';
 
       const action: ReviewAction = {
         id: `act_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
         reviewId: id,
         action: actionType,
+        returnTarget: status === 'RETURNED' ? returnTarget : undefined,
         performedBy: req.user?.id || 'system',
         performedByName: req.user?.name || 'Administrator',
         performedByRole: req.user?.role || 'HR',
-        remarks: remarks || `Review status transitioned to ${status}`,
+        remarks: remarks || `Review status transitioned to ${effectiveStatus}`,
         performedAt: new Date().toISOString(),
       };
 
       const updatedReview: EmployeeReview = {
         ...existing,
-        status: status as ReviewStatus,
+        status: effectiveStatus,
         isClosed: isClosing,
         completedAt: isClosing ? (existing.completedAt || new Date().toISOString()) : undefined,
         actionHistory: [...(existing.actionHistory || []), action],
@@ -1209,7 +1317,7 @@ reviewRouter.put(
           id,
           existing.status,
           updatedReview.status,
-          `Transitioned review status for ${existing.employeeName} to ${status}: ${remarks || ''}`
+          `Transitioned review status for ${existing.employeeName} to ${effectiveStatus}: ${remarks || ''}`
         );
       }
 
@@ -1217,16 +1325,35 @@ reviewRouter.put(
       const notifsCol = getDbCollection('notifications');
       const now = new Date().toISOString();
 
-      if (status === 'RETURNED' && existing.managerId) {
+      if (status === 'RETURNED' && returnTarget === 'HOD' && existing.hodId) {
         await notifsCol.updateOne(
-          { 'metadata.reviewId': id, type: 'RETURNED' },
+          { 'metadata.reviewId': id, type: 'RETURNED', userId: existing.hodId },
+          {
+            $set: {
+              id: `notif_${id}_ret_hod`,
+              userId: existing.hodId,
+              userRole: 'HOD',
+              type: 'RETURNED',
+              title: `Review Returned by HR: ${existing.employeeName}`,
+              message: `HR returned the ${existing.reviewPeriodName} review for ${existing.employeeName} to you for recalibration: ${remarks || 'Please re-evaluate scores.'}`,
+              isRead: false,
+              priority: 'HIGH',
+              metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: 'HOD_PENDING' },
+              createdAt: now,
+            },
+          },
+          { upsert: true }
+        );
+      } else if (status === 'RETURNED' && existing.managerId) {
+        await notifsCol.updateOne(
+          { 'metadata.reviewId': id, type: 'RETURNED', userId: existing.managerId },
           {
             $set: {
               id: `notif_${id}_ret`,
               userId: existing.managerId,
               userRole: 'MANAGER',
               type: 'RETURNED',
-              title: `Review Returned: ${existing.employeeName}`,
+              title: `Review Returned by HR: ${existing.employeeName}`,
               message: `HR returned the ${existing.reviewPeriodName} review for ${existing.employeeName}: ${remarks || 'Please re-evaluate scores.'}`,
               isRead: false,
               priority: 'HIGH',
@@ -1236,7 +1363,7 @@ reviewRouter.put(
           },
           { upsert: true }
         );
-      } else if (status === 'HR_COMPLETED') {
+      } else if (effectiveStatus === 'HR_COMPLETED') {
         await notifsCol.updateOne(
           { 'metadata.reviewId': id, userId: existing.employeeId, type: 'HR_COMPLETED' },
           {
@@ -1257,7 +1384,7 @@ reviewRouter.put(
         );
       }
 
-      console.log(`[Review] Status transition: Review ${id} ("${existing.employeeName}"): ${existing.status} -> ${status} by "${req.user?.name}" [${req.user?.role}]`);
+      console.log(`[Review] Status transition: Review ${id} ("${existing.employeeName}"): ${existing.status} -> ${effectiveStatus} by "${req.user?.name}" [${req.user?.role}]`);
 
       res.json(updatedReview);
     } catch (error: any) {
@@ -1585,7 +1712,7 @@ reviewRouter.post(
   async (req: AuthenticatedRequest, res: Response) => {
     try {
       const { id } = req.params;
-      const updated = await hodApproveReview(id, req.body.hodComments, {
+      const updated = await hodApproveReview(id, req.body, {
         id: req.user!.id,
         name: req.user!.name,
         role: req.user!.role,

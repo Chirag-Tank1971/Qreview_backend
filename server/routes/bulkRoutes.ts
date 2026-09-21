@@ -2,6 +2,7 @@ import { Router, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { getDbCollection } from '../db.js';
 import { AuthenticatedRequest, authenticateToken, requireRoles } from '../auth.js';
+import { resyncUnscoredReviewKraSnapshots, syncEmployeeAppraisalsAndReviews } from '../syncHelpers.js';
 import {
   BulkDatasetType,
   BulkTemplateColumn,
@@ -23,48 +24,37 @@ bulkRouter.use(requireRoles('SUPER_ADMIN', 'HR'));
 
 const TEMPLATE_COLUMNS: Record<BulkDatasetType, BulkTemplateColumn[]> = {
   employees: [
-    { key: 'employeeCode', label: 'Employee Code', description: 'Unique internal ID (e.g. EMP-101)', required: true, example: 'EMP-101', type: 'string' },
+    { key: 'employeeCode', label: 'Employee Code', description: 'Unique internal ID (e.g. MS0001 or MS1445)', required: true, example: 'MS0001', type: 'string' },
     { key: 'fullName', label: 'Full Name', description: 'Employee First and Last Name', required: true, example: 'Aarav Sharma', type: 'string' },
     { key: 'email', label: 'Work Email', description: 'Unique corporate email address', required: true, example: 'aarav.sharma@company.com', type: 'string' },
     { key: 'joiningDate', label: 'Joining Date', description: 'Date of joining (YYYY-MM-DD)', required: true, example: '2025-01-15', type: 'date' },
-    { key: 'cycleCode', label: 'Cycle Code', description: 'Appraisal Cycle: CYCLE_JUN or CYCLE_SEP (must be assigned manually, no auto-derivation)', required: true, example: 'CYCLE_JUN', type: 'enum', options: ['CYCLE_JUN', 'CYCLE_SEP'] },
+    { key: 'confirmationDate', label: 'Confirmation Date', description: 'Date of permanent confirmation (YYYY-MM-DD)', required: false, example: '2025-05-15', type: 'date' },
+    { key: 'gender', label: 'Gender', description: 'Gender identity', required: false, example: 'Male', type: 'enum', options: ['Male', 'Female', 'Other'] },
+    { key: 'employmentType', label: 'Employment Type', description: 'Permanent, Contract, or Intern', required: false, example: 'Permanent', type: 'string' },
+    { key: 'cycleCode', label: 'Cycle Code', description: 'Appraisal Cycle: CYCLE_JUN or CYCLE_SEP (optional - auto-derived from Joining Date if omitted)', required: false, example: 'CYCLE_JUN', type: 'enum', options: ['CYCLE_JUN', 'CYCLE_SEP'] },
     { key: 'department', label: 'Department', description: 'Department Name or Code', required: true, example: 'Engineering', type: 'string' },
     { key: 'designation', label: 'Designation', description: 'Official Job Designation Title', required: true, example: 'Senior Software Engineer', type: 'string' },
-    { key: 'managerCode', label: 'Reporting Manager Code', description: 'Employee Code of Reporting Manager (e.g. EMP-004)', required: false, example: 'EMP-004', type: 'string' },
-    { key: 'hodCode', label: 'HOD Code', description: 'Employee Code of Head of Department (e.g. EMP-001; defaults to Department HOD if blank)', required: false, example: 'EMP-001', type: 'string' },
+    { key: 'managerCode', label: 'Reporting Manager Code', description: 'Employee Code or Name of Reporting Manager (e.g. MS0001 or MS0034)', required: false, example: 'MS0001', type: 'string' },
+    { key: 'hodCode', label: 'HOD Code', description: 'Employee Code or Name of Head of Department (e.g. MS0016)', required: false, example: 'MS0016', type: 'string' },
+    { key: 'probationPeriodDays', label: 'Probation Period In Days', description: 'Probation period in days', required: false, example: '120', type: 'number' },
+    { key: 'companyName', label: 'Company', description: 'Company or Legal Entity Name', required: false, example: 'M INTERGRAPH SYSTEMS PRIVATE LIMITED', type: 'string' },
+    { key: 'location', label: 'Location', description: 'Work office location / city', required: false, example: 'Delhi', type: 'string' },
     { key: 'baseSalary', label: 'Base Annual CTC (₹)', description: 'Current Annual CTC figure in INR', required: true, example: '1850000', type: 'number' },
-    { key: 'role', label: 'System Role', description: 'Access Role in PMS', required: false, example: 'EMPLOYEE', type: 'enum', options: ['EMPLOYEE', 'MANAGER', 'HOD', 'HR_ADMIN', 'CXO'] },
+    { key: 'role', label: 'System Role', description: 'Access Role in PMS', required: true, example: 'EMPLOYEE', type: 'enum', options: ['EMPLOYEE', 'MANAGER', 'HOD', 'HR_ADMIN', 'CXO'] },
     { key: 'status', label: 'Employment Status', description: 'Active or probation', required: false, example: 'ACTIVE', type: 'enum', options: ['ACTIVE', 'PROBATION', 'NOTICE'] },
   ],
   kras: [
-    { key: 'templateTitle', label: 'Template Title', description: 'Standardized Template Group', required: true, example: 'Engineering Senior Core KRA 2026', type: 'string' },
-    { key: 'department', label: 'Department', description: 'Target Department', required: true, example: 'Engineering', type: 'string' },
-    { key: 'designation', label: 'Designation', description: 'Applicable Designation Title', required: true, example: 'Senior Software Engineer', type: 'string' },
-    { key: 'cycleCode', label: 'Cycle Code', description: 'Cycle: CYCLE_JUN, CYCLE_SEP, or ALL', required: true, example: 'CYCLE_JUN', type: 'enum', options: ['ALL', 'CYCLE_JUN', 'CYCLE_SEP'] },
+    { key: 'employeeCode', label: 'Employee Code', description: 'Target Employee Code (e.g. MS1184 or MS0038). Optional - leave blank for general library template.', required: false, example: 'MS1184', type: 'string' },
+    { key: 'employeeName', label: 'Employee Name', description: 'Employee Full Name (optional)', required: false, example: 'Akshay Tyagi', type: 'string' },
+    { key: 'templateTitle', label: 'Template Title', description: 'Scorecard Name / Template Group', required: false, example: 'Akshay Tyagi - 2026 KRAs', type: 'string' },
+    { key: 'department', label: 'Department', description: 'Target Department (optional if Employee Code given)', required: false, example: 'Engineering', type: 'string' },
+    { key: 'designation', label: 'Designation', description: 'Applicable Designation Title (optional if Employee Code given)', required: false, example: 'Senior Software Engineer', type: 'string' },
+    { key: 'cycleCode', label: 'Cycle Code', description: 'Cycle: CYCLE_JUN, CYCLE_SEP, or ALL', required: false, example: 'CYCLE_JUN', type: 'enum', options: ['ALL', 'CYCLE_JUN', 'CYCLE_SEP'] },
     { key: 'kraTitle', label: 'KRA Title', description: 'Specific Key Result Area name', required: true, example: 'System Architecture & Scalability', type: 'string' },
-    { key: 'weightage', label: 'Weightage (%)', description: 'KRA weight (sum of all KRAs in template = 100)', required: true, example: '30', type: 'number' },
-    { key: 'targetDescription', label: 'Target Description', description: 'Measurable metric goal description', required: true, example: 'Deliver zero-downtime microservice migration', type: 'string' },
+    { key: 'weightage', label: 'Weightage (%)', description: 'KRA weight (sum of all KRAs for employee/template = 100)', required: true, example: '30', type: 'number' },
+    { key: 'targetDescription', label: 'Target / Description', description: 'Measurable metric goal description or SLA', required: true, example: 'Deliver zero-downtime microservice migration', type: 'string' },
     { key: 'measurementUnit', label: 'Unit', description: 'Measurement unit type', required: false, example: 'PERCENTAGE', type: 'enum', options: ['PERCENTAGE', 'NUMERIC', 'RATING', 'CURRENCY', 'MILESTONE'] },
-    { key: 'targetValue', label: 'Target Value', description: 'Benchmark target number/text', required: true, example: '99.95', type: 'string' },
-  ],
-  'quarterly-scores': [
-    { key: 'employeeCode', label: 'Employee Code', description: 'Employee Code', required: true, example: 'EMP-101', type: 'string' },
-    { key: 'periodCode', label: 'Quarter Period Code', description: 'Review Period (e.g. Q1_2026, Q2_2026, Q3_2026, Q4_2026)', required: true, example: 'Q1_2026', type: 'string' },
-    { key: 'kraTitle', label: 'KRA Title', description: 'KRA matching employee template', required: true, example: 'System Architecture & Scalability', type: 'string' },
-    { key: 'selfScore', label: 'Self Score (1-5)', description: 'Employee self rating 1.0 to 5.0', required: false, example: '4.2', type: 'number' },
-    { key: 'managerScore', label: 'Manager Score (1-5)', description: 'Manager verified rating 1.0 to 5.0', required: true, example: '4.5', type: 'number' },
-    { key: 'managerComments', label: 'Manager Feedback & Remarks', description: 'Detailed constructive manager comments', required: true, example: 'Demonstrated exceptional leadership and architectural rigor.', type: 'string' },
-    { key: 'status', label: 'Review Status', description: 'Target review submission status', required: false, example: 'MANAGER_COMPLETED', type: 'enum', options: ['DRAFT', 'SELF_SUBMITTED', 'MANAGER_COMPLETED', 'HR_COMPLETED'] },
-  ],
-  'increment-matrix': [
-    { key: 'employeeCode', label: 'Employee Code', description: 'Employee Code', required: true, example: 'EMP-101', type: 'string' },
-    { key: 'cycleCode', label: 'Cycle Code', description: 'Appraisal Cycle Code', required: true, example: 'CYCLE_JUN', type: 'string' },
-    { key: 'finalRating', label: 'Calibrated Rating', description: 'Annual Performance Category', required: true, example: 'OUTSTANDING', type: 'enum', options: ['OUTSTANDING', 'EXCEEDS_EXPECTATIONS', 'MEETS_EXPECTATIONS', 'NEEDS_IMPROVEMENT', 'UNSATISFACTORY'] },
-    { key: 'proposedIncrementPercent', label: 'Increment (%)', description: 'Proposed salary increment percentage', required: true, example: '14.5', type: 'number' },
-    { key: 'promotionEligible', label: 'Promotion (YES/NO)', description: 'Whether employee is recommended for promotion', required: false, example: 'YES', type: 'string' },
-    { key: 'promotedDesignation', label: 'Promoted Designation', description: 'New Designation if promoted', required: false, example: 'Staff Software Engineer', type: 'string' },
-    { key: 'bonusAmount', label: 'Performance Bonus (₹)', description: 'One-time bonus allocation', required: false, example: '150000', type: 'number' },
-    { key: 'hodNotes', label: 'HOD / Calibration Notes', description: 'HOD justification for calibration or merit hike', required: false, example: 'Top 5% performer across engineering pod; recommended for fast-track promotion.', type: 'string' },
+    { key: 'targetValue', label: 'Target Value', description: 'Benchmark target number/text', required: false, example: '99.95', type: 'string' },
   ],
 };
 
@@ -76,18 +66,15 @@ const SAMPLE_DATA: Record<BulkDatasetType, any[]> = {
     { employeeCode: 'EMP-204', fullName: 'Sameer Gupta', email: 'sameer.gupta@company.com', joiningDate: '2025-04-18', cycleCode: 'CYCLE_SEP', department: 'Sales & Growth', designation: 'Enterprise Account Executive', managerCode: 'EMP-005', hodCode: 'EMP-002', baseSalary: 1750000, role: 'EMPLOYEE', status: 'ACTIVE' },
   ],
   kras: [
-    { templateTitle: 'Sales Enterprise Executive 2026', department: 'Sales & Growth', designation: 'Enterprise Account Executive', cycleCode: 'ALL', kraTitle: 'Net New ARR Bookings', weightage: 40, targetDescription: 'Achieve ₹2.5 Cr in new annualized enterprise contract value', measurementUnit: 'CURRENCY', targetValue: '25000000' },
-    { templateTitle: 'Sales Enterprise Executive 2026', department: 'Sales & Growth', designation: 'Enterprise Account Executive', cycleCode: 'ALL', kraTitle: 'Pipeline Generation & Multi-Threading', weightage: 30, targetDescription: 'Generate 4x qualified pipeline coverage each quarter', measurementUnit: 'NUMERIC', targetValue: '4.0' },
-    { templateTitle: 'Sales Enterprise Executive 2026', department: 'Sales & Growth', designation: 'Enterprise Account Executive', cycleCode: 'ALL', kraTitle: 'Customer Retention & Deal Velocity', weightage: 30, targetDescription: 'Maintain <45 day sales cycle with 95% retention', measurementUnit: 'PERCENTAGE', targetValue: '95' },
-  ],
-  'quarterly-scores': [
-    { employeeCode: 'EMP-004', periodCode: 'Q1_2026', kraTitle: 'Feature Delivery Velocity & Code Quality', selfScore: 4.5, managerScore: 4.8, managerComments: 'Exceeded sprints consistently with zero P1 production bugs.', status: 'MANAGER_COMPLETED' },
-    { employeeCode: 'EMP-004', periodCode: 'Q1_2026', kraTitle: 'System Scalability & Unit Test Coverage', selfScore: 4.0, managerScore: 4.5, managerComments: 'Raised pod test coverage from 78% to 92%. Outstanding rigor.', status: 'MANAGER_COMPLETED' },
-    { employeeCode: 'EMP-004', periodCode: 'Q1_2026', kraTitle: 'Mentorship & Peer Code Reviews', selfScore: 4.2, managerScore: 4.6, managerComments: 'Mentored two junior engineers effectively and led team tech talks.', status: 'MANAGER_COMPLETED' },
-  ],
-  'increment-matrix': [
-    { employeeCode: 'EMP-004', cycleCode: 'CYCLE_SEP', finalRating: 'OUTSTANDING', proposedIncrementPercent: 15.0, promotionEligible: 'YES', promotedDesignation: 'Lead Frontend Engineer', bonusAmount: 120000, hodNotes: 'Exemplary cross-functional impact; promoted to Pod Lead.' },
-    { employeeCode: 'EMP-006', cycleCode: 'CYCLE_SEP', finalRating: 'EXCEEDS_EXPECTATIONS', proposedIncrementPercent: 11.5, promotionEligible: 'NO', promotedDesignation: '', bonusAmount: 75000, hodNotes: 'Strong consistency throughout 4 quarters. Merit increment approved.' },
+    { employeeCode: 'MS1184', employeeName: 'Akshay Tyagi', department: 'Service', designation: 'Field Engineer', cycleCode: 'CYCLE_JUN', kraTitle: 'Ownership of breakdown calls, reaching timely at customer place', weightage: 15, targetDescription: 'Prompt resolution of breakdown tickets within SLA', measurementUnit: 'PERCENTAGE', targetValue: '100' },
+    { employeeCode: 'MS1184', employeeName: 'Akshay Tyagi', department: 'Service', designation: 'Field Engineer', cycleCode: 'CYCLE_JUN', kraTitle: 'Defective Spares returned to HO weekly/Claim Submission', weightage: 10, targetDescription: 'Weekly return of defective inventory and bi-weekly claim submission', measurementUnit: 'PERCENTAGE', targetValue: '100' },
+    { employeeCode: 'MS1184', employeeName: 'Akshay Tyagi', department: 'Service', designation: 'Field Engineer', cycleCode: 'CYCLE_JUN', kraTitle: 'Daily attendance sharing latest by morning 10 AM', weightage: 10, targetDescription: 'Timely daily check-in by 10 AM', measurementUnit: 'PERCENTAGE', targetValue: '100' },
+    { employeeCode: 'MS1184', employeeName: 'Akshay Tyagi', department: 'Service', designation: 'Field Engineer', cycleCode: 'CYCLE_JUN', kraTitle: 'Willingness to attend customer site as needed during off days', weightage: 20, targetDescription: 'Emergency client support availability', measurementUnit: 'PERCENTAGE', targetValue: '100' },
+    { employeeCode: 'MS1184', employeeName: 'Akshay Tyagi', department: 'Service', designation: 'Field Engineer', cycleCode: 'CYCLE_JUN', kraTitle: 'Problem diagnosis & 1st Visit call closure ability', weightage: 15, targetDescription: 'First-time right diagnosis and swift call closure', measurementUnit: 'PERCENTAGE', targetValue: '100' },
+    { employeeCode: 'MS1184', employeeName: 'Akshay Tyagi', department: 'Service', designation: 'Field Engineer', cycleCode: 'CYCLE_JUN', kraTitle: 'Improvement during the FY in technical terms', weightage: 15, targetDescription: 'Skill enhancement and technical certifications', measurementUnit: 'PERCENTAGE', targetValue: '100' },
+    { employeeCode: 'MS1184', employeeName: 'Akshay Tyagi', department: 'Service', designation: 'Field Engineer', cycleCode: 'CYCLE_JUN', kraTitle: 'Customer feedback on performance', weightage: 5, targetDescription: 'Positive client CSAT feedback', measurementUnit: 'PERCENTAGE', targetValue: '100' },
+    { employeeCode: 'MS1184', employeeName: 'Akshay Tyagi', department: 'Service', designation: 'Field Engineer', cycleCode: 'CYCLE_JUN', kraTitle: 'Low Consumption of Spares', weightage: 5, targetDescription: 'Optimal spare utilization', measurementUnit: 'PERCENTAGE', targetValue: '100' },
+    { employeeCode: 'MS1184', employeeName: 'Akshay Tyagi', department: 'Service', designation: 'Field Engineer', cycleCode: 'CYCLE_JUN', kraTitle: 'Attitude to learn & grow/Skill Upgradation', weightage: 5, targetDescription: 'Active participation in upskilling programs', measurementUnit: 'PERCENTAGE', targetValue: '100' },
   ],
 };
 
@@ -250,6 +237,318 @@ setTimeout(() => {
   }).catch(() => {});
 }, 3000);
 
+export function cleanCode(val: any): string {
+  const str = String(val || '').trim();
+  if (str.includes(' - ')) {
+    return str.split(' - ')[0].trim().toUpperCase();
+  }
+  return str.toUpperCase();
+}
+
+export function parseExcelDateStr(val: any): string {
+  if (!val) return '';
+  if (typeof val === 'number') {
+    const d = new Date(Math.round((val - 25569) * 86400 * 1000));
+    return isNaN(d.getTime()) ? String(val) : d.toISOString().split('T')[0];
+  }
+  const str = String(val).trim();
+  if (/^\d{5}$/.test(str)) {
+    const num = Number(str);
+    const d = new Date(Math.round((num - 25569) * 86400 * 1000));
+    return isNaN(d.getTime()) ? str : d.toISOString().split('T')[0];
+  }
+  if (/^\d{4}-\d{2}-\d{2}/.test(str)) {
+    return str.split('T')[0];
+  }
+  const parsed = new Date(str);
+  if (!isNaN(parsed.getTime())) {
+    return parsed.toISOString().split('T')[0];
+  }
+  return str;
+}
+
+export function normalizeEmployeeInputRow(raw: any): any {
+  if (!raw || typeof raw !== 'object') return raw;
+  const row = { ...raw };
+
+  // Employee Code
+  if (!row.employeeCode) {
+    row.employeeCode =
+      row['Emp Code'] ||
+      row['emp_code'] ||
+      row['Employee Code'] ||
+      row['employee_code'] ||
+      row['Employee ID'] ||
+      row['emp_id'] ||
+      row.code ||
+      '';
+  }
+
+  // Full Name
+  if (!row.fullName) {
+    row.fullName =
+      row['Full Name'] ||
+      row['full_name'] ||
+      row['Employee Name'] ||
+      row['employee_name'] ||
+      row.name ||
+      row['Name'] ||
+      '';
+  }
+
+  // Email
+  if (!row.email) {
+    row.email =
+      row['Official Email'] ||
+      row['official_email'] ||
+      row['Work Email'] ||
+      row['work_email'] ||
+      row['Email'] ||
+      row['email_id'] ||
+      '';
+  }
+
+  // Joining Date
+  const rawJoin = row.joiningDate || row['Joining Date'] || row['joining_date'] || row.doj || '';
+  if (rawJoin) {
+    row.joiningDate = parseExcelDateStr(rawJoin);
+  }
+
+  // Confirmation Date
+  const rawConf = row.confirmationDate || row['Confirmation Date'] || row['confirmation_date'] || row.doc || '';
+  if (rawConf) {
+    row.confirmationDate = parseExcelDateStr(rawConf);
+  }
+
+  // Gender
+  if (!row.gender && (row['Gender'] || row['gender'])) {
+    row.gender = row['Gender'] || row['gender'];
+  }
+
+  // Employment Type
+  if (!row.employmentType && (row['Employment Type'] || row['employment_type'])) {
+    row.employmentType = row['Employment Type'] || row['employment_type'];
+  }
+
+  // Probation Period In Days
+  if (row.probationPeriodDays === undefined && (row['Probation Period In Days'] !== undefined || row['probation_period'] !== undefined)) {
+    row.probationPeriodDays = row['Probation Period In Days'] ?? row['probation_period'];
+  }
+
+  // Company
+  if (!row.companyName && (row['Company'] || row['company'] || row['company_name'])) {
+    row.companyName = row['Company'] || row['company'] || row['company_name'];
+  }
+
+  // Location
+  if (!row.location && (row['Location'] || row['location'])) {
+    row.location = row['Location'] || row['location'];
+  }
+
+  // Department
+  if (!row.department && (row['Department'] || row['department'])) {
+    row.department = row['Department'] || row['department'];
+  }
+
+  // Designation
+  if (!row.designation && (row['Designation'] || row['designation'])) {
+    row.designation = row['Designation'] || row['designation'];
+  }
+
+  // Manager Code & Name
+  const rawMgr =
+    row.managerCode ||
+    row['Reporting Manager'] ||
+    row['reporting_manager'] ||
+    row['Reporting Manager Code'] ||
+    row.manager ||
+    row.managerEmployeeCode ||
+    '';
+  if (rawMgr) {
+    row.managerCode = cleanCode(rawMgr);
+    if (String(rawMgr).includes(' - ') && !row.managerName) {
+      row.managerName = String(rawMgr).split(' - ').slice(1).join(' - ').trim();
+    }
+  }
+
+  // HOD Code & Name
+  const rawHod =
+    row.hodCode ||
+    row['HOD'] ||
+    row['hod'] ||
+    row['HOD Code'] ||
+    row['head_of_department'] ||
+    row.hodEmployeeCode ||
+    '';
+  if (rawHod) {
+    row.hodCode = cleanCode(rawHod);
+    if (String(rawHod).includes(' - ') && !row.hodName) {
+      row.hodName = String(rawHod).split(' - ').slice(1).join(' - ').trim();
+    }
+  }
+
+  // Base Salary
+  if (row.baseSalary === undefined || row.baseSalary === null || row.baseSalary === '') {
+    row.baseSalary =
+      row['CTC TOTAL'] ??
+      row['ctc_total'] ??
+      row['Base Annual CTC (₹)'] ??
+      row['base_salary'] ??
+      row['currentCtc'] ??
+      row['ctc'] ??
+      row['salary'];
+  }
+
+  // Cycle Code
+  if (!row.cycleCode && (row['Cycle Code'] || row['cycle_code'])) {
+    row.cycleCode = row['Cycle Code'] || row['cycle_code'];
+  }
+
+  // System Role
+  if (!row.role && (row['System Role'] || row['system_role'] || row['Role'] || row['role'] || row['systemRole'] || row['accessRole'] || row['Access Role'])) {
+    row.role = row['System Role'] || row['system_role'] || row['Role'] || row['role'] || row['systemRole'] || row['accessRole'] || row['Access Role'];
+  }
+  if (row.role) {
+    row.role = String(row.role).trim();
+  }
+
+  // Employment Status
+  if (!row.status && (row['Employment Status'] || row['employment_status'] || row['Status'] || row['status'])) {
+    row.status = row['Employment Status'] || row['employment_status'] || row['Status'] || row['status'];
+  }
+
+  return row;
+}
+
+export function normalizeKraInputRow(raw: any): any {
+  if (!raw || typeof raw !== 'object') return raw;
+  const row = { ...raw };
+
+  // Employee Code
+  if (!row.employeeCode) {
+    row.employeeCode =
+      row['Employee Code'] ||
+      row['employee_code'] ||
+      row['Emp Code'] ||
+      row['emp_code'] ||
+      row['Emp Id'] ||
+      row['emp_id'] ||
+      row['Employee ID'] ||
+      row['Code'] ||
+      row['code'] ||
+      '';
+  }
+  if (row.employeeCode) {
+    row.employeeCode = cleanCode(row.employeeCode);
+  }
+
+  // Employee Name
+  if (!row.employeeName) {
+    row.employeeName =
+      row['Employee Name'] ||
+      row['employee_name'] ||
+      row['Full Name'] ||
+      row['full_name'] ||
+      row['Name'] ||
+      row['name'] ||
+      '';
+  }
+
+  // KRA Title
+  if (!row.kraTitle) {
+    row.kraTitle =
+      row['KRA Title'] ||
+      row['kra_title'] ||
+      row['KEY RESULT AREA'] ||
+      row['Key Result Area'] ||
+      row['key_result_area'] ||
+      row['KRA'] ||
+      row['kra'] ||
+      row['Title'] ||
+      row['title'] ||
+      '';
+  }
+
+  // Weightage
+  if (row.weightage === undefined || row.weightage === null || row.weightage === '') {
+    row.weightage =
+      row['Weightage (%)'] ??
+      row['Weightage'] ??
+      row['weightage'] ??
+      row['WEIGHTAGE'] ??
+      row['Weight (%)'] ??
+      row['Weight'] ??
+      row['weight'] ??
+      row['Weight %'];
+  }
+
+  // Target Description / Target
+  if (!row.targetDescription) {
+    row.targetDescription =
+      row['Target Description'] ||
+      row['target_description'] ||
+      row['TARGET'] ||
+      row['Target'] ||
+      row['target'] ||
+      row['Targets'] ||
+      row['Description'] ||
+      row['description'] ||
+      (row.kraTitle ? `Target for ${row.kraTitle}` : '');
+  }
+
+  // Target Value
+  if (!row.targetValue) {
+    row.targetValue =
+      row['Target Value'] ||
+      row['target_value'] ||
+      row['Value'] ||
+      row['value'] ||
+      '100';
+  }
+
+  // Template Title
+  if (!row.templateTitle) {
+    row.templateTitle =
+      row['Template Title'] ||
+      row['template_title'] ||
+      row['Template Name'] ||
+      row['template_name'] ||
+      (row.employeeName ? `${row.employeeName} - Performance Scorecard` : row.employeeCode ? `${row.employeeCode} - Performance Scorecard` : 'General KRA Template');
+  }
+
+  // Department
+  if (!row.department) {
+    row.department =
+      row['Department'] ||
+      row['department'] ||
+      row['Dept'] ||
+      row['dept'] ||
+      '';
+  }
+
+  // Designation
+  if (!row.designation) {
+    row.designation =
+      row['Designation'] ||
+      row['designation'] ||
+      row['Role'] ||
+      row['role'] ||
+      '';
+  }
+
+  // Cycle Code
+  if (!row.cycleCode) {
+    row.cycleCode =
+      row['Cycle Code'] ||
+      row['cycle_code'] ||
+      row['Cycle'] ||
+      row['cycle'] ||
+      'ALL';
+  }
+
+  return row;
+}
+
 // ==========================================
 // 2. VALIDATION ENGINE
 // ==========================================
@@ -290,6 +589,10 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
     const existingUsers = await (await usersCol.find({})).toArray();
 
     const empCodeMap = new Set(existingEmployees.map((e) => String(e.employeeCode || '').trim().toUpperCase()));
+    const empObjMap = new Map<string, any>();
+    existingEmployees.forEach((e) => {
+      if (e.employeeCode) empObjMap.set(String(e.employeeCode).trim().toUpperCase(), e);
+    });
     const empEmailMap = new Set(existingEmployees.map((e) => String(e.email || '').trim().toLowerCase()));
     const userEmailMap = new Set(existingUsers.map((u) => String(u.email || '').trim().toLowerCase()));
 
@@ -307,15 +610,32 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
     let warningCount = 0;
     let errorCount = 0;
 
+    // Pre-calculate KRA weightage sums per employee or template
+    const kraWeightsByTarget = new Map<string, number>();
+    if (datasetType === 'kras') {
+      for (const r of rows) {
+        const norm = normalizeKraInputRow(r);
+        const targetKey = norm.employeeCode ? `EMP:${norm.employeeCode}` : `TPL:${norm.templateTitle || 'General'}`;
+        const w = Number(norm.weightage) || 0;
+        kraWeightsByTarget.set(targetKey, (kraWeightsByTarget.get(targetKey) || 0) + w);
+      }
+    }
+
     rows.forEach((rawRow: any, index: number) => {
       const rowNumber = index + 1;
       const errors: string[] = [];
       const warnings: string[] = [];
       let action: 'INSERT' | 'UPDATE' | 'SKIP' = 'INSERT';
 
+      const row = datasetType === 'employees' ? normalizeEmployeeInputRow(rawRow) : datasetType === 'kras' ? normalizeKraInputRow(rawRow) : rawRow;
+
       // 1. Check Required Fields
       for (const reqKey of requiredKeys) {
-        const val = rawRow[reqKey];
+        if (datasetType === 'employees' && reqKey === 'cycleCode') {
+          // Handled below: can be auto-derived from joiningDate if omitted
+          continue;
+        }
+        const val = row[reqKey];
         if (val === undefined || val === null || String(val).trim() === '') {
           errors.push(`Missing required field: '${reqKey}'`);
         }
@@ -323,18 +643,18 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
 
       // Dataset specific validations
       if (datasetType === 'employees') {
-        const code = String(rawRow.employeeCode || '').trim().toUpperCase();
-        const email = String(rawRow.email || '').trim().toLowerCase();
-        const cycle = String(rawRow.cycleCode || '').trim().toUpperCase();
-        const dept = String(rawRow.department || '').trim().toLowerCase();
-        const desig = String(rawRow.designation || '').trim().toLowerCase();
-        const mgrCode = String(
-          rawRow.managerCode || rawRow.managerEmployeeCode || rawRow.reportingManagerCode || rawRow.manager || ''
-        ).trim().toUpperCase();
-        const hodCode = String(
-          rawRow.hodCode || rawRow.hodEmployeeCode || rawRow.headOfDepartmentCode || rawRow.hod || ''
-        ).trim().toUpperCase();
-        const salary = Number(rawRow.baseSalary);
+        const code = String(row.employeeCode || '').trim().toUpperCase();
+        const email = String(row.email || '').trim().toLowerCase();
+        const cycle = String(row.cycleCode || '').trim().toUpperCase();
+        const dept = String(row.department || '').trim().toLowerCase();
+        const desig = String(row.designation || '').trim().toLowerCase();
+        const mgrCode = cleanCode(
+          row.managerCode || row.managerEmployeeCode || row.reportingManagerCode || row.manager || ''
+        );
+        const hodCode = cleanCode(
+          row.hodCode || row.hodEmployeeCode || row.headOfDepartmentCode || row.hod || ''
+        );
+        const salary = Number(row.baseSalary);
 
         // Code checks
         if (code) {
@@ -369,19 +689,34 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
           }
         }
 
-        // Cycle check — must be assigned explicitly, no auto-derivation from joining date
-        if (cycle && !cycleCodeSet.has(cycle) && !['CYCLE_JUN', 'CYCLE_SEP'].includes(cycle)) {
-          errors.push(`Invalid Cycle Code '${cycle}'. Must be CYCLE_JUN or CYCLE_SEP.`);
+        // Cycle check — validate if present, or auto-derive from joiningDate if omitted
+        if (cycle) {
+          if (!cycleCodeSet.has(cycle) && !['CYCLE_JUN', 'CYCLE_SEP'].includes(cycle)) {
+            errors.push(`Invalid Cycle Code '${cycle}'. Must be CYCLE_JUN or CYCLE_SEP.`);
+          }
+        } else {
+          if (row.joiningDate) {
+            const pDate = new Date(row.joiningDate);
+            if (!isNaN(pDate.getTime())) {
+              const m = pDate.getMonth() + 1;
+              const derived = m >= 1 && m <= 7 ? 'CYCLE_JUN' : 'CYCLE_SEP';
+              warnings.push(`Cycle Code was not specified; will auto-derive as ${derived} from Joining Date.`);
+            } else {
+              errors.push("Missing required field: 'cycleCode' (Joining Date is invalid).");
+            }
+          } else {
+            errors.push("Missing required field: 'cycleCode' (or provide a valid Joining Date).");
+          }
         }
 
         // Department check
         if (dept && !deptNameSet.has(dept) && !deptCodeSet.has(dept)) {
-          warnings.push(`Department '${rawRow.department}' not found in masters; will be auto-created.`);
+          warnings.push(`Department '${row.department}' not found in masters; will be auto-created.`);
         }
 
         // Designation check
         if (desig && !desigNameSet.has(desig)) {
-          warnings.push(`Designation '${rawRow.designation}' not found in masters; will be auto-created.`);
+          warnings.push(`Designation '${row.designation}' not found in masters; will be auto-created.`);
         }
 
         // Manager check
@@ -402,37 +737,56 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
         if (isNaN(salary) || salary <= 0) {
           errors.push('Base Salary must be a positive numeric amount.');
         }
+
+        // System Role check
+        if (row.role) {
+          const cleanRole = String(row.role).toUpperCase().replace(/[\s\-_]+/g, '');
+          const validRoles = ['EMPLOYEE', 'MANAGER', 'MGR', 'HOD', 'HR', 'HRADMIN', 'CXO', 'SUPERADMIN', 'ADMIN', 'MANAGEMENT'];
+          if (!validRoles.includes(cleanRole)) {
+            errors.push(`Invalid System Role '${row.role}'. Allowed: EMPLOYEE, MANAGER, HOD, HR_ADMIN, CXO`);
+          }
+        }
       } else if (datasetType === 'kras') {
-        const weightage = Number(rawRow.weightage);
+        const weightage = Number(row.weightage);
         if (isNaN(weightage) || weightage <= 0 || weightage > 100) {
-          errors.push(`Weightage must be between 1 and 100. Received: '${rawRow.weightage}'`);
-        }
-      } else if (datasetType === 'quarterly-scores') {
-        const code = String(rawRow.employeeCode || '').trim().toUpperCase();
-        const mgrScore = Number(rawRow.managerScore);
-        const selfScore = rawRow.selfScore !== undefined && rawRow.selfScore !== '' ? Number(rawRow.selfScore) : null;
-
-        if (code && !empCodeMap.has(code)) {
-          errors.push(`Employee code '${code}' not found in database.`);
+          errors.push(`Weightage must be between 1 and 100. Received: '${row.weightage}'`);
         }
 
-        if (isNaN(mgrScore) || mgrScore < 1.0 || mgrScore > 5.0) {
-          errors.push(`Manager Score must be a rating between 1.0 and 5.0. Received: '${rawRow.managerScore}'`);
-        }
-
-        if (selfScore !== null && (isNaN(selfScore) || selfScore < 1.0 || selfScore > 5.0)) {
-          errors.push(`Self Score must be between 1.0 and 5.0. Received: '${rawRow.selfScore}'`);
-        }
-      } else if (datasetType === 'increment-matrix') {
-        const code = String(rawRow.employeeCode || '').trim().toUpperCase();
-        const incPct = Number(rawRow.proposedIncrementPercent);
-
-        if (code && !empCodeMap.has(code)) {
-          errors.push(`Employee code '${code}' not found in database.`);
-        }
-
-        if (isNaN(incPct) || incPct < 0 || incPct > 100) {
-          errors.push(`Proposed increment % must be between 0 and 100. Received: '${rawRow.proposedIncrementPercent}'`);
+        const code = String(row.employeeCode || '').trim().toUpperCase();
+        if (code) {
+          if (!empCodeMap.has(code)) {
+            // A KRA scorecard must be linked to a real employee at upload time — nothing
+            // in the system retroactively links an orphan template to an employee created
+            // later, so allowing this through would silently create dead, never-assigned data.
+            errors.push(`Employee code '${code}' not found in database. Register the employee first, then upload their KRA scorecard.`);
+          } else {
+            const emp = empObjMap.get(code);
+            if (emp) {
+              if (!row.employeeName && emp.name) row.employeeName = emp.name;
+              if (!row.department && emp.departmentName) row.department = emp.departmentName;
+              if (!row.designation && emp.designationName) row.designation = emp.designationName;
+              // Every employee's KRA scorecard is exclusive to them — a bulk upload must
+              // never silently overwrite one that's already assigned.
+              if (emp.currentKraTemplateId) {
+                errors.push(
+                  `Employee '${code}' already has a KRA scorecard assigned (${emp.currentKraTemplateName || emp.currentKraTemplateId}). Remove or reassign their existing scorecard before uploading a new one.`
+                );
+              } else {
+                action = 'INSERT';
+              }
+            }
+          }
+          const targetKey = `EMP:${code}`;
+          const sumWeight = kraWeightsByTarget.get(targetKey) || 0;
+          if (sumWeight !== 100) {
+            warnings.push(`Total KRA weightage for employee '${code}' in this upload sums to ${sumWeight}% (Recommended: 100%).`);
+          }
+        } else {
+          const targetKey = `TPL:${row.templateTitle || 'General'}`;
+          const sumWeight = kraWeightsByTarget.get(targetKey) || 0;
+          if (sumWeight !== 100) {
+            warnings.push(`Total KRA weightage for template '${row.templateTitle || 'General'}' in this upload sums to ${sumWeight}% (Recommended: 100%).`);
+          }
         }
       }
 
@@ -449,7 +803,7 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
 
       results.push({
         rowNumber,
-        data: rawRow,
+        data: row,
         isValid,
         status,
         errors,
@@ -504,8 +858,6 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
     const usersCol = getDbCollection('users');
     const kraTemplatesCol = getDbCollection('kraTemplates');
     const krasCol = getDbCollection('kras');
-    const reviewsCol = getDbCollection('employeeReviews');
-    const appraisalsCol = getDbCollection('appraisals');
     const auditLogsCol = getDbCollection('auditLogs');
 
     let insertedCount = 0;
@@ -576,11 +928,33 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
       return clean.includes('SEP') ? 'cycle_f' : 'cycle_d';
     };
 
+    const initializedTemplates = new Set<string>();
+    // Snapshots whether each employee already had a KRA scorecard assigned BEFORE this
+    // batch started, captured once on first encounter. A multi-row scorecard upload sends
+    // one row per KRA item for the same employee — rows 2..N legitimately assign the
+    // employee's currentKraTemplateId from row 1, so re-querying live DB state on every
+    // row would misidentify the employee's own in-progress scorecard as a pre-existing
+    // conflict. Only the pre-batch snapshot may block a row.
+    const preBatchKraAssignment = new Map<string, boolean>();
+    // Employees whose currentKraTemplateId was (re)assigned during this batch — their
+    // not-yet-scored reviews get their kraSnapshot resynced once, after the loop.
+    const employeesToResyncReviews = new Set<string>();
+    // A multi-row KRA upload sends several rows per employee — cache each employee lookup
+    // by code so a 50-row file for 50 employees doesn't re-query the same employee document
+    // once per row it already has cached from an earlier row.
+    const employeeLookupCache = new Map<string, any>();
+    // Mirrors, in-memory, the template document each employee's rows are accumulating into
+    // this batch — avoids re-querying kraTemplatesCol on every subsequent row for the same
+    // employee (rows 2..N would otherwise re-fetch a document this same batch just wrote).
+    const templateStateCache = new Map<string, { id: string; title: string; items: any[] }>();
+
     for (let i = 0; i < rows.length; i++) {
-      const row = rows[i];
+      const rawRow = rows[i];
       const rowNum = i + 1;
 
       try {
+        const row = datasetType === 'employees' ? normalizeEmployeeInputRow(rawRow) : datasetType === 'kras' ? normalizeKraInputRow(rawRow) : rawRow;
+
         if (datasetType === 'employees') {
           const code = String(row.employeeCode || '').trim().toUpperCase();
           const email = String(row.email || '').trim().toLowerCase();
@@ -600,18 +974,18 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
           const resolvedCycle = allCycles.find((c) => c.id === cycleId);
           const cycleCodeShort = resolvedCycle?.code || (cycleId === 'cycle_f' ? 'SEP' : 'JUN');
 
-          const rawMgrCode = String(
+          const cleanMgrCode = cleanCode(
             row.managerCode || row.managerEmployeeCode || row.reportingManagerCode || row.manager || ''
-          ).trim().toUpperCase();
-          const rawHodCode = String(
+          );
+          const cleanHodCode = cleanCode(
             row.hodCode || row.hodEmployeeCode || row.headOfDepartmentCode || row.hod || ''
-          ).trim().toUpperCase();
+          );
 
           // Resolve manager from database if already present
           let managerId: string | undefined = undefined;
-          let managerName: string | undefined = undefined;
-          if (rawMgrCode) {
-            const mgr = await employeesCol.findOne({ employeeCode: rawMgrCode });
+          let managerName: string | undefined = row.managerName || undefined;
+          if (cleanMgrCode) {
+            const mgr = await employeesCol.findOne({ employeeCode: cleanMgrCode });
             if (mgr) {
               managerId = mgr.id;
               managerName = mgr.name;
@@ -620,9 +994,9 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
 
           // Resolve HOD from database or department
           let hodId: string | undefined = undefined;
-          let hodName: string | undefined = undefined;
-          if (rawHodCode) {
-            const hod = await employeesCol.findOne({ employeeCode: rawHodCode });
+          let hodName: string | undefined = row.hodName || undefined;
+          if (cleanHodCode) {
+            const hod = await employeesCol.findOne({ employeeCode: cleanHodCode });
             if (hod) {
               hodId = hod.id;
               hodName = hod.name;
@@ -637,12 +1011,19 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
             }
           }
 
-          const numericCtc = Number(row.baseSalary || row.currentCtc) || 1200000;
+          const rawCtc = row.baseSalary ?? row.currentCtc;
+          const numericCtc = rawCtc !== undefined && rawCtc !== null && rawCtc !== '' ? Number(rawCtc) : 0;
           const empPayload: any = {
             employeeCode: code,
             name,
             email,
             joiningDate: row.joiningDate || new Date().toISOString().split('T')[0],
+            confirmationDate: row.confirmationDate || undefined,
+            gender: row.gender || undefined,
+            employmentType: row.employmentType || undefined,
+            probationPeriodDays: row.probationPeriodDays !== undefined && row.probationPeriodDays !== '' ? Number(row.probationPeriodDays) : undefined,
+            companyName: row.companyName || undefined,
+            location: row.location || undefined,
             cycleId,
             cycleCode: cycleCodeShort,
             departmentId: deptObj.id,
@@ -651,10 +1032,10 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
             designationName: desigObj.title || desigObj.name,
             managerId,
             managerName,
-            managerEmployeeCode: rawMgrCode || undefined,
+            managerEmployeeCode: cleanMgrCode || undefined,
             hodId,
             hodName,
-            hodEmployeeCode: rawHodCode || undefined,
+            hodEmployeeCode: cleanHodCode || undefined,
             currentCtc: numericCtc,
             currency: '₹',
             status: (row.status || 'ACTIVE').toUpperCase(),
@@ -664,6 +1045,20 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
 
           if (existing && allowUpdateExisting) {
             await employeesCol.updateOne({ id: existing.id }, { $set: empPayload });
+            if (row.role) {
+              const candidateRole = String(row.role).toUpperCase().replace(/[\s\-_]+/g, '');
+              let role: UserRole = 'EMPLOYEE';
+              if (candidateRole === 'HR' || candidateRole === 'HRADMIN') role = 'HR';
+              else if (candidateRole === 'MANAGER' || candidateRole === 'MGR') role = 'MANAGER';
+              else if (candidateRole === 'HOD') role = 'HOD';
+              else if (candidateRole === 'SUPERADMIN' || candidateRole === 'ADMIN') role = 'SUPER_ADMIN';
+              else if (candidateRole === 'MANAGEMENT' || candidateRole === 'CXO') role = 'MANAGEMENT';
+
+              await usersCol.updateOne(
+                { $or: [{ employeeId: existing.id }, { email: existing.email }] },
+                { $set: { role, roleId: `role_${role.toLowerCase()}`, updatedAt: new Date().toISOString() } }
+              );
+            }
             updatedCount++;
           } else if (!existing) {
             const newId = `emp_${Math.random().toString(36).substr(2, 9)}`;
@@ -702,7 +1097,8 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
             skippedCount++;
           }
         } else if (datasetType === 'kras') {
-          const tTitle = String(row.templateTitle || 'General KRA Template').trim();
+          const empCode = String(row.employeeCode || '').trim().toUpperCase();
+          const tTitle = String(row.templateTitle || (empCode ? `${empCode} - Performance Scorecard` : 'General KRA Template')).trim();
           const kTitle = String(row.kraTitle || '').trim();
           const weightage = Number(row.weightage) || 25;
 
@@ -711,9 +1107,53 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
             continue;
           }
 
-          const deptObj = await findOrCreateDept(row.department);
-          const desigObj = await findOrCreateDesig(row.designation, deptObj.id);
-          const cycleId = mapCycleCodeToId(row.cycleCode);
+          let matchedEmp: any = null;
+          if (empCode) {
+            if (employeeLookupCache.has(empCode)) {
+              matchedEmp = employeeLookupCache.get(empCode);
+            } else {
+              matchedEmp = await employeesCol.findOne({ employeeCode: empCode });
+              employeeLookupCache.set(empCode, matchedEmp);
+            }
+          }
+
+          // A KRA scorecard must be linked to a real employee — reject rows for employee
+          // codes that don't exist rather than creating an orphaned template that nothing
+          // ever links up later.
+          if (empCode && !matchedEmp) {
+            failedCount++;
+            errorsList.push({
+              row: rowNum,
+              reason: `Employee code '${empCode}' not found in database. Register the employee first, then upload their KRA scorecard.`,
+            });
+            continue;
+          }
+
+          // Snapshot this employee's pre-batch assignment state the first time they're
+          // seen in this file. Rows 2..N of a multi-KRA-item upload for the same employee
+          // legitimately see currentKraTemplateId already set (by row 1, earlier in this
+          // same batch) — only a snapshot taken before the batch touched them can tell
+          // that apart from a genuine pre-existing scorecard.
+          if (empCode && !preBatchKraAssignment.has(empCode)) {
+            preBatchKraAssignment.set(empCode, Boolean(matchedEmp?.currentKraTemplateId));
+          }
+
+          // Every employee's KRA scorecard is exclusive to them — a bulk upload must
+          // never silently overwrite one that already existed before this upload.
+          if (empCode && preBatchKraAssignment.get(empCode)) {
+            failedCount++;
+            errorsList.push({
+              row: rowNum,
+              reason: `Employee '${empCode}' already has a KRA scorecard assigned (${matchedEmp?.currentKraTemplateName || matchedEmp?.currentKraTemplateId || 'existing scorecard'}). Remove or reassign it first.`,
+            });
+            continue;
+          }
+
+          const deptName = row.department || (matchedEmp ? matchedEmp.departmentName : '') || 'General';
+          const desigName = row.designation || (matchedEmp ? matchedEmp.designationName : '') || 'General';
+          const deptObj = await findOrCreateDept(deptName);
+          const desigObj = await findOrCreateDesig(desigName, deptObj.id);
+          const cycleId = matchedEmp?.cycleId || mapCycleCodeToId(row.cycleCode);
 
           const kraId = `kra_${Math.random().toString(36).substr(2, 9)}`;
           const newKra = {
@@ -731,7 +1171,7 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
 
           await krasCol.insertOne(newKra);
 
-          // Find or create template grouping with standard KraItem structure
+          // Standard KraItem structure
           const kraItem = {
             id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
             kraId,
@@ -742,144 +1182,133 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
             measurementCriteria: row.measurementCriteria || `${row.measurementUnit || '%'}: 1=Below, 3=Meets, 5=Exceeds`,
           };
 
-          const existingTemplate = await kraTemplatesCol.findOne({ title: tTitle, departmentId: deptObj.id });
-          if (existingTemplate) {
-            const currentItems = existingTemplate.items || [];
-            currentItems.push(kraItem);
-            const totalWeight = currentItems.reduce((sum: number, it: any) => sum + (Number(it.weight) || 0), 0);
-            await kraTemplatesCol.updateOne(
-              { id: existingTemplate.id },
-              { $set: { items: currentItems, totalWeight, updatedAt: new Date().toISOString() } }
-            );
-            updatedCount++;
-          } else {
-            const newTemplate = {
-              id: `kratpl_${Math.random().toString(36).substr(2, 9)}`,
-              title: tTitle,
-              departmentId: deptObj.id,
-              departmentName: deptObj.name,
-              designationId: desigObj.id,
-              designationName: desigObj.title || desigObj.name,
-              cycleId,
-              totalWeight: weightage,
-              items: [kraItem],
-              active: true,
-              createdAt: new Date().toISOString(),
-            };
-            await kraTemplatesCol.insertOne(newTemplate);
-            insertedCount++;
-          }
-        } else if (datasetType === 'quarterly-scores') {
-          const code = String(row.employeeCode || '').trim().toUpperCase();
-          const mgrScore = Number(row.managerScore) || 3.5;
-          const selfScore = Number(row.selfScore) || mgrScore;
-          const comments = String(row.managerComments || 'Manager evaluated via bulk import.');
+          if (matchedEmp || empCode) {
+            // Find existing employee template — reuse this batch's in-memory record of it if
+            // an earlier row for this same employee already read or created it.
+            const targetKey = `EMP:${empCode}`;
+            let existingTemplate: any = templateStateCache.get(targetKey);
+            if (!existingTemplate) {
+              const templateQuery: any = {
+                $or: [
+                  ...(matchedEmp ? [{ employeeId: matchedEmp.id }] : []),
+                  { employeeCode: empCode },
+                ],
+              };
+              existingTemplate = await kraTemplatesCol.findOne(templateQuery);
+            }
 
-          const emp = await employeesCol.findOne({ employeeCode: code });
-          if (!emp) {
-            skippedCount++;
-            errorsList.push({ row: rowNum, reason: `Employee code '${code}' not found.` });
-            continue;
-          }
-
-          // Update or insert quarterly review with canonical field names
-          const periodCode = String(row.periodCode || 'Q1_2026').trim().toUpperCase();
-          const existingReview = await reviewsCol.findOne({ employeeId: emp.id });
-
-          if (existingReview) {
-            await reviewsCol.updateOne(
-              { id: existingReview.id },
-              {
-                $set: {
-                  status: (row.status || 'MANAGER_COMPLETED').toUpperCase(),
-                  finalScore: mgrScore,
-                  selfScore: selfScore,
-                  managerOverallComments: comments,
-                  updatedAt: new Date().toISOString(),
-                },
+            if (existingTemplate) {
+              const isFirstTouchThisBatch = !initializedTemplates.has(targetKey);
+              let currentItems = existingTemplate.items || [];
+              if (isFirstTouchThisBatch) {
+                initializedTemplates.add(targetKey);
+                if (allowUpdateExisting) {
+                  currentItems = [];
+                }
               }
-            );
-            updatedCount++;
-          } else {
-            const newRevId = `rev_${Math.random().toString(36).substr(2, 9)}`;
-            await reviewsCol.insertOne({
-              id: newRevId,
-              employeeId: emp.id,
-              employeeCode: emp.employeeCode,
-              employeeName: emp.name,
-              departmentId: emp.departmentId,
-              cycleId: emp.cycleId,
-              reviewPeriodId: periodCode,
-              reviewPeriodName: periodCode,
-              status: (row.status || 'MANAGER_COMPLETED').toUpperCase(),
-              selfScore: selfScore,
-              finalScore: mgrScore,
-              managerOverallComments: comments,
-              isClosed: false,
-              kraSnapshot: [],
-              createdAt: new Date().toISOString(),
-            });
-            insertedCount++;
-          }
-        } else if (datasetType === 'increment-matrix') {
-          const code = String(row.employeeCode || '').trim().toUpperCase();
-          const emp = await employeesCol.findOne({ employeeCode: code });
-          if (!emp) {
-            skippedCount++;
-            errorsList.push({ row: rowNum, reason: `Employee code '${code}' not found.` });
-            continue;
-          }
+              currentItems.push(kraItem);
+              const totalWeight = currentItems.reduce((sum: number, it: any) => sum + (Number(it.weight) || 0), 0);
+              await kraTemplatesCol.updateOne(
+                { id: existingTemplate.id },
+                {
+                  $set: {
+                    items: currentItems,
+                    totalWeight,
+                    employeeId: matchedEmp?.id || existingTemplate.employeeId,
+                    employeeCode: empCode,
+                    employeeName: matchedEmp?.name || row.employeeName || existingTemplate.employeeName,
+                    departmentId: deptObj.id,
+                    departmentName: deptObj.name,
+                    designationId: desigObj.id,
+                    designationName: desigObj.title || desigObj.name,
+                    cycleId,
+                    updatedAt: new Date().toISOString(),
+                  },
+                }
+              );
+              templateStateCache.set(targetKey, { id: existingTemplate.id, title: existingTemplate.title, items: currentItems });
 
-          const incPct = Number(row.proposedIncrementPercent) || 10;
-          const rating = String(row.finalRating || 'MEETS_EXPECTATIONS').toUpperCase();
-          const currentCtc = Number(emp.currentCtc) || 1200000;
-          const incrementAmount = Math.round((currentCtc * incPct) / 100);
-          const revisedCtc = currentCtc + incrementAmount;
-          const promoRec = Boolean(row.promotedDesignation || row.promotionRecommended === true || row.promotionRecommended === 'true');
-
-          const existingAppr = await appraisalsCol.findOne({ employeeId: emp.id });
-          if (existingAppr) {
-            await appraisalsCol.updateOne(
-              { id: existingAppr.id },
-              {
-                $set: {
-                  finalRating: rating,
-                  proposedIncrementPercentage: incPct,
-                  approvedIncrementPercentage: incPct,
-                  incrementAmount,
-                  revisedCtc,
-                  promotionRecommended: promoRec,
-                  hodCalibrationNotes: row.hodNotes || 'Calibrated via bulk increment matrix',
-                  status: 'HOD_CALIBRATED',
-                  updatedAt: new Date().toISOString(),
-                },
+              // Auto-assign to employee — only needs writing once per employee per batch,
+              // since the template id/title this batch settles on doesn't change afterward.
+              if (matchedEmp && isFirstTouchThisBatch) {
+                await employeesCol.updateOne(
+                  { id: matchedEmp.id },
+                  { $set: { currentKraTemplateId: existingTemplate.id, currentKraTemplateName: existingTemplate.title } }
+                );
               }
-            );
-            updatedCount++;
+              if (matchedEmp) {
+                employeesToResyncReviews.add(matchedEmp.id);
+              }
+              updatedCount++;
+            } else {
+              const templateTitle = tTitle || `${matchedEmp?.name || row.employeeName || empCode} - Performance Scorecard`;
+              const newTemplate = {
+                id: `kratpl_${Math.random().toString(36).substr(2, 9)}`,
+                title: templateTitle,
+                employeeId: matchedEmp ? matchedEmp.id : undefined,
+                employeeCode: empCode,
+                employeeName: matchedEmp ? matchedEmp.name : row.employeeName,
+                departmentId: deptObj.id,
+                departmentName: deptObj.name,
+                designationId: desigObj.id,
+                designationName: desigObj.title || desigObj.name,
+                cycleId,
+                totalWeight: weightage,
+                items: [kraItem],
+                active: true,
+                createdAt: new Date().toISOString(),
+              };
+              await kraTemplatesCol.insertOne(newTemplate);
+              initializedTemplates.add(targetKey);
+              templateStateCache.set(targetKey, { id: newTemplate.id, title: newTemplate.title, items: newTemplate.items });
+
+              // Auto-assign to employee!
+              if (matchedEmp) {
+                await employeesCol.updateOne(
+                  { id: matchedEmp.id },
+                  { $set: { currentKraTemplateId: newTemplate.id, currentKraTemplateName: newTemplate.title } }
+                );
+                employeesToResyncReviews.add(matchedEmp.id);
+              }
+              insertedCount++;
+            }
           } else {
-            const newApprId = `appr_${Math.random().toString(36).substr(2, 9)}`;
-            await appraisalsCol.insertOne({
-              id: newApprId,
-              employeeId: emp.id,
-              employeeCode: emp.employeeCode,
-              employeeName: emp.name,
-              cycleId: emp.cycleId,
-              departmentId: emp.departmentId,
-              currentCtc,
-              currency: emp.currency || '₹',
-              finalRating: rating,
-              recommendedRating: rating,
-              proposedIncrementPercentage: incPct,
-              approvedIncrementPercentage: incPct,
-              incrementAmount,
-              revisedCtc,
-              promotionRecommended: promoRec,
-              hodCalibrationNotes: row.hodNotes || 'Calibrated via bulk increment matrix',
-              status: 'HOD_CALIBRATED',
-              createdAt: new Date().toISOString(),
-              updatedAt: new Date().toISOString(),
-            });
-            insertedCount++;
+            // General template library grouping by title and department
+            const targetKey = `TPL:${tTitle}_${deptObj.id}`;
+            const existingTemplate = await kraTemplatesCol.findOne({ title: tTitle, departmentId: deptObj.id });
+            if (existingTemplate) {
+              let currentItems = existingTemplate.items || [];
+              if (!initializedTemplates.has(targetKey)) {
+                initializedTemplates.add(targetKey);
+                if (allowUpdateExisting) {
+                  currentItems = [];
+                }
+              }
+              currentItems.push(kraItem);
+              const totalWeight = currentItems.reduce((sum: number, it: any) => sum + (Number(it.weight) || 0), 0);
+              await kraTemplatesCol.updateOne(
+                { id: existingTemplate.id },
+                { $set: { items: currentItems, totalWeight, updatedAt: new Date().toISOString() } }
+              );
+              updatedCount++;
+            } else {
+              const newTemplate = {
+                id: `kratpl_${Math.random().toString(36).substr(2, 9)}`,
+                title: tTitle,
+                departmentId: deptObj.id,
+                departmentName: deptObj.name,
+                designationId: desigObj.id,
+                designationName: desigObj.title || desigObj.name,
+                cycleId,
+                totalWeight: weightage,
+                items: [kraItem],
+                active: true,
+                createdAt: new Date().toISOString(),
+              };
+              await kraTemplatesCol.insertOne(newTemplate);
+              initializedTemplates.add(targetKey);
+              insertedCount++;
+            }
           }
         }
       } catch (rowErr: any) {
@@ -895,6 +1324,25 @@ bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response
       } catch (hierErr) {
         console.error('[Bulk Engine] Error during hierarchy sync post-import:', hierErr);
       }
+    }
+
+    // Newly (re)assigned KRA scorecards should take effect immediately: generate a
+    // quarterly review for any employee who just became eligible (rather than waiting for
+    // the next employee save, manual sync, or the daily sync job), and push the fresh KRA
+    // into any not-yet-scored review that was created before this import.
+    if (datasetType === 'kras' && employeesToResyncReviews.size > 0) {
+      // Each employee's sync only touches their own review/appraisal records (keyed by their
+      // own id), so these are independent and safe to run concurrently — sequentially awaiting
+      // one employee at a time here is what made large multi-employee batches slow.
+      await Promise.all(
+        Array.from(employeesToResyncReviews).map(async (empId) => {
+          const assignedEmp = await employeesCol.findOne({ id: empId });
+          if (assignedEmp) {
+            await syncEmployeeAppraisalsAndReviews(assignedEmp);
+          }
+          await resyncUnscoredReviewKraSnapshots(empId);
+        })
+      );
     }
 
     // Record in Audit Trail
@@ -966,8 +1414,6 @@ bulkRouter.get('/export/:type', async (req: AuthenticatedRequest, res: Response)
     const designationsCol = getDbCollection('designations');
     const cyclesCol = getDbCollection('cycles');
     const kraTemplatesCol = getDbCollection('kraTemplates');
-    const reviewsCol = getDbCollection('employeeReviews');
-    const appraisalsCol = getDbCollection('appraisals');
 
     const employees = await (await employeesCol.find({})).toArray();
     const departments = await (await departmentsCol.find({})).toArray();
@@ -1014,33 +1460,6 @@ bulkRouter.get('/export/:type', async (req: AuthenticatedRequest, res: Response)
           'Measurement Criteria': k.measurementCriteria || '',
         }));
       });
-    } else if (datasetType === 'quarterly-scores') {
-      const reviews = await (await reviewsCol.find({})).toArray();
-      exportRows = reviews.map((r) => ({
-        'Employee Code': r.employeeCode || '',
-        'Employee Name': r.employeeName || '',
-        'Quarter Period': r.reviewPeriodName || r.periodCode || 'Q1',
-        'Self Score (1-5)': r.selfScore ?? r.selfOverallScore ?? 0,
-        'Manager Score (1-5)': r.finalScore ?? r.managerOverallScore ?? 0,
-        'Final Score': r.finalScore ?? r.finalCalculatedScore ?? 0,
-        'Manager Feedback': r.managerOverallComments || r.managerSummary || '',
-        'Status': r.status || 'DRAFT',
-      }));
-    } else if (datasetType === 'increment-matrix') {
-      const appraisals = await (await appraisalsCol.find({})).toArray();
-      exportRows = appraisals.map((a) => ({
-        'Employee Code': a.employeeCode || '',
-        'Employee Name': a.employeeName || '',
-        'Cycle Code': cycleMap.get(a.cycleId) || a.cycleId,
-        'Final Rating': a.finalRating || a.recommendedRating || 'MEETS_EXPECTATIONS',
-        'Proposed Increment (%)': a.proposedIncrementPercentage ?? a.proposedIncrement ?? 0,
-        'Approved Increment (%)': a.approvedIncrementPercentage ?? a.proposedIncrementPercentage ?? 0,
-        'Current CTC (₹)': a.currentCtc || 0,
-        'Revised CTC (₹)': a.revisedCtc || 0,
-        'Promotion Recommended': a.promotionRecommended ? 'YES' : 'NO',
-        'Status': a.status || 'DRAFT',
-        'HOD Calibration Notes': a.hodCalibrationNotes || a.hodComments || '',
-      }));
     }
 
     res.json({

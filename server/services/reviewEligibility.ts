@@ -39,6 +39,57 @@ export interface CreateQuarterlyReviewOptions {
   manualOverrideReason?: string;
 }
 
+const FALLBACK_KRA_ITEMS = [
+  {
+    id: 'item_fb_1',
+    title: 'Core Deliverables & Execution',
+    description: 'Timely and accurate delivery of core quarterly deliverables',
+    target: 'Complete assigned quarterly goals within SLA',
+    measurementCriteria: '1: Below SLA | 3: Meets SLA | 5: Exceeds SLA',
+    weight: 50,
+  },
+  {
+    id: 'item_fb_2',
+    title: 'Quality & Process Discipline',
+    description: 'Adherence to quality standards and zero defect slip rates',
+    target: 'Maintain high standards and zero critical defect slippages',
+    measurementCriteria: '1: Defects reported | 3: Clean execution | 5: Optimization',
+    weight: 30,
+  },
+  {
+    id: 'item_fb_3',
+    title: 'Team Collaboration & Initiative',
+    description: 'Peer collaboration, cross-functional synergy, and proactive initiatives',
+    target: 'Active cross-functional participation and peer support',
+    measurementCriteria: '1: Low initiative | 3: Solid support | 5: Proactive leadership',
+    weight: 20,
+  },
+];
+
+/**
+ * Builds a fresh, unrated KRA snapshot from a KRA template's items (or a generic
+ * fallback scorecard when no template — or an empty one — is available). Shared by
+ * new-review creation and by re-syncing an existing, not-yet-scored review after an
+ * employee's assigned scorecard changes.
+ */
+export function buildKraSnapshotFromTemplate(template?: KraTemplate | null): ReviewKraSnapshot[] {
+  const rawItems = template && template.items && template.items.length > 0 ? template.items : FALLBACK_KRA_ITEMS;
+  return rawItems.map((item: any, idx: number) => ({
+    id: `snap_${Date.now()}_${idx}_${Math.random().toString(36).substr(2, 6)}`,
+    kraId: item.kraId || item.id,
+    kraName: item.title || item.kraName || `KRA ${idx + 1}`,
+    title: item.title || item.kraName || `KRA ${idx + 1}`,
+    description: item.description || '',
+    targetSnapshot: item.target || item.targetSnapshot || 'Meet quarterly targets',
+    weight: item.weight || 25,
+    measurementCriteria: item.measurementCriteria || '',
+    rating: 0,
+    selfRating: 0,
+    comments: '',
+    selfComments: '',
+  }));
+}
+
 /**
  * Calculate tenure days for an employee relative to a quarterly review period.
  * 
@@ -121,21 +172,17 @@ export async function checkEmployeeReviewEligibility(
   });
   const alreadyHasReview = Boolean(existingReview);
 
-  // 4. KRA Template check
+  // 4. KRA Template check — an employee only "has" a KRA template if their OWN
+  // currentKraTemplateId resolves to one. There is deliberately no designation/department/
+  // any-template fallback here: since every KRA template (custom or cloned from the
+  // library) is exclusively owned by one employee, guessing by designation/department could
+  // silently borrow a different employee's personal scorecard, and an "any template" fallback
+  // could attach a completely unrelated one. An employee with no scorecard assigned is simply
+  // not eligible for review generation.
   let hasKraTemplate: boolean;
   try {
-    const allTemplates: KraTemplate[] = await (await templatesCol.find({})).toArray();
-    let template = allTemplates.find((t) => t.id === emp.currentKraTemplateId);
-    if (!template && emp.designationId) {
-      template = allTemplates.find((t) => t.designationId === emp.designationId && t.active !== false);
-    }
-    if (!template && emp.departmentId) {
-      template = allTemplates.find((t) => t.departmentId === emp.departmentId && t.active !== false);
-    }
-    if (!template && allTemplates.length > 0) {
-      template = allTemplates.find((t) => t.active !== false) || allTemplates[0];
-    }
-    hasKraTemplate = Boolean(template && template.items && template.items.length > 0);
+    const template = emp.currentKraTemplateId ? await templatesCol.findOne({ id: emp.currentKraTemplateId }) : null;
+    hasKraTemplate = Boolean(template && template.items && template.items.length > 0 && template.active !== false);
   } catch {
     hasKraTemplate = false;
   }
@@ -267,66 +314,21 @@ export async function createQuarterlyReview(options: CreateQuarterlyReviewOption
     }
   }
 
-  // 5. Resolve KRA Template
+  // 5. Resolve KRA Template — only the employee's OWN assigned template (or one explicitly
+  // provided by the caller) is used. No designation/department/any-template guessing: since
+  // every template is exclusively owned by one employee, that could silently attach a
+  // different employee's personal scorecard. An employee with no scorecard assigned gets no
+  // review at all, rather than one built from fake/borrowed KRAs.
   let template = providedTemplate;
-  if (!template) {
-    const allTemplates: KraTemplate[] = await (await templatesCol.find({})).toArray();
-    template = allTemplates.find((t) => t.id === emp.currentKraTemplateId);
-    if (!template && emp.designationId) {
-      template = allTemplates.find((t) => t.designationId === emp.designationId && t.active !== false);
-    }
-    if (!template && emp.departmentId) {
-      template = allTemplates.find((t) => t.departmentId === emp.departmentId && t.active !== false);
-    }
-    if (!template && allTemplates.length > 0) {
-      template = allTemplates.find((t) => t.active !== false) || allTemplates[0];
-    }
+  if (!template && emp.currentKraTemplateId) {
+    template = await templatesCol.findOne({ id: emp.currentKraTemplateId });
+  }
+  if (!template || !template.items || template.items.length === 0) {
+    throw new Error(`Cannot create review for ${emp.name} (${emp.employeeCode}): no KRA scorecard is assigned to this employee.`);
   }
 
-  const defaultItems = [
-    {
-      id: 'item_fb_1',
-      title: 'Core Deliverables & Execution',
-      description: 'Timely and accurate delivery of core quarterly deliverables',
-      target: 'Complete assigned quarterly goals within SLA',
-      measurementCriteria: '1: Below SLA | 3: Meets SLA | 5: Exceeds SLA',
-      weight: 50,
-    },
-    {
-      id: 'item_fb_2',
-      title: 'Quality & Process Discipline',
-      description: 'Adherence to quality standards and zero defect slip rates',
-      target: 'Maintain high standards and zero critical defect slippages',
-      measurementCriteria: '1: Defects reported | 3: Clean execution | 5: Optimization',
-      weight: 30,
-    },
-    {
-      id: 'item_fb_3',
-      title: 'Team Collaboration & Initiative',
-      description: 'Peer collaboration, cross-functional synergy, and proactive initiatives',
-      target: 'Active cross-functional participation and peer support',
-      measurementCriteria: '1: Low initiative | 3: Solid support | 5: Proactive leadership',
-      weight: 20,
-    },
-  ];
-
-  const rawItems = (template && template.items && template.items.length > 0) ? template.items : defaultItems;
-
   // 6. Build immutable KRA snapshot
-  const kraSnapshot: ReviewKraSnapshot[] = rawItems.map((item: any, idx: number) => ({
-    id: `snap_${Date.now()}_${idx}_${Math.random().toString(36).substr(2, 6)}`,
-    kraId: item.kraId || item.id,
-    kraName: item.title || item.kraName || `KRA ${idx + 1}`,
-    title: item.title || item.kraName || `KRA ${idx + 1}`,
-    description: item.description || '',
-    targetSnapshot: item.target || item.targetSnapshot || 'Meet quarterly targets',
-    weight: item.weight || 25,
-    measurementCriteria: item.measurementCriteria || '',
-    rating: 0,
-    selfRating: 0,
-    comments: '',
-    selfComments: '',
-  }));
+  const kraSnapshot: ReviewKraSnapshot[] = buildKraSnapshotFromTemplate(template);
 
   // 7. Cycle & Appraisal month mapping
   const allCycles: Cycle[] = await (await cyclesCol.find({})).toArray();

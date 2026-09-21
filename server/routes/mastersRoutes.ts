@@ -12,7 +12,7 @@ import {
   generateTempPassword,
 } from '../auth.js';
 import { Employee, Department, Designation, Cycle, User, UserRole } from '../../src/types/index.js';
-import { syncEmployeeAppraisalsAndReviews } from '../syncHelpers.js';
+import { syncEmployeeAppraisalsAndReviews, resyncUnscoredReviewKraSnapshots } from '../syncHelpers.js';
 import { sendNotificationEmail } from '../services/emailService.js';
 import { renderEmployeeWelcomeEmail } from '../services/emailTemplates.js';
 
@@ -20,6 +20,91 @@ export const mastersRouter = express.Router();
 
 // Apply auth middleware to all master routes
 mastersRouter.use(authenticateToken);
+
+/**
+ * Ensures a KRA template assigned to an employee is exclusively theirs.
+ *
+ * `kraTemplates` can be either a shared library blueprint (no `employeeId`,
+ * scoped only by department/designation) or an employee-owned scorecard.
+ * When HR picks a library template via "Template Library" mode, we must
+ * never let two employees point at the same `kraTemplates` document —
+ * otherwise editing one employee's scorecard mutates it for everyone else
+ * assigned to that document, and cascade cleanup on employee deletion
+ * cannot safely tell which employees still depend on it.
+ *
+ * This clones the source template (if it isn't already owned by this
+ * employee) into a new document with `employeeId` set, and returns the id
+ * of the document that should actually be stored as the employee's
+ * `currentKraTemplateId`.
+ */
+async function assignKraTemplateToEmployee(
+  sourceTemplateId: string,
+  employee: { id: string; employeeCode: string; name: string }
+): Promise<{ id: string; name: string } | undefined> {
+  const templateCol = getDbCollection('kraTemplates');
+  const krasCol = getDbCollection('kras');
+  const source = await templateCol.findOne({ id: sourceTemplateId });
+  if (!source) return undefined;
+
+  // Already an employee-owned copy belonging to this exact employee.
+  if (source.employeeId === employee.id) {
+    return { id: source.id, name: source.title };
+  }
+
+  // Give the clone its own `kras` rows too (not just its own kraTemplates doc).
+  // If two employees both picked the same library template and we reused the
+  // source's kraId references, deleting one employee's KRAs (on edit or
+  // deletion) would remove `kras` rows the other employee's clone still uses.
+  const clonedItems = [];
+  for (const it of source.items || []) {
+    const kId = `kra_${Math.random().toString(36).substr(2, 9)}`;
+    await krasCol.insertOne({
+      id: kId,
+      title: it.title,
+      description: it.description || it.target || `Target for ${it.title}`,
+      departmentId: source.departmentId,
+      designationId: source.designationId,
+      cycleId: source.cycleId,
+      metricType: 'PERCENTAGE',
+      targetUnit: '%',
+      active: true,
+      createdAt: new Date().toISOString(),
+    });
+    clonedItems.push({
+      id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      kraId: kId,
+      title: it.title,
+      description: it.description,
+      target: it.target,
+      weight: it.weight,
+      measurementCriteria: it.measurementCriteria,
+    });
+  }
+
+  const clonedId = `kratpl_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+  const clonedTitle = `${employee.name.trim()} - Performance Scorecard`;
+  await templateCol.insertOne({
+    id: clonedId,
+    title: clonedTitle,
+    employeeId: employee.id,
+    employeeCode: employee.employeeCode,
+    employeeName: employee.name.trim(),
+    departmentId: source.departmentId,
+    departmentName: source.departmentName,
+    designationId: source.designationId,
+    designationName: source.designationName,
+    cycleId: source.cycleId,
+    cycleCode: source.cycleCode,
+    totalWeight: source.totalWeight,
+    items: clonedItems,
+    active: true,
+    clonedFromTemplateId: source.id,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+
+  return { id: clonedId, name: clonedTitle };
+}
 
 // ==========================================
 // 1. DEPARTMENTS
@@ -537,23 +622,13 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       provisionLogin = true,
       systemRole,
       initialPassword,
+      confirmationDate,
+      gender,
+      employmentType,
+      probationPeriodDays,
+      companyName,
+      customKras,
     } = req.body;
-
-    if (!employeeCode || !name || !email || !departmentId || !designationId || !joiningDate || !cycleId || !hodId || !startingReviewPeriodId) {
-      return res.status(400).json({
-        error: 'Required fields missing: employeeCode, name, email, departmentId, designationId, joiningDate, cycleId, hodId, startingReviewPeriodId',
-      });
-    }
-
-    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!emailRegex.test(email.trim())) {
-      return res.status(400).json({ error: 'Please enter a valid corporate email address.' });
-    }
-
-    const numericCtc = currentCtc !== undefined && currentCtc !== '' ? Number(currentCtc) : 0;
-    if (isNaN(numericCtc) || numericCtc < 0) {
-      return res.status(400).json({ error: 'Starting Annual CTC must be a positive number.' });
-    }
 
     const empCol = getDbCollection('employees');
     const deptCol = getDbCollection('departments');
@@ -568,35 +643,28 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       systemRole === 'MANAGER' ||
       Boolean(des && (des.level >= 3 || des.name?.toLowerCase().includes('manager') || des.name?.toLowerCase().includes('lead')));
 
+    if (!employeeCode || !name || !email || !departmentId || !designationId || !joiningDate || !cycleId || (!hodId && !isTargetHod) || !startingReviewPeriodId) {
+      return res.status(400).json({
+        error: 'Required fields missing: employeeCode, name, email, departmentId, designationId, joiningDate, cycleId, startingReviewPeriodId',
+      });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email.trim())) {
+      return res.status(400).json({ error: 'Please enter a valid corporate email address.' });
+    }
+
+    const numericCtc = currentCtc !== undefined && currentCtc !== '' ? Number(currentCtc) : 0;
+    if (isNaN(numericCtc) || numericCtc < 0) {
+      return res.status(400).json({ error: 'Starting Annual CTC must be a positive number.' });
+    }
+
     // Validate Reporting Manager & HOD
     let managerName: string | undefined;
     if (managerId) {
       const mgr = await empCol.findOne({ id: managerId });
       if (!mgr) {
         return res.status(400).json({ error: 'Selected Reporting Manager was not found in the employee directory.' });
-      }
-      const allDepts = await (await deptCol.find({})).toArray();
-      const deptHodIds = new Set(allDepts.map((d: any) => d.hodId).filter(Boolean));
-      const isMgrHod = deptHodIds.has(managerId) || mgr.systemRole === 'HOD';
-
-      // Managers and HODs can report to HODs. For individual contributors, only restrict if departmental managers exist.
-      if (isMgrHod && !isTargetHod && !isTargetManager) {
-        const otherMgrs = await empCol.find({
-          departmentId,
-          id: { $ne: managerId },
-          status: { $ne: 'INACTIVE' },
-          systemRole: { $in: ['MANAGER', 'REPORTING_MANAGER'] },
-        }).toArray();
-        if (otherMgrs.length > 0) {
-          return res.status(400).json({
-            error: 'An HOD cannot be assigned as an L1 Reporting Manager for individual contributors when departmental managers exist. Please select a departmental reporting manager.',
-          });
-        }
-      }
-      if (mgr.departmentId !== departmentId && !isTargetHod) {
-        return res.status(400).json({
-          error: 'Reporting Manager must belong to the same department as the employee.',
-        });
       }
       managerName = mgr.name;
     } else if (!isTargetHod && status !== 'INACTIVE') {
@@ -605,30 +673,28 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       });
     }
 
-    const hod = await empCol.findOne({ id: hodId });
-    if (!hod) {
-      return res.status(400).json({ error: 'Selected Head of Department (HOD) was not found in the employee directory.' });
+    let hodName: string | undefined;
+    if (hodId) {
+      const hod = await empCol.findOne({ id: hodId });
+      if (!hod) {
+        return res.status(400).json({ error: 'Selected Head of Department (HOD) was not found in the employee directory.' });
+      }
+      hodName = hod.name;
     }
-    if (hod.departmentId !== departmentId) {
-      return res.status(400).json({
-        error: 'Head of Department (HOD) must belong to the same department as the employee.',
-      });
-    }
-    const hodName = hod.name;
 
-    // Auto-generate sequential EMP-XXX if employeeCode not provided
+    // Auto-generate sequential MSXXXX if employeeCode not provided
     let finalCode = employeeCode ? employeeCode.trim().toUpperCase() : '';
     if (!finalCode) {
       const allExisting = await empCol.find({}).toArray();
       const maxNum = allExisting.reduce((max: number, emp: any) => {
-        const match = emp.employeeCode?.match(/EMP-(\d+)/i);
+        const match = emp.employeeCode?.match(/(?:MS|EMP-?)(\d+)/i);
         if (match) {
           const num = parseInt(match[1], 10);
           return num > max ? num : max;
         }
         return max;
       }, 0);
-      finalCode = `EMP-${String(maxNum + 1).padStart(3, '0')}`;
+      finalCode = `MS${String(maxNum + 1).padStart(4, '0')}`;
     }
 
     // Check code/email uniqueness
@@ -657,8 +723,87 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
 
     const exitDate = relievingDate || pastEmployeeDate || (status === 'INACTIVE' ? new Date().toISOString() : undefined);
 
+    const newEmpId = `emp_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
+    let assignedKraTemplateId: string | undefined;
+    let assignedKraTemplateName: string | undefined;
+
+    // If a shared/library template was chosen ("Template Library" mode), clone it
+    // into an employee-owned copy so no two employees ever reference the same
+    // kraTemplates document.
+    if (currentKraTemplateId && (!Array.isArray(customKras) || customKras.length === 0)) {
+      const cloned = await assignKraTemplateToEmployee(currentKraTemplateId, {
+        id: newEmpId,
+        employeeCode: finalCode,
+        name: name.trim(),
+      });
+      if (cloned) {
+        assignedKraTemplateId = cloned.id;
+        assignedKraTemplateName = cloned.name;
+      }
+    }
+
+    // If custom employee KRAs provided, create employee scorecard template
+    if (Array.isArray(customKras) && customKras.length > 0) {
+      try {
+        const kraTemplatesCol = getDbCollection('kraTemplates');
+        const krasCol = getDbCollection('kras');
+        const tId = `kratpl_${Math.random().toString(36).substr(2, 9)}`;
+        const items = [];
+        for (const k of customKras) {
+          if (!k.title || !String(k.title).trim()) continue;
+          const kId = `kra_${Math.random().toString(36).substr(2, 9)}`;
+          const kraDoc = {
+            id: kId,
+            title: String(k.title).trim(),
+            description: k.description || k.target || `Target for ${k.title}`,
+            departmentId,
+            designationId,
+            cycleId,
+            metricType: 'PERCENTAGE',
+            targetUnit: '%',
+            active: true,
+            createdAt: new Date().toISOString(),
+          };
+          await krasCol.insertOne(kraDoc);
+          items.push({
+            id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+            kraId: kId,
+            title: String(k.title).trim(),
+            description: k.description || k.target || '',
+            target: String(k.target || '100% Target SLA'),
+            weight: Number(k.weight || k.weightage) || 0,
+            measurementCriteria: k.measurementCriteria || '% SLA: 1=Below, 3=Meets, 5=Exceeds',
+          });
+        }
+        if (items.length > 0) {
+          const totalWeight = items.reduce((s, it) => s + (Number(it.weight) || 0), 0);
+          const tTitle = `${name.trim()} - Performance Scorecard`;
+          await kraTemplatesCol.insertOne({
+            id: tId,
+            title: tTitle,
+            employeeId: newEmpId,
+            employeeCode: finalCode,
+            employeeName: name.trim(),
+            departmentId,
+            departmentName: dept?.name || 'Department',
+            designationId,
+            designationName: des?.name || 'Designation',
+            cycleId,
+            totalWeight,
+            items,
+            active: true,
+            createdAt: new Date().toISOString(),
+          });
+          assignedKraTemplateId = tId;
+          assignedKraTemplateName = tTitle;
+        }
+      } catch (kraErr) {
+        console.warn('[MastersRoutes] Error creating custom employee KRA template:', kraErr);
+      }
+    }
+
     const newEmp: Employee = {
-      id: `emp_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      id: newEmpId,
       employeeCode: finalCode,
       name: name.trim(),
       email: email.trim().toLowerCase(),
@@ -679,13 +824,19 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
       cycleColor: cycle?.colorHex || '#64748b',
       startingReviewPeriodId,
       startingReviewPeriodName: startingPeriod?.name || undefined,
-      currentKraTemplateId: currentKraTemplateId || undefined,
+      currentKraTemplateId: assignedKraTemplateId,
+      currentKraTemplateName: assignedKraTemplateName,
       currentCtc: numericCtc,
       currency: currency || '₹',
       status: status || 'ACTIVE',
       isPastEmployee: status === 'INACTIVE' || Boolean(exitDate),
       pastEmployeeDate: exitDate ? new Date(exitDate).toISOString() : undefined,
       relievingDate: exitDate ? new Date(exitDate).toISOString() : undefined,
+      confirmationDate: confirmationDate ? new Date(confirmationDate).toISOString() : undefined,
+      gender: gender ? gender.trim() : undefined,
+      employmentType: employmentType ? employmentType.trim() : undefined,
+      probationPeriodDays: probationPeriodDays !== undefined && probationPeriodDays !== '' ? Number(probationPeriodDays) : undefined,
+      companyName: companyName ? companyName.trim() : undefined,
       createdAt: new Date().toISOString(),
     };
 
@@ -842,6 +993,12 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       systemRole,
       provisionLogin,
       initialPassword,
+      confirmationDate,
+      gender,
+      employmentType,
+      probationPeriodDays,
+      companyName,
+      customKras,
     } = req.body;
 
     const empCol = getDbCollection('employees');
@@ -889,9 +1046,31 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
     if (location !== undefined) updateData.location = location ? location.trim() : undefined;
     if (joiningDate !== undefined) updateData.joiningDate = new Date(joiningDate).toISOString();
     if (status !== undefined) updateData.status = status;
-    if (currentKraTemplateId !== undefined) updateData.currentKraTemplateId = currentKraTemplateId || undefined;
+    // If a shared/library template was picked ("Template Library" mode), clone it into
+    // an employee-owned copy so this employee's scorecard never aliases another
+    // employee's (or the library blueprint's) document. Custom-scorecard mode is
+    // handled separately below and takes precedence when both are sent.
+    if (currentKraTemplateId !== undefined && (!Array.isArray(customKras) || customKras.length === 0)) {
+      if (currentKraTemplateId) {
+        const cloned = await assignKraTemplateToEmployee(currentKraTemplateId, {
+          id: emp.id,
+          employeeCode: (updateData.employeeCode || emp.employeeCode),
+          name: (updateData.name || emp.name),
+        });
+        updateData.currentKraTemplateId = cloned?.id;
+        updateData.currentKraTemplateName = cloned?.name;
+      } else {
+        updateData.currentKraTemplateId = undefined;
+        updateData.currentKraTemplateName = undefined;
+      }
+    }
     if (currentCtc !== undefined && currentCtc !== '') updateData.currentCtc = Number(currentCtc);
     if (currency !== undefined) updateData.currency = currency;
+    if (confirmationDate !== undefined) updateData.confirmationDate = confirmationDate ? new Date(confirmationDate).toISOString() : undefined;
+    if (gender !== undefined) updateData.gender = gender ? gender.trim() : undefined;
+    if (employmentType !== undefined) updateData.employmentType = employmentType ? employmentType.trim() : undefined;
+    if (probationPeriodDays !== undefined) updateData.probationPeriodDays = (probationPeriodDays !== '' && probationPeriodDays !== null) ? Number(probationPeriodDays) : undefined;
+    if (companyName !== undefined) updateData.companyName = companyName ? companyName.trim() : undefined;
 
     // Handle employee code update with uniqueness check and cascade
     if (employeeCode !== undefined && employeeCode.trim() !== '') {
@@ -936,6 +1115,109 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       updateData.startingReviewPeriodName = startingPeriod?.name || undefined;
     }
 
+    // Process custom employee KRAs if provided
+    if (Array.isArray(customKras) && customKras.length > 0) {
+      try {
+        const kraTemplatesCol = getDbCollection('kraTemplates');
+        const krasCol = getDbCollection('kras');
+        const items = [];
+        const targetDeptId = updateData.departmentId || emp.departmentId;
+        const targetDesigId = updateData.designationId || emp.designationId;
+        const targetCycleId = updateData.cycleId || emp.cycleId;
+
+        // The custom scorecard form always submits its full, current row set, so
+        // every save fully replaces this employee's KRA items. Look up the
+        // existing employee-owned template up front so its old `kras` docs can
+        // be cleaned up afterwards instead of being left as orphans.
+        const existingTpl = await kraTemplatesCol.findOne({
+          $or: [{ employeeId: emp.id }, { employeeCode: emp.employeeCode }],
+        });
+        const staleKraIds: string[] = (existingTpl?.items || [])
+          .map((it: any) => it.kraId)
+          .filter(Boolean);
+
+        for (const k of customKras) {
+          if (!k.title || !String(k.title).trim()) continue;
+          const kId = `kra_${Math.random().toString(36).substr(2, 9)}`;
+          const kraDoc = {
+            id: kId,
+            title: String(k.title).trim(),
+            description: k.description || k.target || `Target for ${k.title}`,
+            departmentId: targetDeptId,
+            designationId: targetDesigId,
+            cycleId: targetCycleId,
+            metricType: 'PERCENTAGE',
+            targetUnit: '%',
+            active: true,
+            createdAt: new Date().toISOString(),
+          };
+          await krasCol.insertOne(kraDoc);
+          items.push({
+            id: `item_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+            kraId: kId,
+            title: String(k.title).trim(),
+            description: k.description || k.target || '',
+            target: String(k.target || '100% Target SLA'),
+            weight: Number(k.weight || k.weightage) || 0,
+            measurementCriteria: k.measurementCriteria || '% SLA: 1=Below, 3=Meets, 5=Exceeds',
+          });
+        }
+
+        if (items.length > 0) {
+          const totalWeight = items.reduce((s, it) => s + (Number(it.weight) || 0), 0);
+          const tTitle = `${(updateData.name || emp.name).trim()} - Performance Scorecard`;
+
+          if (existingTpl) {
+            await kraTemplatesCol.updateOne(
+              { id: existingTpl.id },
+              {
+                $set: {
+                  title: tTitle,
+                  items,
+                  totalWeight,
+                  departmentId: targetDeptId,
+                  designationId: targetDesigId,
+                  cycleId: targetCycleId,
+                  updatedAt: new Date().toISOString(),
+                },
+              }
+            );
+            updateData.currentKraTemplateId = existingTpl.id;
+            updateData.currentKraTemplateName = tTitle;
+          } else {
+            const newTplId = `kratpl_${Math.random().toString(36).substr(2, 9)}`;
+            await kraTemplatesCol.insertOne({
+              id: newTplId,
+              title: tTitle,
+              employeeId: emp.id,
+              employeeCode: emp.employeeCode,
+              employeeName: (updateData.name || emp.name).trim(),
+              departmentId: targetDeptId,
+              designationId: targetDesigId,
+              cycleId: targetCycleId,
+              totalWeight,
+              items,
+              active: true,
+              createdAt: new Date().toISOString(),
+            });
+            updateData.currentKraTemplateId = newTplId;
+            updateData.currentKraTemplateName = tTitle;
+          }
+
+          // The scorecard's items were just fully replaced above — remove the
+          // previous items' standalone `kras` docs so they don't accumulate as
+          // orphans with every edit.
+          const newKraIds = new Set(items.map((it) => it.kraId));
+          const kraIdsToDelete = staleKraIds.filter((kId) => !newKraIds.has(kId));
+          if (kraIdsToDelete.length > 0) {
+            await krasCol.deleteMany({ id: { $in: kraIdsToDelete } });
+          }
+        }
+      } catch (kraErr) {
+        console.warn('[MastersRoutes] Error updating custom employee KRA template:', kraErr);
+      }
+    }
+
     const targetDesId = designationId || emp.designationId;
     const currentDes = targetDesId ? await desCol.findOne({ id: targetDesId }) : null;
     const effectiveRole = systemRole || emp.systemRole;
@@ -955,31 +1237,6 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
         if (!mgr) {
           return res.status(400).json({ error: 'Selected Reporting Manager was not found in the employee directory.' });
         }
-        const allDepts = await (await deptCol.find({})).toArray();
-        const deptHodIds = new Set(allDepts.map((d: any) => d.hodId).filter(Boolean));
-        const isMgrHod = deptHodIds.has(managerId) || mgr.systemRole === 'HOD';
-
-        // Managers and HODs can report to HODs. For individual contributors, only restrict if departmental managers exist.
-        if (isMgrHod && !isTargetHod && !isTargetManager) {
-          const targetDept = departmentId || emp.departmentId;
-          const otherMgrs = await empCol.find({
-            departmentId: targetDept,
-            id: { $ne: managerId },
-            status: { $ne: 'INACTIVE' },
-            systemRole: { $in: ['MANAGER', 'REPORTING_MANAGER'] },
-          }).toArray();
-          if (otherMgrs.length > 0) {
-            return res.status(400).json({
-              error: 'An HOD cannot be assigned as an L1 Reporting Manager for individual contributors when departmental managers exist. Please select a departmental reporting manager.',
-            });
-          }
-        }
-        const targetDeptId = departmentId || emp.departmentId;
-        if (mgr.departmentId !== targetDeptId && !isTargetHod) {
-          return res.status(400).json({
-            error: 'Reporting Manager must belong to the same department as the employee.',
-          });
-        }
         updateData.managerId = managerId;
         updateData.managerName = mgr.name;
 
@@ -995,19 +1252,13 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
     }
 
     if (hodId !== undefined) {
-      if (!hodId && status !== 'INACTIVE' && emp.status !== 'INACTIVE') {
+      if (!hodId && !isTargetHod && status !== 'INACTIVE' && emp.status !== 'INACTIVE') {
         return res.status(400).json({ error: 'Head of Department (HOD) is required.' });
       }
       if (hodId) {
         const hod = await empCol.findOne({ id: hodId });
         if (!hod) {
           return res.status(400).json({ error: 'Selected Head of Department (HOD) was not found in the employee directory.' });
-        }
-        const targetDeptId = departmentId || emp.departmentId;
-        if (hod.departmentId !== targetDeptId) {
-          return res.status(400).json({
-            error: 'Head of Department (HOD) must belong to the same department as the employee.',
-          });
         }
         updateData.hodId = hodId;
         updateData.hodName = hod.name;
@@ -1148,6 +1399,12 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
       await syncEmployeeAppraisalsAndReviews(updated);
     }
 
+    // If this request (re)assigned a KRA scorecard, push it into any not-yet-scored
+    // review that was created before this assignment and is still showing stale/fallback KRAs.
+    if (updateData.currentKraTemplateId !== undefined) {
+      await resyncUnscoredReviewKraSnapshots(id);
+    }
+
     if (req.user) {
       await recordAuditLog(
         req.user.id,
@@ -1234,6 +1491,22 @@ mastersRouter.delete('/employees/:id', requireRoles('SUPER_ADMIN'), async (req: 
     if (emp.userId) userOrConditions.push({ id: emp.userId });
     if (emp.email) userOrConditions.push({ email: emp.email.toLowerCase().trim() });
     await usersCol.deleteMany({ $or: userOrConditions });
+
+    // 5b. Delete this employee's own KRA scorecard (it is never shared with
+    // another employee, so it's always safe to remove alongside them) and the
+    // standalone `kras` docs its items reference.
+    const kraTemplatesCol = getDbCollection('kraTemplates');
+    const krasCol = getDbCollection('kras');
+    const ownedTemplates = await (await kraTemplatesCol.find({
+      $or: [{ employeeId: id }, { employeeCode: emp.employeeCode }],
+    })).toArray();
+    if (ownedTemplates.length > 0) {
+      const ownedKraIds = ownedTemplates.flatMap((t: any) => (t.items || []).map((it: any) => it.kraId).filter(Boolean));
+      if (ownedKraIds.length > 0) {
+        await krasCol.deleteMany({ id: { $in: ownedKraIds } });
+      }
+      await kraTemplatesCol.deleteMany({ id: { $in: ownedTemplates.map((t: any) => t.id) } });
+    }
 
     // 6. Unassign this employee as reporting manager or HOD for any other employees
     await empCol.updateMany(
@@ -1412,131 +1685,79 @@ async function isNotificationTargetCompleted(notif: any): Promise<boolean> {
 }
 
 /**
- * GET /api/notifications
- * List actionable in-app workflow notifications for current user/role
+ * Auto-syncs and auto-resolves workflow notifications for a user before they're read —
+ * creates/resolves self-assessment reminders and clears stale review-action notifications
+ * once their underlying review has moved on. Shared by both the full list and the
+ * lightweight unread-count endpoint below, so their side effects and results never drift
+ * out of sync with each other.
  */
-mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const notifsCol = getDbCollection('notifications');
-    const currentUser = req.user;
-    if (!currentUser) {
-      return res.json([]);
-    }
+async function runNotificationAutoSync(currentUser: User): Promise<void> {
+  const notifsCol = getDbCollection('notifications');
 
-    // Auto-sync self-assessment notifications for current user/employee with pending reviews
-    const targetEmpId = currentUser.employeeId || (currentUser.role === 'EMPLOYEE' ? currentUser.id : null);
-    if (targetEmpId) {
-      try {
-        const reviewsCol = getDbCollection('employeeReviews');
-        const pendingReviews: any[] = await (
-          await reviewsCol.find({
-            $or: [{ employeeId: targetEmpId }, { employeeId: currentUser.id }],
-            isClosed: { $ne: true },
-            status: { $in: ['ASSIGNED', 'DRAFT', 'MANAGER_PENDING', 'SELF_ASSESSMENT_DUE', 'OPEN'] },
-            isSelfSubmitted: { $ne: true },
-          })
-        ).toArray();
-
-        for (const rev of pendingReviews) {
-          const notifId = `notif_self_assess_${rev.id}`;
-          const existingNotif = await notifsCol.findOne({
-            $or: [
-              { id: notifId },
-              {
-                'metadata.reviewId': rev.id,
-                userId: { $in: [targetEmpId, currentUser.id] },
-                type: 'REVIEW_ASSIGNED',
-              },
-            ],
-          });
-
-          if (!existingNotif) {
-            await notifsCol.insertOne({
-              id: notifId,
-              userId: targetEmpId,
-              userRole: 'EMPLOYEE',
-              type: 'REVIEW_ASSIGNED',
-              title: `Self-Assessment Due: ${rev.reviewPeriodName || 'Quarterly Review'}`,
-              message: `Your quarterly performance self-assessment for ${rev.reviewPeriodName || 'this cycle'} is pending. Complete your ratings and submit your self-evaluation.`,
-              isRead: false,
-              priority: 'HIGH',
-              metadata: {
-                reviewId: rev.id,
-                periodId: rev.reviewPeriodId,
-                subTab: 'reviews',
-                openSelfAssess: true,
-              },
-              createdAt: new Date().toISOString(),
-            });
-          }
-        }
-
-        // If employee has already submitted, ensure the self-assessment notification is marked as read
-        const completedReviews: any[] = await (
-          await reviewsCol.find({
-            $and: [
-              { $or: [{ employeeId: targetEmpId }, { employeeId: currentUser.id }] },
-              { $or: [{ isSelfSubmitted: true }, { isClosed: true }] },
-            ],
-          })
-        ).toArray();
-
-        for (const rev of completedReviews) {
-          await notifsCol.updateMany(
-            {
-              userId: { $in: [targetEmpId, currentUser.id] },
-              'metadata.reviewId': rev.id,
-              type: 'REVIEW_ASSIGNED',
-              isRead: false,
-            },
-            {
-              $set: { isRead: true },
-            }
-          );
-        }
-      } catch (syncErr) {
-        console.warn('[Notifications] Error auto-syncing employee self-assessment notifs:', syncErr);
-      }
-    }
-
-    // Auto-resolve stale workflow review notifications across all roles (HR, HOD, Managers, Employees)
+  // Auto-sync self-assessment notifications for current user/employee with pending reviews
+  const targetEmpId = currentUser.employeeId || (currentUser.role === 'EMPLOYEE' ? currentUser.id : null);
+  if (targetEmpId) {
     try {
       const reviewsCol = getDbCollection('employeeReviews');
-
-      // 1. If reviews are completed / closed, resolve all pending review action notifications
-      const closedOrCompletedReviews: any[] = await (
+      const pendingReviews: any[] = await (
         await reviewsCol.find({
-          $or: [{ isClosed: true }, { status: 'CLOSED' }],
+          $or: [{ employeeId: targetEmpId }, { employeeId: currentUser.id }],
+          isClosed: { $ne: true },
+          status: { $in: ['ASSIGNED', 'DRAFT', 'MANAGER_PENDING', 'SELF_ASSESSMENT_DUE', 'OPEN'] },
+          isSelfSubmitted: { $ne: true },
         })
       ).toArray();
 
-      if (closedOrCompletedReviews.length > 0) {
-        const closedReviewIds = closedOrCompletedReviews.map((r) => r.id);
-        await notifsCol.updateMany(
-          {
-            'metadata.reviewId': { $in: closedReviewIds },
-            type: { $in: ['MANAGER_SUBMITTED', 'HOD_ACTION_REQUIRED', 'HOD_APPROVED', 'RETURNED', 'REVIEW_ASSIGNED'] },
+      for (const rev of pendingReviews) {
+        const notifId = `notif_self_assess_${rev.id}`;
+        const existingNotif = await notifsCol.findOne({
+          $or: [
+            { id: notifId },
+            {
+              'metadata.reviewId': rev.id,
+              userId: { $in: [targetEmpId, currentUser.id] },
+              type: 'REVIEW_ASSIGNED',
+            },
+          ],
+        });
+
+        if (!existingNotif) {
+          await notifsCol.insertOne({
+            id: notifId,
+            userId: targetEmpId,
+            userRole: 'EMPLOYEE',
+            type: 'REVIEW_ASSIGNED',
+            title: `Self-Assessment Due: ${rev.reviewPeriodName || 'Quarterly Review'}`,
+            message: `Your quarterly performance self-assessment for ${rev.reviewPeriodName || 'this cycle'} is pending. Complete your ratings and submit your self-evaluation.`,
             isRead: false,
-          },
-          {
-            $set: { isRead: true },
-          }
-        );
+            priority: 'HIGH',
+            metadata: {
+              reviewId: rev.id,
+              periodId: rev.reviewPeriodId,
+              subTab: 'reviews',
+              openSelfAssess: true,
+            },
+            createdAt: new Date().toISOString(),
+          });
+        }
       }
 
-      // 2. If review is no longer pending HR approval (status is not HR_PENDING or SUBMITTED), resolve MANAGER_SUBMITTED and HOD_APPROVED
-      const nonHrPendingReviews: any[] = await (
+      // If employee has already submitted, ensure the self-assessment notification is marked as read
+      const completedReviews: any[] = await (
         await reviewsCol.find({
-          status: { $nin: ['HR_PENDING', 'SUBMITTED'] },
+          $and: [
+            { $or: [{ employeeId: targetEmpId }, { employeeId: currentUser.id }] },
+            { $or: [{ isSelfSubmitted: true }, { isClosed: true }] },
+          ],
         })
       ).toArray();
 
-      if (nonHrPendingReviews.length > 0) {
-        const nonHrPendingIds = nonHrPendingReviews.map((r) => r.id);
+      for (const rev of completedReviews) {
         await notifsCol.updateMany(
           {
-            'metadata.reviewId': { $in: nonHrPendingIds },
-            type: { $in: ['MANAGER_SUBMITTED', 'HOD_APPROVED'] },
+            userId: { $in: [targetEmpId, currentUser.id] },
+            'metadata.reviewId': rev.id,
+            type: 'REVIEW_ASSIGNED',
             isRead: false,
           },
           {
@@ -1545,112 +1766,203 @@ mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Respo
         );
       }
     } catch (syncErr) {
-      console.warn('[Notifications] Error auto-syncing completed review workflow notifications:', syncErr);
+      console.warn('[Notifications] Error auto-syncing employee self-assessment notifs:', syncErr);
+    }
+  }
+
+  // Auto-resolve stale workflow review notifications across all roles (HR, HOD, Managers, Employees)
+  try {
+    const reviewsCol = getDbCollection('employeeReviews');
+
+    // 1. If reviews are completed / closed, resolve all pending review action notifications
+    const closedOrCompletedReviews: any[] = await (
+      await reviewsCol.find({
+        $or: [{ isClosed: true }, { status: 'CLOSED' }],
+      })
+    ).toArray();
+
+    if (closedOrCompletedReviews.length > 0) {
+      const closedReviewIds = closedOrCompletedReviews.map((r) => r.id);
+      await notifsCol.updateMany(
+        {
+          'metadata.reviewId': { $in: closedReviewIds },
+          type: { $in: ['MANAGER_SUBMITTED', 'HOD_ACTION_REQUIRED', 'HOD_APPROVED', 'RETURNED', 'REVIEW_ASSIGNED'] },
+          isRead: false,
+        },
+        {
+          $set: { isRead: true },
+        }
+      );
     }
 
-    const isSuperAdmin = currentUser.role === 'SUPER_ADMIN';
+    // 2. If review is no longer pending HR approval (status is not HR_PENDING or SUBMITTED), resolve MANAGER_SUBMITTED and HOD_APPROVED
+    const nonHrPendingReviews: any[] = await (
+      await reviewsCol.find({
+        status: { $nin: ['HR_PENDING', 'SUBMITTED'] },
+      })
+    ).toArray();
 
-    let filter: any = {};
-    if (!isSuperAdmin) {
-      const orClauses: any[] = [
-        { userId: currentUser.id },
-        { userId: 'ALL' },
-        { userId: null },
-        { userRole: 'ALL' },
-        { userRole: currentUser.role },
-      ];
-      if (currentUser.employeeId) {
-        orClauses.push({ userId: currentUser.employeeId });
+    if (nonHrPendingReviews.length > 0) {
+      const nonHrPendingIds = nonHrPendingReviews.map((r) => r.id);
+      await notifsCol.updateMany(
+        {
+          'metadata.reviewId': { $in: nonHrPendingIds },
+          type: { $in: ['MANAGER_SUBMITTED', 'HOD_APPROVED'] },
+          isRead: false,
+        },
+        {
+          $set: { isRead: true },
+        }
+      );
+    }
+  } catch (syncErr) {
+    console.warn('[Notifications] Error auto-syncing completed review workflow notifications:', syncErr);
+  }
+}
+
+/**
+ * Resolves the exact, role-scoped, deduplicated notification list a user is allowed to see —
+ * the single source of truth for both GET /notifications (full list) and
+ * GET /notifications/unread-count (badge count), so the count can never drift from what the
+ * list endpoint actually shows.
+ */
+async function computeVisibleNotifications(currentUser: User): Promise<any[]> {
+  const notifsCol = getDbCollection('notifications');
+
+  await runNotificationAutoSync(currentUser);
+
+  const isSuperAdmin = currentUser.role === 'SUPER_ADMIN';
+
+  let filter: any = {};
+  if (!isSuperAdmin) {
+    const orClauses: any[] = [
+      { userId: currentUser.id },
+      { userId: 'ALL' },
+      { userId: null },
+      { userRole: 'ALL' },
+      { userRole: currentUser.role },
+    ];
+    if (currentUser.employeeId) {
+      orClauses.push({ userId: currentUser.employeeId });
+    }
+    filter = { $or: orClauses };
+  }
+
+  // Direct database query with sort and limit 100
+  const rawNotifications: any = await notifsCol.find(filter);
+  const notifications: any[] = Array.isArray(rawNotifications)
+    ? rawNotifications
+    : typeof rawNotifications?.toArray === 'function'
+    ? await rawNotifications.toArray()
+    : [];
+
+  let filtered: any[] = notifications;
+
+  if (isSuperAdmin) {
+    filtered = notifications.filter((n) => {
+      // Exclude individual employee private notifications unless specifically for admin
+      if (n.userRole === 'EMPLOYEE' && n.userId !== currentUser.id) return false;
+      if (n.type === 'HR_COMPLETED') return false;
+      if (n.title && n.title.toLowerCase().includes('self-assessment due')) return false;
+      if (n.message && n.message.toLowerCase().includes('your quarterly performance')) return false;
+      if (n.type === 'LETTER_RELEASED' && n.userId !== currentUser.id) return false;
+
+      // Admin has oversight over administrative, management, HR, HOD, and global alerts
+      if (['SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGEMENT', 'HOD', 'ALL'].includes(n.userRole) || !n.userRole) {
+        return true;
       }
-      filter = { $or: orClauses };
-    }
+      return false;
+    });
+  } else {
+    filtered = notifications.filter((n) => {
+      // Direct target match by user ID or employee ID (private notification)
+      const isDirectUserMatch = n.userId === currentUser.id;
+      const isDirectEmpMatch = Boolean(currentUser.employeeId && n.userId === currentUser.employeeId);
+      if (isDirectUserMatch || isDirectEmpMatch) {
+        return true;
+      }
 
-    // Direct database query with sort and limit 100
-    const rawNotifications: any = await notifsCol.find(filter);
-    const notifications: any[] = Array.isArray(rawNotifications)
-      ? rawNotifications
-      : typeof rawNotifications?.toArray === 'function'
-      ? await rawNotifications.toArray()
-      : [];
-
-    let filtered: any[] = notifications;
-
-    if (isSuperAdmin) {
-      filtered = notifications.filter((n) => {
-        // Exclude individual employee private notifications unless specifically for admin
-        if (n.userRole === 'EMPLOYEE' && n.userId !== currentUser.id) return false;
-        if (n.type === 'HR_COMPLETED') return false;
-        if (n.title && n.title.toLowerCase().includes('self-assessment due')) return false;
-        if (n.message && n.message.toLowerCase().includes('your quarterly performance')) return false;
-        if (n.type === 'LETTER_RELEASED' && n.userId !== currentUser.id) return false;
-
-        // Admin has oversight over administrative, management, HR, HOD, and global alerts
-        if (['SUPER_ADMIN', 'ADMIN', 'HR', 'MANAGEMENT', 'HOD', 'ALL'].includes(n.userRole) || !n.userRole) {
-          return true;
-        }
-        return false;
-      });
-    } else {
-      filtered = notifications.filter((n) => {
-        // Direct target match by user ID or employee ID (private notification)
-        const isDirectUserMatch = n.userId === currentUser.id;
-        const isDirectEmpMatch = Boolean(currentUser.employeeId && n.userId === currentUser.employeeId);
-        if (isDirectUserMatch || isDirectEmpMatch) {
-          return true;
-        }
-
-        // Direct target match by userRole (e.g. HR, MANAGEMENT)
-        if (n.userRole === currentUser.role) {
-          // If a specific userId is designated and it does not match this user, don't show it
-          if (n.userId && n.userId !== 'ALL' && n.userId !== currentUser.id && (!currentUser.employeeId || n.userId !== currentUser.employeeId)) {
-            return false;
-          }
-          return true;
-        }
-
-        // Broadcast notifications targeted to ALL or broad role queues
-        if (n.userId === 'ALL' || !n.userId) {
-          if (!n.userRole || n.userRole === 'ALL' || n.userRole === currentUser.role) {
-            return true;
-          }
+      // Direct target match by userRole (e.g. HR, MANAGEMENT)
+      if (n.userRole === currentUser.role) {
+        // If a specific userId is designated and it does not match this user, don't show it
+        if (n.userId && n.userId !== 'ALL' && n.userId !== currentUser.id && (!currentUser.employeeId || n.userId !== currentUser.employeeId)) {
           return false;
         }
-
-        // Shared administrative queues (HR and Executive Management shared pools)
-        if (currentUser.role === 'HR' && n.userRole === 'HR' && (n.userId === 'ALL' || (typeof n.userId === 'string' && n.userId.includes('hr')))) {
-          return true;
-        }
-        if (currentUser.role === 'MANAGEMENT' && n.userRole === 'MANAGEMENT' && (n.userId === 'ALL' || (typeof n.userId === 'string' && n.userId.includes('mgmt')))) {
-          return true;
-        }
-
-        return false;
-      });
-    }
-
-    // Deduplicate by notification id or (userId + type + metadata.reviewId/periodId)
-    const seenNotifs = new Set<string>();
-    const deduplicated: any[] = [];
-    for (const notif of filtered) {
-      const dedupeKey = notif.id || `${notif.userId}_${notif.type}_${notif.metadata?.reviewId || notif.metadata?.periodId || notif.title}`;
-      if (!seenNotifs.has(dedupeKey)) {
-        seenNotifs.add(dedupeKey);
-        deduplicated.push(notif);
+        return true;
       }
-    }
 
-    // Sort newest first & limit to top 100
-    deduplicated.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
-    if (deduplicated.length > 100) {
-      filtered = deduplicated.slice(0, 100);
-    } else {
-      filtered = deduplicated;
-    }
+      // Broadcast notifications targeted to ALL or broad role queues
+      if (n.userId === 'ALL' || !n.userId) {
+        if (!n.userRole || n.userRole === 'ALL' || n.userRole === currentUser.role) {
+          return true;
+        }
+        return false;
+      }
 
+      // Shared administrative queues (HR and Executive Management shared pools)
+      if (currentUser.role === 'HR' && n.userRole === 'HR' && (n.userId === 'ALL' || (typeof n.userId === 'string' && n.userId.includes('hr')))) {
+        return true;
+      }
+      if (currentUser.role === 'MANAGEMENT' && n.userRole === 'MANAGEMENT' && (n.userId === 'ALL' || (typeof n.userId === 'string' && n.userId.includes('mgmt')))) {
+        return true;
+      }
+
+      return false;
+    });
+  }
+
+  // Deduplicate by notification id or (userId + type + metadata.reviewId/periodId)
+  const seenNotifs = new Set<string>();
+  const deduplicated: any[] = [];
+  for (const notif of filtered) {
+    const dedupeKey = notif.id || `${notif.userId}_${notif.type}_${notif.metadata?.reviewId || notif.metadata?.periodId || notif.title}`;
+    if (!seenNotifs.has(dedupeKey)) {
+      seenNotifs.add(dedupeKey);
+      deduplicated.push(notif);
+    }
+  }
+
+  // Sort newest first & limit to top 100
+  deduplicated.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+  return deduplicated.length > 100 ? deduplicated.slice(0, 100) : deduplicated;
+}
+
+/**
+ * GET /api/notifications
+ * List actionable in-app workflow notifications for current user/role
+ */
+mastersRouter.get('/notifications', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const currentUser = req.user;
+    if (!currentUser) {
+      return res.json([]);
+    }
+    const filtered = await computeVisibleNotifications(currentUser);
     res.json(filtered);
   } catch (error: any) {
     console.error('Failed to fetch notifications:', error);
     res.status(500).json({ error: 'Failed to fetch workflow notifications.' });
+  }
+});
+
+/**
+ * GET /api/notifications/unread-count
+ * Lightweight badge-count endpoint — same visibility rules as GET /notifications, but
+ * returns only a number instead of the full (up to 100-item) payload. Built for frequent
+ * polling (e.g. the header bell) without the network/parsing cost of the full list.
+ */
+mastersRouter.get('/notifications/unread-count', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const currentUser = req.user;
+    if (!currentUser) {
+      return res.json({ unreadCount: 0 });
+    }
+    const filtered = await computeVisibleNotifications(currentUser);
+    const unreadCount = filtered.filter((n) => !n.isRead).length;
+    res.json({ unreadCount });
+  } catch (error: any) {
+    console.error('Failed to fetch unread notification count:', error);
+    res.status(500).json({ error: 'Failed to fetch unread notification count.' });
   }
 });
 

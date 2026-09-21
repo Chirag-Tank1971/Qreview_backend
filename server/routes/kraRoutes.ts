@@ -2,7 +2,8 @@ import express, { Response } from 'express';
 import { getDbCollection } from '../db.js';
 import { authenticateToken, requireRoles, recordAuditLog, AuthenticatedRequest } from '../auth.js';
 import { validateBody, CreateKraSchema, UpdateKraSchema, KraTemplateSchema } from '../validation.js';
-import { Kra, KraTemplate, KraItem } from '../../src/types/index.js';
+import { Kra, KraTemplate, KraItem, Employee } from '../../src/types/index.js';
+import { syncEmployeeAppraisalsAndReviews, resyncUnscoredReviewKraSnapshots } from '../syncHelpers.js';
 
 export const kraRouter = express.Router();
 
@@ -170,13 +171,17 @@ kraRouter.put(
 
 /**
  * GET /api/kra-templates
- * Supports filters: departmentId, designationId, search
+ * Supports filters: departmentId, designationId, employeeId, search
  */
 kraRouter.get('/kra-templates', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { departmentId, designationId, search } = req.query;
+    const { departmentId, designationId, employeeId, search } = req.query;
     const templateCol = getDbCollection('kraTemplates');
     let allTemplates: KraTemplate[] = await (await templateCol.find({})).toArray();
+
+    if (employeeId) {
+      allTemplates = allTemplates.filter((t) => t.employeeId === employeeId);
+    }
 
     if (departmentId) {
       allTemplates = allTemplates.filter((t) => t.departmentId === departmentId);
@@ -191,8 +196,10 @@ kraRouter.get('/kra-templates', async (req: AuthenticatedRequest, res: Response)
       allTemplates = allTemplates.filter(
         (t) =>
           t.title.toLowerCase().includes(q) ||
-          t.departmentName.toLowerCase().includes(q) ||
-          t.designationName.toLowerCase().includes(q)
+          (t.employeeName && t.employeeName.toLowerCase().includes(q)) ||
+          (t.employeeCode && t.employeeCode.toLowerCase().includes(q)) ||
+          (t.departmentName && t.departmentName.toLowerCase().includes(q)) ||
+          (t.designationName && t.designationName.toLowerCase().includes(q))
       );
     }
 
@@ -229,11 +236,11 @@ kraRouter.post(
   validateBody(KraTemplateSchema),
   async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { title, departmentId, designationId, items, description } = req.body;
+    const { title, departmentId, designationId, employeeId, employeeCode, employeeName, items, description, cycleId, cycleCode } = req.body;
 
-    if (!title || !departmentId || !designationId || !Array.isArray(items) || items.length === 0) {
+    if (!title || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
-        error: 'Required fields missing: title, departmentId, designationId, and at least 1 KRA item.',
+        error: 'Required fields missing: title and at least 1 KRA item.',
       });
     }
 
@@ -247,10 +254,47 @@ kraRouter.post(
 
     const deptCol = getDbCollection('departments');
     const desCol = getDbCollection('designations');
+    const empCol = getDbCollection('employees');
     const templateCol = getDbCollection('kraTemplates');
 
-    const dept = await deptCol.findOne({ id: departmentId });
-    const des = await desCol.findOne({ id: designationId });
+    let resolvedDeptId = departmentId;
+    let resolvedDeptName: string | undefined;
+    let resolvedDesigId = designationId;
+    let resolvedDesigName: string | undefined;
+    let resolvedEmpId = employeeId;
+    let resolvedEmpCode = employeeCode;
+    let resolvedEmpName = employeeName;
+
+    if (employeeId || employeeCode) {
+      const emp = await empCol.findOne({
+        $or: [
+          ...(employeeId ? [{ id: employeeId }] : []),
+          ...(employeeCode ? [{ employeeCode: String(employeeCode).trim().toUpperCase() }] : []),
+        ],
+      });
+      if (emp) {
+        resolvedEmpId = emp.id;
+        resolvedEmpCode = emp.employeeCode;
+        resolvedEmpName = emp.name;
+        if (!resolvedDeptId) {
+          resolvedDeptId = emp.departmentId;
+          resolvedDeptName = emp.departmentName;
+        }
+        if (!resolvedDesigId) {
+          resolvedDesigId = emp.designationId;
+          resolvedDesigName = emp.designationName;
+        }
+      }
+    }
+
+    if (resolvedDeptId && !resolvedDeptName) {
+      const dept = await deptCol.findOne({ id: resolvedDeptId });
+      if (dept) resolvedDeptName = dept.name;
+    }
+    if (resolvedDesigId && !resolvedDesigName) {
+      const des = await desCol.findOne({ id: resolvedDesigId });
+      if (des) resolvedDesigName = des.name;
+    }
 
     const sanitizedItems: KraItem[] = items.map((it: any, idx: number) => ({
       id: it.id || `item_${Date.now()}_${idx}`,
@@ -265,10 +309,15 @@ kraRouter.post(
     const newTemplate: KraTemplate = {
       id: `tmpl_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       title: title.trim(),
-      departmentId,
-      departmentName: dept?.name || 'Department',
-      designationId,
-      designationName: des?.name || 'Designation',
+      employeeId: resolvedEmpId || undefined,
+      employeeCode: resolvedEmpCode || undefined,
+      employeeName: resolvedEmpName || undefined,
+      departmentId: resolvedDeptId || undefined,
+      departmentName: resolvedDeptName || (resolvedEmpId ? 'General' : undefined),
+      designationId: resolvedDesigId || undefined,
+      designationName: resolvedDesigName || undefined,
+      cycleId: cycleId || undefined,
+      cycleCode: cycleCode || undefined,
       items: sanitizedItems,
       totalWeight: 100,
       active: true,
@@ -277,6 +326,29 @@ kraRouter.post(
     };
 
     await templateCol.insertOne(newTemplate);
+
+    // Auto-assign to employee if an employee was associated
+    if (resolvedEmpId) {
+      await empCol.updateOne(
+        { id: resolvedEmpId },
+        {
+          $set: {
+            currentKraTemplateId: newTemplate.id,
+            currentKraTemplateName: newTemplate.title,
+            updatedAt: new Date().toISOString(),
+          },
+        }
+      );
+
+      // Immediately re-evaluate this employee's review eligibility so a newly assigned
+      // KRA generates their quarterly review right away, instead of waiting for the next
+      // employee save, manual sync, or the daily 7 AM automated sync job.
+      const assignedEmp: Employee | null = await empCol.findOne({ id: resolvedEmpId });
+      if (assignedEmp) {
+        await syncEmployeeAppraisalsAndReviews(assignedEmp);
+      }
+      await resyncUnscoredReviewKraSnapshots(resolvedEmpId);
+    }
 
     if (req.user) {
       await recordAuditLog(
@@ -288,7 +360,7 @@ kraRouter.post(
         newTemplate.id,
         '',
         newTemplate.title,
-        `Created KRA Template "${newTemplate.title}" for ${newTemplate.designationName} (${newTemplate.departmentName}) with ${newTemplate.items.length} items totaling 100%`
+        `Created KRA Template "${newTemplate.title}" ${resolvedEmpName ? `for employee ${resolvedEmpName} (${resolvedEmpCode})` : ''} with ${newTemplate.items.length} items totaling 100%`
       );
     }
 
@@ -305,11 +377,12 @@ kraRouter.post(
 kraRouter.put('/kra-templates/:id', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { id } = req.params;
-    const { title, departmentId, designationId, items, active } = req.body;
+    const { title, departmentId, designationId, employeeId, employeeCode, employeeName, items, active } = req.body;
 
     const templateCol = getDbCollection('kraTemplates');
     const deptCol = getDbCollection('departments');
     const desCol = getDbCollection('designations');
+    const empCol = getDbCollection('employees');
 
     const template = await templateCol.findOne({ id });
     if (!template) {
@@ -322,6 +395,29 @@ kraRouter.put('/kra-templates/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
 
     if (title !== undefined) updateData.title = title.trim();
     if (active !== undefined) updateData.active = Boolean(active);
+
+    if (employeeId !== undefined || employeeCode !== undefined) {
+      const emp = await empCol.findOne({
+        $or: [
+          ...(employeeId ? [{ id: employeeId }] : []),
+          ...(employeeCode ? [{ employeeCode: String(employeeCode).trim().toUpperCase() }] : []),
+        ],
+      });
+      if (emp) {
+        updateData.employeeId = emp.id;
+        updateData.employeeCode = emp.employeeCode;
+        updateData.employeeName = emp.name;
+        // Also auto-assign template to this employee if not assigned
+        await empCol.updateOne(
+          { id: emp.id },
+          { $set: { currentKraTemplateId: template.id, currentKraTemplateName: updateData.title || template.title, updatedAt: new Date().toISOString() } }
+        );
+      } else {
+        updateData.employeeId = employeeId;
+        updateData.employeeCode = employeeCode;
+        updateData.employeeName = employeeName;
+      }
+    }
 
     if (departmentId !== undefined) {
       updateData.departmentId = departmentId;
@@ -361,6 +457,18 @@ kraRouter.put('/kra-templates/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
 
     await templateCol.updateOne({ id }, { $set: updateData });
     const updated = await templateCol.findOne({ id });
+
+    // If this template is (now) tied to an employee, immediately re-evaluate their review
+    // eligibility so the assignment/edit generates or refreshes their quarterly review right
+    // away, instead of waiting for the next employee save, manual sync, or the daily sync job.
+    const linkedEmployeeId = updateData.employeeId !== undefined ? updateData.employeeId : template.employeeId;
+    if (linkedEmployeeId) {
+      const assignedEmp: Employee | null = await empCol.findOne({ id: linkedEmployeeId });
+      if (assignedEmp) {
+        await syncEmployeeAppraisalsAndReviews(assignedEmp);
+      }
+      await resyncUnscoredReviewKraSnapshots(linkedEmployeeId);
+    }
 
     if (req.user) {
       await recordAuditLog(

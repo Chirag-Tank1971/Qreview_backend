@@ -271,11 +271,16 @@ export async function generateQuarterlyReviews(
 /**
  * Server-side weighted score calculator
  * Weighted Score = SUM(KRA Rating * KRA Weight) / 100
+ * `ratingField` lets the same calculator serve the Manager's own score ('rating', default)
+ * and the HOD's own independent score ('hodRating') without duplicating the formula.
  */
-export function calculateWeightedScore(kraSnapshot: ReviewKraSnapshot[]): number {
+export function calculateWeightedScore(
+  kraSnapshot: ReviewKraSnapshot[],
+  ratingField: 'rating' | 'hodRating' = 'rating'
+): number {
   if (!kraSnapshot || kraSnapshot.length === 0) return 0;
   const total = kraSnapshot.reduce((sum, item) => {
-    const rating = Number(item.rating) || 0;
+    const rating = Number((item as any)[ratingField]) || 0;
     const weight = Number(item.weight) || 0;
     return sum + (rating * weight);
   }, 0);
@@ -309,6 +314,39 @@ export function mergeKraSnapshot(
         achievement: incoming.achievement || '',
         comments: incoming.comments || '',
         issueReason: incoming.issueReason || '',
+      };
+    }
+    return existingKra;
+  });
+}
+
+/**
+ * Merges incoming HOD rating/comment fields onto the existing review's KRA snapshot.
+ * Mirrors mergeKraSnapshot but writes ONLY the hod* fields — the Manager's own
+ * rating/achievement/comments are never touched here, regardless of what the incoming
+ * payload contains, so HOD scoring can never overwrite the Manager's assessment.
+ */
+export function mergeHodKraSnapshot(
+  existingSnapshot: ReviewKraSnapshot[] | undefined,
+  incomingHodKras: any[] | undefined
+): ReviewKraSnapshot[] {
+  const base = existingSnapshot || [];
+  if (!incomingHodKras || !Array.isArray(incomingHodKras)) return base;
+
+  return base.map((existingKra) => {
+    const incoming = incomingHodKras.find(
+      (k: any) =>
+        k.id === existingKra.id ||
+        k.kraId === existingKra.kraId ||
+        k.kraName === existingKra.kraName ||
+        k.title === existingKra.title
+    );
+    if (incoming) {
+      return {
+        ...existingKra,
+        hodRating: Number(incoming.hodRating) || 0,
+        hodAchievement: incoming.hodAchievement || '',
+        hodComments: incoming.hodComments || '',
       };
     }
     return existingKra;
@@ -530,16 +568,27 @@ export async function submitManagerReview(
 }
 
 /**
- * HOD approves the manager's assessment
- * Transitions: HOD_PENDING -> HR_PENDING
+ * HOD scores the review independently (own KRA-by-KRA ratings, never touching the
+ * Manager's), and either saves a draft or submits it forward.
+ * Transitions (on submit): HOD_PENDING -> HR_PENDING
+ *
+ * `finalScore` becomes the average of the Manager's and HOD's own weighted scores once
+ * the HOD submits — the Manager's independent score is preserved untouched on the review
+ * (managerScore), never overwritten by this function.
  */
 export async function hodApproveReview(
   reviewId: string,
-  hodComments: string | undefined,
+  payload: {
+    kraSnapshot?: any[];
+    hodRatings?: any[];
+    hodOverallComments?: string;
+    hodComments?: string; // legacy alias for hodOverallComments
+    isDraft?: boolean;
+  },
   user: { id: string; name: string; role: any; employeeId?: string }
 ): Promise<EmployeeReview> {
   if (user.role !== 'SUPER_ADMIN' && user.role !== 'HOD') {
-    throw new Error('Forbidden: Only the designated HOD or Super Admin can approve a review.');
+    throw new Error('Forbidden: Only the designated HOD or Super Admin can score/approve a review.');
   }
 
   const reviewCol = getDbCollection('employeeReviews');
@@ -550,8 +599,53 @@ export async function hodApproveReview(
   if (review.isClosed) {
     throw new Error('Cannot approve a closed review.');
   }
+  if (review.status !== 'HOD_PENDING' && user.role !== 'SUPER_ADMIN') {
+    throw new Error(`Cannot score review in status "${review.status}". Must be HOD_PENDING.`);
+  }
+
+  const incomingHodKras = payload.kraSnapshot || payload.hodRatings;
+  const updatedSnapshot = incomingHodKras
+    ? mergeHodKraSnapshot(review.kraSnapshot, incomingHodKras)
+    : review.kraSnapshot || [];
+
+  const isDraft = Boolean(payload.isDraft);
+  const hodOverallComments = payload.hodOverallComments !== undefined ? payload.hodOverallComments : payload.hodComments;
 
   const now = new Date().toISOString();
+
+  if (isDraft) {
+    const draftAction: ReviewAction = {
+      id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
+      reviewId,
+      action: 'DRAFT_SAVED',
+      performedBy: user.id,
+      performedByName: user.name,
+      performedByRole: user.role,
+      remarks: 'HOD saved scoring draft.',
+      performedAt: now,
+    };
+    const draftUpdated: EmployeeReview = {
+      ...review,
+      kraSnapshot: updatedSnapshot,
+      hodOverallComments: hodOverallComments !== undefined ? hodOverallComments : review.hodOverallComments,
+      actionHistory: [...(review.actionHistory || []), draftAction],
+      updatedAt: now,
+    };
+    await reviewCol.updateOne({ id: reviewId }, { $set: draftUpdated });
+    return draftUpdated;
+  }
+
+  // Strict validation: every KRA must carry a valid HOD rating between 1 and 5 before submitting.
+  for (const kra of updatedSnapshot) {
+    if (!kra.hodRating || kra.hodRating < 1 || kra.hodRating > 5) {
+      throw new Error(`KRA "${kra.kraName || kra.title}" must have a valid HOD rating between 1 and 5.`);
+    }
+  }
+
+  const hodScore = calculateWeightedScore(updatedSnapshot, 'hodRating');
+  const managerScore = review.managerScore ?? review.finalScore ?? 0;
+  const finalScore = Number(((managerScore + hodScore) / 2).toFixed(2));
+
   const action: ReviewAction = {
     id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
     reviewId,
@@ -559,12 +653,18 @@ export async function hodApproveReview(
     performedBy: user.id,
     performedByName: user.name,
     performedByRole: user.role,
-    remarks: hodComments ? `Approved by HOD: ${hodComments}` : 'Approved by HOD.',
+    remarks: hodOverallComments
+      ? `HOD submitted independent scoring (${hodScore}). Comments: ${hodOverallComments}`
+      : `HOD submitted independent scoring (${hodScore}).`,
     performedAt: now,
   };
 
   const updated: EmployeeReview = {
     ...review,
+    kraSnapshot: updatedSnapshot,
+    hodScore,
+    finalScore,
+    hodOverallComments: hodOverallComments !== undefined ? hodOverallComments : review.hodOverallComments,
     status: 'HR_PENDING',
     actionHistory: [...(review.actionHistory || []), action],
     updatedAt: now,
@@ -583,7 +683,7 @@ export async function hodApproveReview(
     userRole: 'HR',
     type: 'HOD_APPROVED',
     title: `Review Ready for HR Approval: ${review.employeeName}`,
-    message: `${user.name} (HOD) approved the performance review for ${review.employeeName} (${review.reviewPeriodName}).`,
+    message: `${user.name} (HOD) submitted their independent score (${hodScore}) for ${review.employeeName} (${review.reviewPeriodName}). Final score: ${finalScore}.`,
     isRead: false,
     priority: 'HIGH',
     metadata: { reviewId, periodId: review.reviewPeriodId, status: 'HR_PENDING' },
@@ -599,7 +699,7 @@ export async function hodApproveReview(
     reviewId,
     'HOD_PENDING',
     'HR_PENDING',
-    `HOD approved review for ${review.employeeName}.${hodComments ? ` Comments: ${hodComments}` : ''}`
+    `HOD submitted independent score (${hodScore}) for ${review.employeeName}. Final (averaged) score: ${finalScore}.${hodOverallComments ? ` Comments: ${hodOverallComments}` : ''}`
   );
 
   return updated;

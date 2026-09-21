@@ -326,8 +326,12 @@ appraisalRouter.post(
   requireRoles('SUPER_ADMIN', 'HR'),
   async (_req: AuthenticatedRequest, res: Response) => {
     try {
-      await syncAllActiveEmployees();
-      res.json({ success: true, message: 'All active employees and appraisals successfully synchronized.' });
+      const { employeesProcessed } = await syncAllActiveEmployees();
+      res.json({
+        success: true,
+        message: `Synchronized ${employeesProcessed} active/probation employees, their reviews, and appraisals.`,
+        employeesProcessed,
+      });
     } catch (err: any) {
       res.status(500).json({ error: 'Failed to synchronize appraisals: ' + err.message });
     }

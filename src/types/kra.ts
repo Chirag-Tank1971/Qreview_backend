@@ -33,10 +33,15 @@ export interface KraTemplate {
   title: string;
   name?: string;
   description?: string;
+  employeeId?: string;
+  employeeCode?: string;
+  employeeName?: string;
   departmentId?: string;
   departmentName?: string;
   designationId?: string;
   designationName?: string;
+  cycleId?: string;
+  cycleCode?: string;
   totalWeight: number;
   active: boolean;
   items: KraTemplateItem[];
