@@ -392,5 +392,90 @@ export function startBackgroundScheduler(): void {
     }
   });
 
+  // 6. Daily at 09:30 AM: Executive digest for Management — a single rolled-up alert of
+  // org-wide items needing attention (overdue reviews, unresolved PIP escalations, appraisal
+  // cohorts due this month), instead of the granular per-item notifications HR/Managers get.
+  // Management previously received zero notifications of any kind; this gives them one
+  // low-noise daily signal rather than replicating every HR/Manager alert at their volume.
+  // Runs after the 09:00/09:15 checks above so it reflects the same day's escalation state.
+  cron.schedule('30 9 * * *', async () => {
+    const job = 'ManagementExecutiveDigest';
+    const startedAt = Date.now();
+    logJob(job, 'Started — compiling daily executive digest for Management...');
+    try {
+      const reviewCol = getDbCollection('employeeReviews');
+      const periodCol = getDbCollection('reviewPeriods');
+      const pipCol = getDbCollection('performanceImprovementPlans');
+      const cycleCol = getDbCollection('cycles');
+      const empCol = getDbCollection('employees');
+      const notifCol = getDbCollection('notifications');
+
+      // Overdue reviews past the active period's deadline
+      const activePeriod: ReviewPeriod | null = await periodCol.findOne({ status: 'ACTIVE' });
+      let overdueReviewsCount = 0;
+      if (activePeriod?.dueDate && Date.now() > new Date(activePeriod.dueDate).getTime()) {
+        overdueReviewsCount = await reviewCol.countDocuments({
+          reviewPeriodId: activePeriod.id,
+          status: { $in: ['MANAGER_PENDING', 'DRAFT', 'RETURNED', 'HOD_PENDING'] },
+        });
+      }
+
+      // PIPs past end date with no recorded outcome
+      const activePips: PerformanceImprovementPlan[] = await (
+        await pipCol.find({ status: { $in: ['ACTIVE', 'EXTENDED'] } })
+      ).toArray();
+      const overduePipCount = activePips.filter((p) => new Date(p.endDate).getTime() < Date.now()).length;
+
+      // Appraisal cohorts due this month
+      const currentMonth = new Date().getMonth() + 1;
+      const cycles: Cycle[] = await (
+        await cycleCol.find({ appraisalMonth: currentMonth, active: { $ne: false } })
+      ).toArray();
+      let appraisalCohortDueCount = 0;
+      if (cycles.length > 0) {
+        const cycleIds = new Set(cycles.map((c) => c.id));
+        const cycleCodes = new Set(cycles.map((c) => c.code));
+        const employees: Employee[] = await (await empCol.find({ status: 'ACTIVE' })).toArray();
+        appraisalCohortDueCount = employees.filter(
+          (e) => (e.cycleId && cycleIds.has(e.cycleId)) || (e.cycleCode && cycleCodes.has(e.cycleCode))
+        ).length;
+      }
+
+      const totalIssues = overdueReviewsCount + overduePipCount + appraisalCohortDueCount;
+
+      if (totalIssues > 0) {
+        const todayKey = new Date().toISOString().slice(0, 10);
+        const notifId = `notif_mgmt_digest_${todayKey}`;
+        const existing = await notifCol.findOne({ id: notifId });
+        if (!existing) {
+          const parts: string[] = [];
+          if (overdueReviewsCount > 0) parts.push(`${overdueReviewsCount} overdue review${overdueReviewsCount === 1 ? '' : 's'}`);
+          if (overduePipCount > 0) parts.push(`${overduePipCount} PIP${overduePipCount === 1 ? '' : 's'} past end date`);
+          if (appraisalCohortDueCount > 0) parts.push(`${appraisalCohortDueCount} employee${appraisalCohortDueCount === 1 ? '' : 's'} due for annual appraisal`);
+
+          await notifCol.insertOne({
+            id: notifId,
+            userId: 'ALL',
+            userRole: 'MANAGEMENT',
+            type: 'ESCALATION',
+            title: `Executive Digest: ${totalIssues} Item${totalIssues === 1 ? '' : 's'} Need Attention`,
+            message: `${parts.join(' · ')}. See the Workforce Risk & Alerts tab on Executive Analytics for details.`,
+            isRead: false,
+            priority: 'MEDIUM',
+            metadata: { overdueReviewsCount, overduePipCount, appraisalCohortDueCount, subTab: 'management' },
+            createdAt: new Date().toISOString(),
+          });
+          logJob(job, `Completed in ${Date.now() - startedAt}ms — digest sent (${totalIssues} items: ${overdueReviewsCount} reviews, ${overduePipCount} PIPs, ${appraisalCohortDueCount} appraisals due).`);
+        } else {
+          logJob(job, `Completed in ${Date.now() - startedAt}ms — digest already sent today.`);
+        }
+      } else {
+        logJob(job, `Completed in ${Date.now() - startedAt}ms — nothing to report, digest skipped.`);
+      }
+    } catch (err: any) {
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
+    }
+  });
+
   logJob('Init', 'All background jobs scheduled successfully.');
 }

@@ -8,6 +8,7 @@ import {
   Employee,
   Department,
   Cycle,
+  PerformanceImprovementPlan,
 } from '../../src/types/index.js';
 
 export const managementRouter = express.Router();
@@ -1047,6 +1048,123 @@ managementRouter.get(
     } catch (err: any) {
       console.error('[ManagementAPI] Error in GET /management/employee/:id/performance:', err);
       res.status(500).json({ error: 'Failed to fetch employee performance profile.' });
+    }
+  }
+);
+
+/**
+ * GET /api/management/workforce-risk
+ * Executive-level workforce risk snapshot: active Performance Improvement Plans, stale
+ * check-ins, plans past their end date without a recorded outcome, this year's outcome
+ * breakdown, and a live overdue-reviews alert — computed directly from source collections
+ * (not the per-role notifications queue) so it stays independent of notification routing.
+ */
+managementRouter.get(
+  '/management/workforce-risk',
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { year } = req.query;
+      const targetYear = Number(year) || new Date().getFullYear();
+
+      const pipCol = getDbCollection('performanceImprovementPlans');
+      const reviewCol = getDbCollection('employeeReviews');
+      const periodCol = getDbCollection('reviewPeriods');
+
+      const allPips: PerformanceImprovementPlan[] = await (await pipCol.find({})).toArray();
+
+      const CHECKIN_REMINDER_THRESHOLD_DAYS = 7;
+      const now = Date.now();
+
+      const activePips = allPips.filter((p) => p.status === 'ACTIVE' || p.status === 'EXTENDED');
+
+      const atRisk = activePips.map((p) => {
+        const lastCheckIn = p.checkIns && p.checkIns.length > 0 ? p.checkIns[p.checkIns.length - 1] : null;
+        const lastActivityDate = new Date(lastCheckIn ? lastCheckIn.date : p.startDate).getTime();
+        const daysSinceLastCheckIn = Math.floor((now - lastActivityDate) / (1000 * 60 * 60 * 24));
+        const isPastEndDate = new Date(p.endDate).getTime() < now;
+        return {
+          pipId: p.id,
+          employeeId: p.employeeId,
+          employeeCode: p.employeeCode,
+          employeeName: p.employeeName,
+          departmentName: p.departmentName,
+          designationName: p.designationName,
+          managerName: p.managerName,
+          hodName: p.hodName,
+          status: p.status,
+          startDate: p.startDate,
+          endDate: p.endDate,
+          daysSinceLastCheckIn,
+          isOverdueCheckIn: daysSinceLastCheckIn >= CHECKIN_REMINDER_THRESHOLD_DAYS,
+          isPastEndDate,
+        };
+      });
+
+      // Most urgent first: past end date (no outcome recorded), then longest since check-in
+      atRisk.sort((a, b) => {
+        if (a.isPastEndDate !== b.isPastEndDate) return a.isPastEndDate ? -1 : 1;
+        return b.daysSinceLastCheckIn - a.daysSinceLastCheckIn;
+      });
+
+      const overdueCheckInCount = atRisk.filter((p) => p.isOverdueCheckIn).length;
+      const pastEndDateNoOutcomeCount = atRisk.filter((p) => p.isPastEndDate).length;
+
+      // Outcomes recorded this year, across all plans (not just currently active ones)
+      const outcomesThisYear = allPips
+        .filter((p) => p.outcome && new Date(p.outcome.decidedAt).getFullYear() === targetYear)
+        .map((p) => ({
+          pipId: p.id,
+          employeeName: p.employeeName,
+          departmentName: p.departmentName,
+          decision: p.outcome!.decision,
+          decidedAt: p.outcome!.decidedAt,
+          decidedByName: p.outcome!.decidedByName,
+        }))
+        .sort((a, b) => new Date(b.decidedAt).getTime() - new Date(a.decidedAt).getTime());
+
+      const outcomeCounts = {
+        succeeded: outcomesThisYear.filter((o) => o.decision === 'SUCCEEDED').length,
+        failed: outcomesThisYear.filter((o) => o.decision === 'FAILED').length,
+        extended: outcomesThisYear.filter((o) => o.decision === 'EXTENDED').length,
+      };
+
+      // Live alert: reviews still open past the active period's deadline
+      const activePeriod: ReviewPeriod | null = await periodCol.findOne({ status: 'ACTIVE' });
+      let overdueReviewsCount = 0;
+      let reviewDeadlinePassed = false;
+      if (activePeriod && activePeriod.dueDate) {
+        reviewDeadlinePassed = now > new Date(activePeriod.dueDate).getTime();
+        if (reviewDeadlinePassed) {
+          overdueReviewsCount = await reviewCol.countDocuments({
+            reviewPeriodId: activePeriod.id,
+            status: { $in: ['MANAGER_PENDING', 'DRAFT', 'RETURNED', 'HOD_PENDING'] },
+          });
+        }
+      }
+
+      await logManagementAudit(req, 'MANAGEMENT_VIEW_WORKFORCE_RISK', { year: targetYear });
+
+      res.json({
+        year: targetYear,
+        summary: {
+          activePipCount: activePips.length,
+          extendedPipCount: activePips.filter((p) => p.status === 'EXTENDED').length,
+          overdueCheckInCount,
+          pastEndDateNoOutcomeCount,
+          ...outcomeCounts,
+        },
+        atRiskEmployees: atRisk.slice(0, 25),
+        recentOutcomes: outcomesThisYear.slice(0, 10),
+        alerts: {
+          overdueReviewsCount,
+          reviewDeadlinePassed,
+          activePeriodName: activePeriod?.name || null,
+          activePeriodDueDate: activePeriod?.dueDate || null,
+        },
+      });
+    } catch (err: any) {
+      console.error('[ManagementAPI] Error in GET /management/workforce-risk:', err);
+      res.status(500).json({ error: 'Failed to fetch workforce risk snapshot.' });
     }
   }
 );
