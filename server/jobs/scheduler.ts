@@ -3,37 +3,71 @@ import { getDbCollection } from '../db.js';
 import { ReviewPeriod, EmployeeReview, Employee, Cycle, PerformanceImprovementPlan } from '../../src/types/index.js';
 import { syncAllActiveEmployees } from '../syncHelpers.js';
 
+// Captured before server.ts's production log-silencing override runs (ES module imports
+// evaluate before the importing module's own top-level code), so these stay callable even
+// though console.log/warn get monkey-patched to a noop in production for everything else.
+const rawLog = console.log.bind(console);
+const rawWarn = console.warn.bind(console);
+const rawError = console.error.bind(console);
+
+// Scheduler logs are intentionally the inverse of the app-wide convention: silent in
+// development, visible in production (so cron activity is auditable in prod without
+// cluttering local dev output).
+const isProductionEnv = process.env.NODE_ENV === 'production';
+
+function logJob(job: string, message: string): void {
+  if (!isProductionEnv) return;
+  rawLog(`[${new Date().toISOString()}] [Scheduler:${job}] ${message}`);
+}
+
+function warnJob(job: string, message: string): void {
+  if (!isProductionEnv) return;
+  rawWarn(`[${new Date().toISOString()}] [Scheduler:${job}] ${message}`);
+}
+
+function errorJob(job: string, message: string, err: any): void {
+  if (!isProductionEnv) return;
+  rawError(`[${new Date().toISOString()}] [Scheduler:${job}] ${message}:`, err?.message ?? err);
+}
+
 /**
  * Production Background Scheduler using node-cron
  * Handles automated workflow execution, reminder dispatches, and deadline escalations
  */
 export function startBackgroundScheduler(): void {
-  console.log('[Scheduler] Initializing automated background cron tasks...');
+  logJob('Init', 'Initializing automated background cron tasks...');
 
   // 0. Daily at 07:00 AM: Auto-generate quarterly reviews for any employee who has newly
   // become eligible (KRA assigned, tenure now met, manager assigned, etc.) without requiring
   // HR to save their record or click "Sync" manually. Runs before the 08:00/08:30 reminder
   // jobs below so anyone picked up today is included in those same-day reminders.
   cron.schedule('0 7 * * *', async () => {
+    const job = 'DailyEligibilitySync';
+    const startedAt = Date.now();
+    logJob(job, 'Started — running daily automatic review/appraisal eligibility sync...');
     try {
-      console.log('[Scheduler] Running daily automatic review/appraisal eligibility sync...');
       const { employeesProcessed } = await syncAllActiveEmployees();
-      console.log(`[Scheduler] Daily sync complete — re-evaluated ${employeesProcessed} active/probation employees.`);
+      logJob(job, `Completed in ${Date.now() - startedAt}ms — re-evaluated ${employeesProcessed} active/probation employees.`);
     } catch (err: any) {
-      console.error('[Scheduler] Error in daily automatic review sync job:', err.message);
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
     }
   });
 
   // 1. Daily at 08:00 AM: Check and send evaluation reminders to managers for pending reviews
   cron.schedule('0 8 * * *', async () => {
+    const job = 'ManagerReviewReminder';
+    const startedAt = Date.now();
+    logJob(job, 'Started — running daily manager review reminder job...');
     try {
-      console.log('[Scheduler] Running daily manager review reminder job...');
       const reviewCol = getDbCollection('employeeReviews');
       const notifCol = getDbCollection('notifications');
       const periodCol = getDbCollection('reviewPeriods');
 
       const activePeriod: ReviewPeriod | null = await periodCol.findOne({ status: 'ACTIVE' });
-      if (!activePeriod) return;
+      if (!activePeriod) {
+        logJob(job, `Skipped in ${Date.now() - startedAt}ms — no active review period.`);
+        return;
+      }
 
       const pendingReviews: EmployeeReview[] = await (
         await reviewCol.find({
@@ -65,22 +99,27 @@ export function startBackgroundScheduler(): void {
         });
       }
 
-      console.log(`[Scheduler] Reminders sent to ${managerMap.size} managers for ${pendingReviews.length} pending reviews.`);
+      logJob(job, `Completed in ${Date.now() - startedAt}ms — reminders sent to ${managerMap.size} managers for ${pendingReviews.length} pending reviews.`);
     } catch (err: any) {
-      console.error('[Scheduler] Error in manager reminder job:', err.message);
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
     }
   });
 
   // Daily at 08:30 AM: Send self-assessment reminders to employees for pending reviews in active periods
   cron.schedule('30 8 * * *', async () => {
+    const job = 'EmployeeSelfAssessmentReminder';
+    const startedAt = Date.now();
+    logJob(job, 'Started — running daily employee self-assessment reminder job...');
     try {
-      console.log('[Scheduler] Running daily employee self-assessment reminder job...');
       const reviewCol = getDbCollection('employeeReviews');
       const notifCol = getDbCollection('notifications');
       const periodCol = getDbCollection('reviewPeriods');
 
       const activePeriod: ReviewPeriod | null = await periodCol.findOne({ status: 'ACTIVE' });
-      if (!activePeriod) return;
+      if (!activePeriod) {
+        logJob(job, `Skipped in ${Date.now() - startedAt}ms — no active review period.`);
+        return;
+      }
 
       const pendingReviews: EmployeeReview[] = await (
         await reviewCol.find({
@@ -118,22 +157,27 @@ export function startBackgroundScheduler(): void {
           sentCount++;
         }
       }
-      console.log(`[Scheduler] Dispatched ${sentCount} employee self-assessment reminders.`);
+      logJob(job, `Completed in ${Date.now() - startedAt}ms — dispatched ${sentCount} employee self-assessment reminders.`);
     } catch (err: any) {
-      console.error('[Scheduler] Error in employee self-assessment reminder job:', err.message);
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
     }
   });
 
   // 2. Daily at 09:00 AM: Check for overdue reviews past dueDate and escalate to HR / HOD
   cron.schedule('0 9 * * *', async () => {
+    const job = 'OverdueReviewEscalation';
+    const startedAt = Date.now();
+    logJob(job, 'Started — checking for overdue reviews past submission deadline...');
     try {
-      console.log('[Scheduler] Checking for overdue reviews past submission deadline...');
       const reviewCol = getDbCollection('employeeReviews');
       const periodCol = getDbCollection('reviewPeriods');
       const notifCol = getDbCollection('notifications');
 
       const activePeriod: ReviewPeriod | null = await periodCol.findOne({ status: 'ACTIVE' });
-      if (!activePeriod || !activePeriod.dueDate) return;
+      if (!activePeriod || !activePeriod.dueDate) {
+        logJob(job, `Skipped in ${Date.now() - startedAt}ms — no active review period or due date set.`);
+        return;
+      }
 
       const dueDate = new Date(activePeriod.dueDate).getTime();
       const now = Date.now();
@@ -147,7 +191,7 @@ export function startBackgroundScheduler(): void {
         ).toArray();
 
         if (overdueReviews.length > 0) {
-          console.warn(`[Scheduler] Detected ${overdueReviews.length} overdue reviews past deadline ${activePeriod.dueDate}!`);
+          warnJob(job, `Detected ${overdueReviews.length} overdue reviews past deadline ${activePeriod.dueDate}!`);
           await notifCol.insertOne({
             id: `notif_escalation_${Date.now()}`,
             userId: 'ALL',
@@ -184,16 +228,21 @@ export function startBackgroundScheduler(): void {
             );
           }
         }
+        logJob(job, `Completed in ${Date.now() - startedAt}ms — ${overdueReviews.length} overdue reviews escalated.`);
+      } else {
+        logJob(job, `Completed in ${Date.now() - startedAt}ms — due date not yet passed.`);
       }
     } catch (err: any) {
-      console.error('[Scheduler] Error in overdue escalation job:', err.message);
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
     }
   });
 
   // 3. Monthly on the 1st at 06:00 AM: Notify HR and managers of employees due for annual appraisal
   cron.schedule('0 6 1 * *', async () => {
+    const job = 'MonthlyAppraisalCohortCheck';
+    const startedAt = Date.now();
+    logJob(job, 'Started — running monthly appraisal cohort eligibility check...');
     try {
-      console.log('[Scheduler] Running monthly appraisal cohort eligibility check...');
       const currentMonth = new Date().getMonth() + 1;
       const currentYear = new Date().getFullYear();
 
@@ -204,7 +253,10 @@ export function startBackgroundScheduler(): void {
       const cycles: Cycle[] = await (
         await cycleCol.find({ appraisalMonth: currentMonth, active: { $ne: false } })
       ).toArray();
-      if (cycles.length === 0) return;
+      if (cycles.length === 0) {
+        logJob(job, `Skipped in ${Date.now() - startedAt}ms — no cycles due for appraisal this month.`);
+        return;
+      }
 
       const cycleIds = new Set(cycles.map((c) => c.id));
       const cycleCodes = new Set(cycles.map((c) => c.code));
@@ -228,18 +280,22 @@ export function startBackgroundScheduler(): void {
           metadata: { month: currentMonth, year: currentYear, count: dueEmployees.length },
           createdAt: new Date().toISOString(),
         });
-        console.log(`[Scheduler] Appraisal cohort notification sent for ${dueEmployees.length} employees due in month ${currentMonth}.`);
+        logJob(job, `Completed in ${Date.now() - startedAt}ms — appraisal cohort notification sent for ${dueEmployees.length} employees due in month ${currentMonth}.`);
+      } else {
+        logJob(job, `Completed in ${Date.now() - startedAt}ms — no employees due in month ${currentMonth}.`);
       }
     } catch (err: any) {
-      console.error('[Scheduler] Error in monthly appraisal check:', err.message);
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
     }
   });
 
   // 4. Daily at 08:45 AM: Remind the manager/HOD of any employee on an active PIP if no
   // check-in has been logged in the last 7 days — keeps the plan from going silently stale.
   cron.schedule('45 8 * * *', async () => {
+    const job = 'PipCheckInReminder';
+    const startedAt = Date.now();
+    logJob(job, 'Started — running daily PIP check-in reminder job...');
     try {
-      console.log('[Scheduler] Running daily PIP check-in reminder job...');
       const pipCol = getDbCollection('performanceImprovementPlans');
       const notifCol = getDbCollection('notifications');
 
@@ -282,9 +338,9 @@ export function startBackgroundScheduler(): void {
           remindersSent++;
         }
       }
-      console.log(`[Scheduler] Dispatched ${remindersSent} PIP check-in reminders.`);
+      logJob(job, `Completed in ${Date.now() - startedAt}ms — dispatched ${remindersSent} PIP check-in reminders (${activePips.length} active PIPs checked).`);
     } catch (err: any) {
-      console.error('[Scheduler] Error in PIP check-in reminder job:', err.message);
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
     }
   });
 
@@ -292,8 +348,10 @@ export function startBackgroundScheduler(): void {
   // recorded outcome (SUCCEEDED/FAILED/EXTENDED) — prevents plans from silently expiring
   // unresolved, which matters if a later termination is ever challenged.
   cron.schedule('15 9 * * *', async () => {
+    const job = 'PipOutcomeEscalation';
+    const startedAt = Date.now();
+    logJob(job, 'Started — checking for PIPs past end date with no recorded outcome...');
     try {
-      console.log('[Scheduler] Checking for PIPs past end date with no recorded outcome...');
       const pipCol = getDbCollection('performanceImprovementPlans');
       const notifCol = getDbCollection('notifications');
 
@@ -321,13 +379,18 @@ export function startBackgroundScheduler(): void {
             metadata: { pipIds: overduePips.map((p) => p.id), overdueCount: overduePips.length, subTab: 'pip' },
             createdAt: new Date().toISOString(),
           });
-          console.warn(`[Scheduler] Escalated ${overduePips.length} PIPs past end date with no outcome to HR.`);
+          warnJob(job, `Escalated ${overduePips.length} PIPs past end date with no outcome to HR.`);
+          logJob(job, `Completed in ${Date.now() - startedAt}ms — ${overduePips.length} PIPs escalated.`);
+        } else {
+          logJob(job, `Completed in ${Date.now() - startedAt}ms — escalation already sent today.`);
         }
+      } else {
+        logJob(job, `Completed in ${Date.now() - startedAt}ms — no overdue PIPs found.`);
       }
     } catch (err: any) {
-      console.error('[Scheduler] Error in PIP outcome escalation job:', err.message);
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
     }
   });
 
-  console.log('[Scheduler] All background jobs scheduled successfully.');
+  logJob('Init', 'All background jobs scheduled successfully.');
 }
