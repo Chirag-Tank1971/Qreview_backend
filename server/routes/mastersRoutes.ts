@@ -409,6 +409,202 @@ mastersRouter.delete('/designations/:id', requireRoles('SUPER_ADMIN', 'HR'), asy
 });
 
 // ==========================================
+// 2.5 LOCATIONS (Work Location Registry)
+// ==========================================
+
+const DEFAULT_LOCATIONS = [
+  'Bangalore HQ', 'Corporate Office', 'Head Office', 'Mumbai Branch',
+  'Delhi NCR Hub', 'Hyderabad Tech Center', 'Jaipur Office',
+  'Delhi', 'Haryana', 'Uttar Pradesh', 'Rajasthan', 'West Bengal',
+  'Patna', 'Jodhpur', 'Jaipur', 'Chennai', 'HYDERABAD', 'LUCKNOW',
+  'Remote - India', 'Global Remote',
+];
+
+const escapeRegex = (str: string) => str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * GET /api/locations
+ * Returns list of distinct locations with active employee count
+ */
+mastersRouter.get('/locations', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const locationsCol = getDbCollection('locations');
+    const employeesCol = getDbCollection('employees');
+
+    // 1. Get all stored locations from the locations collection
+    let storedLocations = await (await locationsCol.find({})).toArray();
+
+    // If locations collection is empty, seed it with DEFAULT_LOCATIONS and distinct existing employee locations
+    if (storedLocations.length === 0) {
+      const activeEmps = await (await employeesCol.find({
+        status: { $ne: 'INACTIVE' },
+        isPastEmployee: { $ne: true }
+      })).toArray();
+      const existingLocs = new Set<string>();
+      DEFAULT_LOCATIONS.forEach((l) => existingLocs.add(l.trim()));
+      activeEmps.forEach((e) => {
+        if (e.location && typeof e.location === 'string' && e.location.trim()) {
+          existingLocs.add(e.location.trim());
+        }
+      });
+      const initialDocs = Array.from(existingLocs).map((name) => ({
+        id: `loc_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+        name,
+        createdAt: new Date().toISOString(),
+      }));
+      if (initialDocs.length > 0) {
+        await locationsCol.insertMany(initialDocs);
+        storedLocations = initialDocs;
+      }
+    }
+
+    // Also check if any active employees have a location not yet in locationsCol, auto-register it
+    const activeEmps = await (await employeesCol.find({
+      status: { $ne: 'INACTIVE' },
+      isPastEmployee: { $ne: true }
+    })).toArray();
+
+    const storedNamesLower = new Set(storedLocations.map((l: any) => (l.name || '').trim().toLowerCase()));
+    const newLocDocs: any[] = [];
+    activeEmps.forEach((e) => {
+      const locName = (e.location || '').trim();
+      if (locName && !storedNamesLower.has(locName.toLowerCase())) {
+        storedNamesLower.add(locName.toLowerCase());
+        newLocDocs.push({
+          id: `loc_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+          name: locName,
+          createdAt: new Date().toISOString(),
+        });
+      }
+    });
+    if (newLocDocs.length > 0) {
+      await locationsCol.insertMany(newLocDocs);
+      storedLocations = [...storedLocations, ...newLocDocs];
+    }
+
+    // Aggregate counts for each location
+    const result = storedLocations.map((locDoc: any) => {
+      const name = (locDoc.name || '').trim();
+      const matchingEmps = activeEmps.filter(
+        (e) => (e.location || '').trim().toLowerCase() === name.toLowerCase()
+      );
+      return {
+        id: locDoc.id || locDoc._id?.toString(),
+        name,
+        employeeCount: matchingEmps.length,
+        assignedEmployees: matchingEmps.slice(0, 10).map((e) => ({ id: e.id, name: e.name, employeeCode: e.employeeCode })),
+      };
+    });
+
+    // Sort by employee count desc, then alphabetically by name
+    result.sort((a, b) => b.employeeCount - a.employeeCount || a.name.localeCompare(b.name));
+
+    res.json(result);
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to fetch locations.' });
+  }
+});
+
+/**
+ * POST /api/locations
+ * Create a new location
+ */
+mastersRouter.post('/locations', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { name } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({ error: 'Location name is required.' });
+    }
+    const locName = name.trim();
+    const locationsCol = getDbCollection('locations');
+    const existing = await locationsCol.findOne({
+      name: { $regex: new RegExp(`^${escapeRegex(locName)}$`, 'i') }
+    });
+    if (existing) {
+      return res.status(400).json({ error: `Location "${locName}" already exists.` });
+    }
+    const newDoc = {
+      id: `loc_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
+      name: locName,
+      createdAt: new Date().toISOString(),
+    };
+    await locationsCol.insertOne(newDoc);
+    if (req.user) {
+      await recordAuditLog(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        'ORGANIZATION_MASTER',
+        'CREATE_LOCATION',
+        newDoc.id,
+        locName,
+        '',
+        `Created location "${locName}"`
+      );
+    }
+    res.status(201).json({ success: true, message: `Location "${locName}" added successfully.`, location: newDoc });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to create location.' });
+  }
+});
+
+/**
+ * DELETE /api/locations/:name
+ * Delete a location if no active employees are assigned
+ */
+mastersRouter.delete('/locations/:name', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const rawName = req.params.name;
+    if (!rawName) {
+      return res.status(400).json({ error: 'Location name is required.' });
+    }
+    const locName = decodeURIComponent(rawName).trim();
+    const locationsCol = getDbCollection('locations');
+    const employeesCol = getDbCollection('employees');
+
+    // Check for active employees assigned to this location
+    const assignedEmployees = await (await employeesCol.find({
+      location: { $regex: new RegExp(`^${escapeRegex(locName)}$`, 'i') },
+      status: { $ne: 'INACTIVE' },
+      isPastEmployee: { $ne: true },
+    })).toArray();
+
+    if (assignedEmployees.length > 0) {
+      const names = assignedEmployees.map((e) => e.name || e.employeeCode).filter(Boolean);
+      return res.status(400).json({
+        error: `Cannot delete location "${locName}". ${assignedEmployees.length} active employee(s) are assigned to this location (${names.slice(0, 5).join(', ')}${names.length > 5 ? ` and ${names.length - 5} more` : ''}). Please reassign or update them before deleting.`
+      });
+    }
+
+    // Safe to delete from locations collection
+    await locationsCol.deleteMany({
+      name: { $regex: new RegExp(`^${escapeRegex(locName)}$`, 'i') }
+    });
+
+    if (req.user) {
+      await recordAuditLog(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        'ORGANIZATION_MASTER',
+        'DELETE_LOCATION',
+        locName,
+        locName,
+        '',
+        `Deleted location "${locName}" from database`
+      );
+    }
+
+    res.json({
+      success: true,
+      message: `Location "${locName}" was deleted successfully.`
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to delete location.' });
+  }
+});
+
+// ==========================================
 // 3. CYCLES (Appraisal Cycle Framework: June/September)
 // ==========================================
 
