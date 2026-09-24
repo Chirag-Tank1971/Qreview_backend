@@ -601,6 +601,7 @@ export function authorizeReviewAccess(
           const isAssigned =
             review.managerId === userEmpId ||
             review.managerId === req.user.id ||
+            review.hodId === userEmpId ||
             review.employeeId === userEmpId;
 
           if (isAssigned) {
@@ -650,11 +651,12 @@ export function authorizeReviewAccess(
         return next();
       }
 
-      // Score (draft) action: ONLY assigned reporting manager, HR, or Super Admin (HOD is view-only)
+      // Score (draft) action: ONLY the assigned reporting manager, HR, or Super Admin (HOD is
+      // view-only unless they are also this employee's assigned manager). Checked against the
+      // actual manager relationship on the review, not the caller's stored role label, so a
+      // person who holds both the manager and HOD capacity for this employee can still score.
       if (action === 'score') {
-        const isAssignedManager =
-          (role === 'REPORTING_MANAGER' || role === 'MANAGER') &&
-          (review.managerId === userEmpId || review.managerId === req.user.id);
+        const isAssignedManager = review.managerId === userEmpId || review.managerId === req.user.id;
         const isSuperAdminOrHr = role === 'SUPER_ADMIN' || role === 'HR';
 
         if (!isAssignedManager && !isSuperAdminOrHr) {
@@ -678,11 +680,10 @@ export function authorizeReviewAccess(
         return next();
       }
 
-      // Submit action: ONLY assigned reporting manager, HR, or Super Admin
+      // Submit action: ONLY the assigned reporting manager, HR, or Super Admin — checked
+      // against the actual manager relationship, not the caller's stored role label.
       if (action === 'submit') {
-        const isAssignedManager =
-          (role === 'REPORTING_MANAGER' || role === 'MANAGER') &&
-          (review.managerId === userEmpId || review.managerId === req.user.id);
+        const isAssignedManager = review.managerId === userEmpId || review.managerId === req.user.id;
         const isSuperAdminOrHr = role === 'SUPER_ADMIN' || role === 'HR';
 
         if (!isAssignedManager && !isSuperAdminOrHr) {
@@ -742,9 +743,10 @@ export function authorizeReviewAccess(
         return next();
       }
 
-      // HOD Approve action
+      // HOD Approve action — checked against the actual HOD relationship, not the caller's
+      // stored role label, so a manager who is also this employee's HOD can still approve.
       if (action === 'hod_approve') {
-        const isAssignedHod = role === 'HOD' && review.hodId === userEmpId;
+        const isAssignedHod = review.hodId === userEmpId;
         const isSuperAdmin = role === 'SUPER_ADMIN';
 
         if (!isAssignedHod && !isSuperAdmin) {
@@ -767,9 +769,10 @@ export function authorizeReviewAccess(
         return next();
       }
 
-      // HOD Return action
+      // HOD Return action — checked against the actual HOD relationship, not the caller's
+      // stored role label, so a manager who is also this employee's HOD can still return it.
       if (action === 'hod_return') {
-        const isAssignedHod = role === 'HOD' && review.hodId === userEmpId;
+        const isAssignedHod = review.hodId === userEmpId;
         const isSuperAdmin = role === 'SUPER_ADMIN';
 
         if (!isAssignedHod && !isSuperAdmin) {

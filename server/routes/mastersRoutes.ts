@@ -2049,8 +2049,8 @@ async function computeVisibleNotifications(currentUser: User): Promise<any[]> {
   const notifications: any[] = Array.isArray(rawNotifications)
     ? rawNotifications
     : typeof rawNotifications?.toArray === 'function'
-    ? await rawNotifications.toArray()
-    : [];
+      ? await rawNotifications.toArray()
+      : [];
 
   let filtered: any[] = notifications;
 

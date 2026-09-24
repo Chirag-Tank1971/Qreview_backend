@@ -106,15 +106,18 @@ appraisalRouter.get(
         (e) => (e.cycleId && matchingCycleIds.has(e.cycleId)) || (e.cycleCode && matchingCycleCodes.has(e.cycleCode))
       );
 
-      // Strict role scoping: Managers only see their direct reports
-      if (req.user?.role === 'REPORTING_MANAGER' || req.user?.role === 'MANAGER') {
-        dueEmployees = dueEmployees.filter(
-          (e) => e.managerId === req.user?.employeeId || e.managerId === req.user?.id
-        );
-      } else if (req.user?.role === 'HOD') {
+      // Strict role scoping: Managers/HODs only see employees where they actually hold the
+      // manager or HOD relationship — checked independently so a person who holds both
+      // capacities (e.g. is also the HOD for their own direct reports) sees the union of both,
+      // rather than only whichever single role happens to be stored on their account.
+      if (['REPORTING_MANAGER', 'MANAGER', 'HOD'].includes(req.user?.role || '')) {
         const deptId = req.employeeProfile?.departmentId;
         dueEmployees = dueEmployees.filter(
-          (e) => e.departmentId === deptId || e.hodId === req.user?.employeeId
+          (e) =>
+            e.managerId === req.user?.employeeId ||
+            e.managerId === req.user?.id ||
+            e.hodId === req.user?.employeeId ||
+            (req.user?.role === 'HOD' && deptId && e.departmentId === deptId)
         );
       }
 
@@ -216,32 +219,26 @@ appraisalRouter.get('/appraisals', async (req: AuthenticatedRequest, res: Respon
     if (user.role === 'EMPLOYEE') {
       // Employees can STRICTLY ONLY view their own appraisal record
       appraisals = appraisals.filter((a) => a.employeeId === user.employeeId);
-    } else if (user.role === 'REPORTING_MANAGER' || user.role === 'MANAGER') {
-      // Managers can view their direct reports or their own record
-      appraisals = appraisals.filter((a) => {
-        const empRecord = empMap.get(a.employeeId);
-        return (
-          a.managerId === user.employeeId ||
-          a.employeeId === user.employeeId ||
-          empRecord?.managerId === user.employeeId ||
-          (user.email && empRecord?.managerName?.toLowerCase() === user.name.toLowerCase())
-        );
-      });
-    } else if (user.role === 'HOD') {
-      // HODs can view their department roll-ups, direct reports, or their own record
+    } else if (['REPORTING_MANAGER', 'MANAGER', 'HOD'].includes(user.role)) {
+      // Managers and HODs can view direct reports, their own record, and (for HODs) their
+      // department roll-up. The manager and HOD relationships are checked independently so a
+      // person who holds both capacities for an employee (e.g. is both their reporting manager
+      // and their HOD) sees the record regardless of which single role is stored on their account.
+      const isHodRole = user.role === 'HOD';
       appraisals = appraisals.filter((a) => {
         const empRecord = empMap.get(a.employeeId);
         const userDeptId = req.employeeProfile?.departmentId;
         const userDeptName = req.employeeProfile?.departmentName?.toLowerCase();
         return (
-          a.hodId === user.employeeId ||
           a.managerId === user.employeeId ||
+          a.hodId === user.employeeId ||
           a.employeeId === user.employeeId ||
-          empRecord?.hodId === user.employeeId ||
           empRecord?.managerId === user.employeeId ||
-          (userDeptId && a.departmentId === userDeptId) ||
-          (userDeptId && empRecord?.departmentId === userDeptId) ||
-          (userDeptName && a.departmentName?.toLowerCase() === userDeptName)
+          empRecord?.hodId === user.employeeId ||
+          (user.email && empRecord?.managerName?.toLowerCase() === user.name.toLowerCase()) ||
+          (isHodRole && userDeptId && a.departmentId === userDeptId) ||
+          (isHodRole && userDeptId && empRecord?.departmentId === userDeptId) ||
+          (isHodRole && userDeptName && a.departmentName?.toLowerCase() === userDeptName)
         );
       });
     }
@@ -358,30 +355,23 @@ appraisalRouter.get(
       const empMap = new Map<string, Employee>();
       allEmployees.forEach((e) => empMap.set(e.id, e));
 
-      // Role-based scope
-      if (user?.role === 'REPORTING_MANAGER' || user?.role === 'MANAGER') {
-        appraisals = appraisals.filter((a) => {
-          const empRecord = empMap.get(a.employeeId);
-          return (
-            a.managerId === user.employeeId ||
-            a.employeeId === user.employeeId ||
-            empRecord?.managerId === user.employeeId
-          );
-        });
-      } else if (user?.role === 'HOD') {
+      // Role-based scope: manager and HOD relationships are checked independently so a person
+      // who holds both capacities for an employee sees the record either way.
+      if (['REPORTING_MANAGER', 'MANAGER', 'HOD'].includes(user?.role || '')) {
+        const isHodRole = user?.role === 'HOD';
         appraisals = appraisals.filter((a) => {
           const empRecord = empMap.get(a.employeeId);
           const userDeptId = req.employeeProfile?.departmentId;
           const userDeptName = req.employeeProfile?.departmentName?.toLowerCase();
           return (
-            a.hodId === user.employeeId ||
-            a.managerId === user.employeeId ||
-            a.employeeId === user.employeeId ||
-            empRecord?.hodId === user.employeeId ||
-            empRecord?.managerId === user.employeeId ||
-            (userDeptId && a.departmentId === userDeptId) ||
-            (userDeptId && empRecord?.departmentId === userDeptId) ||
-            (userDeptName && a.departmentName?.toLowerCase() === userDeptName)
+            a.managerId === user?.employeeId ||
+            a.hodId === user?.employeeId ||
+            a.employeeId === user?.employeeId ||
+            empRecord?.managerId === user?.employeeId ||
+            empRecord?.hodId === user?.employeeId ||
+            (isHodRole && userDeptId && a.departmentId === userDeptId) ||
+            (isHodRole && userDeptId && empRecord?.departmentId === userDeptId) ||
+            (isHodRole && userDeptName && a.departmentName?.toLowerCase() === userDeptName)
           );
         });
       }
@@ -787,8 +777,10 @@ appraisalRouter.get('/appraisals/:id', async (req: AuthenticatedRequest, res: Re
     } else if (user.role === 'REPORTING_MANAGER' || user.role === 'MANAGER') {
       const isManagerMatch =
         appraisal.managerId === user.employeeId ||
+        appraisal.hodId === user.employeeId ||
         appraisal.employeeId === user.employeeId ||
         empRecord?.managerId === user.employeeId ||
+        empRecord?.hodId === user.employeeId ||
         (user.name && empRecord?.managerName?.toLowerCase() === user.name.toLowerCase());
 
       if (!isManagerMatch) {
@@ -1024,7 +1016,7 @@ appraisalRouter.post(
  */
 appraisalRouter.put(
   '/appraisals/:id/manager-recommend',
-  requireRoles('REPORTING_MANAGER', 'MANAGER', 'SUPER_ADMIN'),
+  requireRoles('REPORTING_MANAGER', 'MANAGER', 'HOD', 'MANAGEMENT', 'SUPER_ADMIN'),
   validateBody(ManagerRecommendationSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
@@ -1070,8 +1062,14 @@ appraisalRouter.put(
         return res.status(400).json({ error: 'Cannot submit recommendation: Employee is currently on an active performance improvement plan and ineligible for annual increment/promotion until it resolves.' });
       }
 
-      // Role check: If caller is MANAGER, verify they are the assigned reporting manager
-      if ((user?.role === 'REPORTING_MANAGER' || user?.role === 'MANAGER') && appraisal.managerId !== user.employeeId) {
+      // Ownership check: caller must actually be the assigned reporting manager for this
+      // employee (regardless of their account's stored role label — a person can hold the
+      // manager relationship on a record even if their account role is HOD/MANAGEMENT/etc).
+      if (
+        user?.role !== 'SUPER_ADMIN' &&
+        appraisal.managerId !== user?.employeeId &&
+        appraisal.managerId !== user?.id
+      ) {
         return res.status(403).json({ error: 'Unauthorized: You can only submit recommendations for your assigned direct reports.' });
       }
 
@@ -1183,7 +1181,7 @@ appraisalRouter.put(
  */
 appraisalRouter.put(
   '/appraisals/:id/hod-calibrate',
-  requireRoles('SUPER_ADMIN', 'HOD'),
+  requireRoles('SUPER_ADMIN', 'HOD', 'REPORTING_MANAGER', 'MANAGER', 'MANAGEMENT'),
   validateBody(HodCalibrationSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
@@ -1199,8 +1197,10 @@ appraisalRouter.put(
       }
 
       // Strict HOD ownership: only the employee's actually-configured HOD may calibrate,
-      // not any HOD-role user in the department (SUPER_ADMIN bypasses).
-      if (user?.role === 'HOD' && appraisal.hodId !== user.employeeId) {
+      // not any HOD-role user in the department. Checked against the relationship, not the
+      // caller's stored role label, so a manager who is also this employee's HOD can act
+      // (SUPER_ADMIN bypasses).
+      if (user?.role !== 'SUPER_ADMIN' && appraisal.hodId !== user?.employeeId) {
         return res.status(403).json({ error: 'Unauthorized: Only the designated HOD or Super Admin can calibrate this appraisal.' });
       }
 
@@ -1308,7 +1308,7 @@ appraisalRouter.put(
  */
 appraisalRouter.put(
   '/appraisals/:id/hod-return',
-  requireRoles('SUPER_ADMIN', 'HOD'),
+  requireRoles('SUPER_ADMIN', 'HOD', 'REPORTING_MANAGER', 'MANAGER', 'MANAGEMENT'),
   validateBody(HodReturnSchema),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
@@ -1323,8 +1323,10 @@ appraisalRouter.put(
         return res.status(404).json({ error: 'Appraisal record not found' });
       }
 
-      // Strict HOD ownership: only the employee's actually-configured HOD may return it, not any HOD-role user.
-      if (user?.role === 'HOD' && appraisal.hodId !== user.employeeId) {
+      // Strict HOD ownership: only the employee's actually-configured HOD may return it, not
+      // any HOD-role user, checked against the relationship rather than the caller's stored
+      // role label (SUPER_ADMIN bypasses).
+      if (user?.role !== 'SUPER_ADMIN' && appraisal.hodId !== user?.employeeId) {
         return res.status(403).json({ error: 'Unauthorized: Only the designated HOD or Super Admin can return this appraisal.' });
       }
 
@@ -1730,7 +1732,7 @@ appraisalRouter.get('/appraisals/:id/letter', async (req: AuthenticatedRequest, 
         return res.status(403).json({ error: 'Access denied: You may only view your own appraisal letter.' });
       }
     } else if (user.role === 'REPORTING_MANAGER' || user.role === 'MANAGER') {
-      if (appraisal.managerId !== user.employeeId && appraisal.employeeId !== user.employeeId) {
+      if (appraisal.managerId !== user.employeeId && appraisal.hodId !== user.employeeId && appraisal.employeeId !== user.employeeId) {
         return res.status(403).json({ error: 'Access denied: You may only view appraisal letters for your direct reports.' });
       }
     } else if (user.role === 'HOD') {
