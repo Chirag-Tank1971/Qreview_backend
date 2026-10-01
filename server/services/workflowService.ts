@@ -1,6 +1,7 @@
 import { getDbCollection } from '../db.js';
 import { recordAuditLog } from '../auth.js';
 import { checkEmployeeReviewEligibility } from './reviewEligibility.js';
+import { refreshEmployeeAppraisalScores } from './appraisalScoring.js';
 import {
   EmployeeReview,
   ReviewPeriod,
@@ -672,6 +673,9 @@ export async function hodApproveReview(
 
   await reviewCol.updateOne({ id: reviewId }, { $set: updated });
 
+  // HR_PENDING counts as evaluated, so the open appraisal's rolling score moves now.
+  await refreshEmployeeAppraisalScores(review.employeeId);
+
   const notifCol = getDbCollection('notifications');
   await notifCol.updateMany(
     { 'metadata.reviewId': reviewId, type: 'HOD_PENDING', isRead: false },
@@ -925,6 +929,9 @@ export async function completeHRReview(
   };
 
   await reviewCol.updateOne({ id: reviewId }, { $set: updated });
+
+  // A newly closed quarter changes the employee's rolling score on any open appraisal.
+  await refreshEmployeeAppraisalScores(review.employeeId);
 
   // Auto-resolve all prior pending review notifications (HR pending, returns, assignments)
   const notifCol = getDbCollection('notifications');

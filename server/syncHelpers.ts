@@ -14,6 +14,7 @@ import {
   createQuarterlyReview,
   buildKraSnapshotFromTemplate,
 } from './services/reviewEligibility.js';
+import { refreshAppraisalScore } from './services/appraisalScoring.js';
 
 /**
  * Synchronize appraisal & quarterly review records for a single employee
@@ -119,6 +120,7 @@ export async function syncEmployeeAppraisalsAndReviews(emp: Employee) {
           },
         }
       );
+      await refreshAppraisalScore(existingAppraisal);
     }
   } catch (err) {
     console.error('Error syncing employee reviews and appraisals:', err);

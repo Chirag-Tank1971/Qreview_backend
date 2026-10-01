@@ -3,6 +3,7 @@ import { getDbCollection } from '../db.js';
 import { ReviewPeriod, EmployeeReview, Employee, Cycle, PerformanceImprovementPlan } from '../../src/types/index.js';
 import { syncAllActiveEmployees } from '../syncHelpers.js';
 import { autoActivateCurrentPeriod } from '../services/periodLifecycle.js';
+import { refreshAllOpenAppraisalScores } from '../services/appraisalScoring.js';
 
 // Captured before server.ts's production log-silencing override runs (ES module imports
 // evaluate before the importing module's own top-level code), so these stay callable even
@@ -63,6 +64,13 @@ export function startBackgroundScheduler(): void {
   };
   void runPeriodRollover();
   cron.schedule('5 0 * * *', runPeriodRollover);
+
+  // Boot-time catch-up: appraisal rolling scores used to be computed only when a cohort was
+  // initiated, so quarters closed afterwards never reached them. Recompute once at startup;
+  // from here on they're refreshed when a review is evaluated/closed and by the daily sync.
+  void refreshAllOpenAppraisalScores()
+    .then((n) => logJob('AppraisalScoreRefresh', `Recomputed rolling scores for ${n} open appraisals.`))
+    .catch((err) => errorJob('AppraisalScoreRefresh', 'Failed', err));
 
   // 0. Daily at 07:00 AM: Auto-generate quarterly reviews for any employee who has newly
   // become eligible (KRA assigned, tenure now met, manager assigned, etc.) without requiring

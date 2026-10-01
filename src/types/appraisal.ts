@@ -48,6 +48,8 @@ export interface Appraisal {
   quarterlyReviews?: AppraisalQuarterRecord[];
   quarterlyHistory?: AppraisalQuarterRecord[];
   averageQuarterlyScore: number;
+  /** How many manager-evaluated quarters (max 4) the rolling score was averaged over. */
+  evaluatedQuarterCount?: number;
   managerId: string;
   managerName: string;
   hodId?: string;

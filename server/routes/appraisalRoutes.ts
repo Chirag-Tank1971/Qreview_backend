@@ -27,51 +27,15 @@ import {
 import { sendNotificationEmail, resolveRecipient } from '../services/emailService.js';
 import { renderAppraisalLetterReleasedEmail } from '../services/emailTemplates.js';
 import { getActivePipForEmployee } from '../services/pipService.js';
+import { checkDepartmentBudget, getDepartmentBudgetSnapshot } from '../services/departmentBudget.js';
+import { computeAppraisalMatrix, buildQuarterlyRollup, getRatingBand, RatingBand, refreshAppraisalScore } from '../services/appraisalScoring.js';
 
 export const appraisalRouter = Router();
 
 // Apply real JWT authentication to ALL appraisal routes
 appraisalRouter.use(authenticateToken);
 
-// Compute standard rating and default increment bracket based on rolling 4-quarter score
-export function computeAppraisalMatrix(avgScore: number) {
-  if (avgScore <= 0) {
-    return {
-      recommendedRating: 'PENDING',
-      suggestedIncrementMin: 0,
-      suggestedIncrementMax: 0,
-      defaultIncrement: 0,
-    };
-  } else if (avgScore >= 4.5) {
-    return {
-      recommendedRating: 'OUTSTANDING',
-      suggestedIncrementMin: 15,
-      suggestedIncrementMax: 20,
-      defaultIncrement: 16.5,
-    };
-  } else if (avgScore >= 3.8) {
-    return {
-      recommendedRating: 'EXCEEDS_EXPECTATIONS',
-      suggestedIncrementMin: 10,
-      suggestedIncrementMax: 14,
-      defaultIncrement: 12.0,
-    };
-  } else if (avgScore >= 2.8) {
-    return {
-      recommendedRating: 'MEETS_EXPECTATIONS',
-      suggestedIncrementMin: 5,
-      suggestedIncrementMax: 9,
-      defaultIncrement: 7.0,
-    };
-  } else {
-    return {
-      recommendedRating: 'NEEDS_IMPROVEMENT',
-      suggestedIncrementMin: 0,
-      suggestedIncrementMax: 4,
-      defaultIncrement: 2.0,
-    };
-  }
-}
+export { computeAppraisalMatrix };
 
 /**
  * GET /api/appraisals/due
@@ -397,8 +361,11 @@ appraisalRouter.get(
       const locked = appraisals.filter((a) => a.status === 'LOCKED' || a.isLocked).length;
       const promotionsCount = appraisals.filter((a) => a.promotionRecommended || a.hodCalibration?.promotionApproved).length;
 
-      const totalScore = appraisals.reduce((acc, a) => acc + (a.averageQuarterlyScore || 0), 0);
-      const averageScore = total > 0 ? Number((totalScore / total).toFixed(2)) : 0;
+      // Unscored appraisals (no evaluated quarters yet) are excluded from the average and bands.
+      const scored = appraisals.filter((a) => (a.averageQuarterlyScore || 0) > 0);
+      const averageScore = scored.length > 0
+        ? Number((scored.reduce((acc, a) => acc + a.averageQuarterlyScore, 0) / scored.length).toFixed(2))
+        : 0;
 
       const totalCurrentPayroll = appraisals.reduce((acc, a) => acc + (a.currentCtc || 0), 0);
       const totalRevisedPayroll = appraisals.reduce((acc, a) => acc + (a.revisedCtc || a.currentCtc || 0), 0);
@@ -411,10 +378,10 @@ appraisalRouter.get(
           : 0;
 
       const ratingDistribution = {
-        outstanding: appraisals.filter((a) => a.averageQuarterlyScore >= 4.5).length,
-        exceeds: appraisals.filter((a) => a.averageQuarterlyScore >= 3.8 && a.averageQuarterlyScore < 4.5).length,
-        meets: appraisals.filter((a) => a.averageQuarterlyScore >= 2.8 && a.averageQuarterlyScore < 3.8).length,
-        needsImprovement: appraisals.filter((a) => a.averageQuarterlyScore < 2.8).length,
+        outstanding: appraisals.filter((a) => getRatingBand(a) === 'OUTSTANDING').length,
+        exceeds: appraisals.filter((a) => getRatingBand(a) === 'EXCEEDS_EXPECTATIONS').length,
+        meets: appraisals.filter((a) => getRatingBand(a) === 'MEETS_EXPECTATIONS').length,
+        needsImprovement: appraisals.filter((a) => getRatingBand(a) === 'NEEDS_IMPROVEMENT').length,
       };
 
       const stats: AppraisalSummaryStats = {
@@ -482,26 +449,56 @@ appraisalRouter.get(
       const totalBudgetSpent = totalRevisedPayroll - totalCurrentPayroll;
       let totalBudgetCap = totalCurrentPayroll * 0.12; // 12% organizational default fallback
 
-      const totalScore = allAppraisals.reduce((acc, a) => acc + (a.averageQuarterlyScore || 0), 0);
-      const averageScore = totalAppraisals > 0 ? Number((totalScore / totalAppraisals).toFixed(2)) : 0;
+      // Rating bands: calibrated finalRating when set, else the rolling score's band. Appraisals
+      // with no evaluated quarters are UNRATED and kept out of the distribution percentages —
+      // previously their 0 score dropped them all into "Needs Improvement".
+      const bandOf = new Map(allAppraisals.map((a) => [a.id, getRatingBand(a)]));
+      const countBands = (list: Appraisal[]) => {
+        const counts: Record<RatingBand | 'UNRATED', number> = {
+          OUTSTANDING: 0, EXCEEDS_EXPECTATIONS: 0, MEETS_EXPECTATIONS: 0, NEEDS_IMPROVEMENT: 0, UNRATED: 0,
+        };
+        list.forEach((a) => counts[bandOf.get(a.id) || 'UNRATED']++);
+        return { counts, rated: list.length - counts.UNRATED };
+      };
+      const pct = (n: number, of: number) => (of > 0 ? Number(((n / of) * 100).toFixed(1)) : 0);
+      const scoredAvg = (list: Appraisal[]) => {
+        const scored = list.filter((a) => (a.averageQuarterlyScore || 0) > 0);
+        return scored.length > 0
+          ? Number((scored.reduce((s, a) => s + a.averageQuarterlyScore, 0) / scored.length).toFixed(2))
+          : 0;
+      };
+      // An appraisal belongs to a department by ID; the name is only a fallback for legacy
+      // records with no departmentId (two departments can share a name, e.g. two "Service").
+      const inDept = (rec: { departmentId?: string; departmentName?: string }, dept: Department) =>
+        rec.departmentId
+          ? rec.departmentId === dept.id
+          : Boolean(rec.departmentName && dept.name && rec.departmentName.trim().toLowerCase() === dept.name.trim().toLowerCase());
+
+      const averageScore = scoredAvg(allAppraisals);
       const totalIncrements = allAppraisals.reduce(
         (acc, a) => acc + (a.approvedIncrementPercentage || a.proposedIncrementPercentage || 0),
         0
       );
       const averageIncrementPercent = totalAppraisals > 0 ? Number((totalIncrements / totalAppraisals).toFixed(2)) : 0;
+      // Committed = appraisals whose revised CTC has actually been set above current CTC.
+      const committed = allAppraisals.filter((a) => (a.revisedCtc || 0) > (a.currentCtc || 0));
+      const committedAverageIncrementPercent = committed.length > 0
+        ? Number((committed.reduce((s, a) => s + ((a.revisedCtc - a.currentCtc) / (a.currentCtc || 1)) * 100, 0) / committed.length).toFixed(2))
+        : 0;
       const promotionsCount = allAppraisals.filter((a) => a.promotionRecommended || a.hodCalibration?.promotionApproved).length;
 
       // Overall Target vs Actual Distribution
-      const countOutstanding = allAppraisals.filter((a) => a.averageQuarterlyScore >= 4.5).length;
-      const countExceeds = allAppraisals.filter((a) => a.averageQuarterlyScore >= 3.8 && a.averageQuarterlyScore < 4.5).length;
-      const countMeets = allAppraisals.filter((a) => a.averageQuarterlyScore >= 2.8 && a.averageQuarterlyScore < 3.8).length;
-      const countNeedsImp = allAppraisals.filter((a) => a.averageQuarterlyScore < 2.8).length;
+      const { counts: orgCounts, rated: orgRated } = countBands(allAppraisals);
+      const countOutstanding = orgCounts.OUTSTANDING;
+      const countExceeds = orgCounts.EXCEEDS_EXPECTATIONS;
+      const countMeets = orgCounts.MEETS_EXPECTATIONS;
+      const countNeedsImp = orgCounts.NEEDS_IMPROVEMENT;
 
       const actualDist = {
-        outstanding: totalAppraisals > 0 ? Number(((countOutstanding / totalAppraisals) * 100).toFixed(1)) : 0,
-        exceeds: totalAppraisals > 0 ? Number(((countExceeds / totalAppraisals) * 100).toFixed(1)) : 0,
-        meets: totalAppraisals > 0 ? Number(((countMeets / totalAppraisals) * 100).toFixed(1)) : 0,
-        needsImprovement: totalAppraisals > 0 ? Number(((countNeedsImp / totalAppraisals) * 100).toFixed(1)) : 0,
+        outstanding: pct(countOutstanding, orgRated),
+        exceeds: pct(countExceeds, orgRated),
+        meets: pct(countMeets, orgRated),
+        needsImprovement: pct(countNeedsImp, orgRated),
       };
 
       // Departmental Budget Pools & Bell Curves
@@ -509,28 +506,22 @@ appraisalRouter.get(
       const departmentBellCurves: any[] = [];
 
       allDepartments.forEach((dept) => {
-        const deptAppraisals = allAppraisals.filter((a) => {
-          if (a.departmentId && a.departmentId === dept.id) return true;
-          if (a.departmentName && dept.name && a.departmentName.trim().toLowerCase() === dept.name.trim().toLowerCase()) return true;
-          return false;
-        });
+        const deptAppraisals = allAppraisals.filter((a) => inDept(a, dept));
+        const deptEmployees = allEmployees.filter((e) =>
+          inDept({ departmentId: e.departmentId, departmentName: e.departmentName || (e as any).department }, dept)
+        );
 
-        const deptEmployees = allEmployees.filter((e) => {
-          if (e.departmentId && e.departmentId === dept.id) return true;
-          if (e.departmentName && dept.name && e.departmentName.trim().toLowerCase() === dept.name.trim().toLowerCase()) return true;
-          if ((e as any).department && dept.name && (e as any).department.trim().toLowerCase() === dept.name.trim().toLowerCase()) return true;
-          return false;
-        });
-
-        const headcount = deptAppraisals.length > 0 ? deptAppraisals.length : deptEmployees.length;
-        const currentCtc = deptAppraisals.length > 0
-          ? deptAppraisals.reduce((sum, a) => sum + (a.currentCtc || 0), 0)
-          : deptEmployees.reduce((sum, e) => sum + (e.currentCtc || 0), 0);
+        // The pool covers only the employees actually being appraised in the selected cohort.
+        // A department with no appraisals here has no pool — falling back to its whole
+        // payroll (as before) added budget to the org total for people not in the cohort,
+        // which is what inflated the overall cap % above every department's own cap.
+        const headcount = deptAppraisals.length;
+        const currentCtc = deptAppraisals.reduce((sum, a) => sum + (a.currentCtc || 0), 0);
 
         const budgetCapPercent = typeof dept.budgetCapPercent === 'number' && dept.budgetCapPercent >= 0 ? dept.budgetCapPercent : 12.0;
         const allocatedBudgetAmount = currentCtc * (budgetCapPercent / 100);
         const revisedCtc = deptAppraisals.reduce((sum, a) => sum + (a.revisedCtc || a.currentCtc || 0), 0);
-        const actualSpentAmount = deptAppraisals.length > 0 ? (revisedCtc - currentCtc) : 0;
+        const actualSpentAmount = revisedCtc - currentCtc;
         const remainingBudgetAmount = allocatedBudgetAmount - actualSpentAmount;
         const actualSpentPercent = currentCtc > 0 ? Number(((actualSpentAmount / currentCtc) * 100).toFixed(2)) : 0;
         const isOverBudget = actualSpentAmount > allocatedBudgetAmount;
@@ -539,8 +530,7 @@ appraisalRouter.get(
         if (isOverBudget) status = 'EXCEEDED';
         else if (actualSpentAmount > allocatedBudgetAmount * 0.9) status = 'NEAR_CAP';
 
-        const deptScores = deptAppraisals.reduce((sum, a) => sum + (a.averageQuarterlyScore || 0), 0);
-        const avgScore = deptAppraisals.length > 0 ? Number((deptScores / deptAppraisals.length).toFixed(2)) : 0;
+        const avgScore = scoredAvg(deptAppraisals);
         const deptIncs = deptAppraisals.reduce((sum, a) => sum + (a.approvedIncrementPercentage || a.proposedIncrementPercentage || 0), 0);
         const avgInc = deptAppraisals.length > 0 ? Number((deptIncs / deptAppraisals.length).toFixed(2)) : 0;
         const promoCount = deptAppraisals.filter((a) => a.promotionRecommended || a.hodCalibration?.promotionApproved).length;
@@ -548,7 +538,10 @@ appraisalRouter.get(
         departmentBudgets.push({
           departmentId: dept.id,
           departmentName: dept.name,
+          departmentCode: dept.code,
           headcount,
+          employeeHeadcount: deptEmployees.length,
+          inCohort: headcount > 0,
           totalCurrentCtc: currentCtc,
           budgetCapPercent,
           allocatedBudgetAmount,
@@ -564,36 +557,41 @@ appraisalRouter.get(
 
         // Bell curve for department (based on active appraisals in this cycle/cohort)
         const totalDeptAppraisals = deptAppraisals.length;
-        const deptOut = deptAppraisals.filter((a) => a.averageQuarterlyScore >= 4.5).length;
-        const deptExc = deptAppraisals.filter((a) => a.averageQuarterlyScore >= 3.8 && a.averageQuarterlyScore < 4.5).length;
-        const deptMet = deptAppraisals.filter((a) => a.averageQuarterlyScore >= 2.8 && a.averageQuarterlyScore < 3.8).length;
-        const deptNid = deptAppraisals.filter((a) => a.averageQuarterlyScore < 2.8).length;
+        const { counts: deptCounts, rated: ratedDeptAppraisals } = countBands(deptAppraisals);
+        const deptOut = deptCounts.OUTSTANDING;
+        const deptExc = deptCounts.EXCEEDS_EXPECTATIONS;
+        const deptMet = deptCounts.MEETS_EXPECTATIONS;
+        const deptNid = deptCounts.NEEDS_IMPROVEMENT;
 
-        const pOut = totalDeptAppraisals > 0 ? Number(((deptOut / totalDeptAppraisals) * 100).toFixed(1)) : 0;
-        const pExc = totalDeptAppraisals > 0 ? Number(((deptExc / totalDeptAppraisals) * 100).toFixed(1)) : 0;
-        const pMet = totalDeptAppraisals > 0 ? Number(((deptMet / totalDeptAppraisals) * 100).toFixed(1)) : 0;
-        const pNid = totalDeptAppraisals > 0 ? Number(((deptNid / totalDeptAppraisals) * 100).toFixed(1)) : 0;
+        const pOut = pct(deptOut, ratedDeptAppraisals);
+        const pExc = pct(deptExc, ratedDeptAppraisals);
+        const pMet = pct(deptMet, ratedDeptAppraisals);
+        const pNid = pct(deptNid, ratedDeptAppraisals);
 
         let skewAlert: string | undefined = undefined;
         let skewSeverity: 'NORMAL' | 'WARNING' | 'CRITICAL' = 'NORMAL';
 
-        if (totalDeptAppraisals > 0) {
+        // Overrun is checked first so the most severe alert isn't masked by a distribution warning.
+        if (isOverBudget) {
+          skewAlert = `Budget Overrun: Actual increment spend of ${actualSpentPercent}% exceeds ${budgetCapPercent}% departmental limit.`;
+          skewSeverity = 'CRITICAL';
+        } else if (ratedDeptAppraisals > 0) {
           if (pOut > 30) {
             skewAlert = `Inflation Alert: ${pOut}% top performers exceeds 10% target guideline. HOD normalization recommended.`;
             skewSeverity = 'WARNING';
-          } else if (pNid === 0 && totalDeptAppraisals >= 5) {
-            skewAlert = `Zero bottom bucket distribution with ${totalDeptAppraisals} employees. Check for lenient rating bias.`;
+          } else if (pNid === 0 && ratedDeptAppraisals >= 5) {
+            skewAlert = `Zero bottom bucket distribution with ${ratedDeptAppraisals} rated employees. Check for lenient rating bias.`;
             skewSeverity = 'WARNING';
-          } else if (isOverBudget) {
-            skewAlert = `Budget Overrun: Actual increment spend of ${actualSpentPercent}% exceeds ${budgetCapPercent}% departmental limit.`;
-            skewSeverity = 'CRITICAL';
           }
         }
 
         departmentBellCurves.push({
           departmentId: dept.id,
           departmentName: dept.name,
+          departmentCode: dept.code,
           totalEmployees: totalDeptAppraisals,
+          ratedEmployees: ratedDeptAppraisals,
+          unratedEmployees: deptCounts.UNRATED,
           skewAlert,
           skewSeverity,
           buckets: [
@@ -651,42 +649,65 @@ appraisalRouter.get(
       }
 
       // High Performer Retention & Flight Risk Insights
-      const attritionRiskInsights: any[] = [];
-      allAppraisals.forEach((a) => {
-        const isTopPerformer = a.averageQuarterlyScore >= 4.2;
-        const increment = a.approvedIncrementPercentage || a.proposedIncrementPercentage || 0;
+      // Risk is derived only from data the system holds: the employee's increment compared
+      // with this system's own guideline band for their score (computeAppraisalMatrix) and
+      // with the average increment of the other top performers in the selected cohort. There
+      // is no external market/salary-survey data here, so none is implied.
+      const TOP_PERFORMER_SCORE = 4.2;
+      const incrementOf = (a: Appraisal) => a.approvedIncrementPercentage || a.proposedIncrementPercentage || 0;
+      const topPerformers = allAppraisals.filter((a) => (a.averageQuarterlyScore || 0) >= TOP_PERFORMER_SCORE);
+      const attritionRiskInsights: any[] = topPerformers.map((a) => {
+        const score = a.averageQuarterlyScore;
+        const increment = incrementOf(a);
+        const band = computeAppraisalMatrix(score);
+        const bandMid = (band.suggestedIncrementMin + band.suggestedIncrementMax) / 2;
+        const peers = topPerformers.filter((p) => p.id !== a.id);
+        const peerAvg = peers.length > 0
+          ? Number((peers.reduce((s, p) => s + incrementOf(p), 0) / peers.length).toFixed(1))
+          : null;
+        const bandLabel = `${band.recommendedRating.replace(/_/g, ' ').toLowerCase()} guideline band (${band.suggestedIncrementMin}–${band.suggestedIncrementMax}%)`;
+        const isSystemDefault = a.status === 'PENDING' && !a.managerRecommendation;
 
-        if (isTopPerformer) {
-          let flightRisk: 'HIGH' | 'MEDIUM' | 'LOW' = 'LOW';
-          let riskReason = 'Strong performer aligned with merit band';
-          let action = 'Maintain standard progression and career mapping.';
+        let flightRisk: 'HIGH' | 'MEDIUM' | 'LOW' = 'LOW';
+        let riskReason = `+${increment}% is within the ${bandLabel}.`;
+        let action = 'Maintain standard progression and career mapping.';
 
-          if (increment <= 10) {
-            flightRisk = 'HIGH';
-            riskReason = `Score ${a.averageQuarterlyScore.toFixed(2)} with only +${increment}% increment (industry median +18% for top quartile).`;
-            action = 'Management special equity adjustment or milestone retention bonus recommended.';
-          } else if (increment < 14) {
-            flightRisk = 'MEDIUM';
-            riskReason = 'High score with conservative increment allocation.';
-            action = 'Schedule 1-on-1 career growth conversation with HOD.';
-          }
-
-          attritionRiskInsights.push({
-            employeeId: a.employeeId,
-            employeeName: a.employeeName,
-            employeeCode: a.employeeCode,
-            departmentName: a.departmentName,
-            designationName: a.designationName,
-            score: a.averageQuarterlyScore,
-            incrementPercent: increment,
-            rating: a.recommendedRating,
-            marketCompRatio: Number((0.85 + (increment / 100) * 0.5).toFixed(2)),
-            flightRisk,
-            riskReason,
-            recommendedRetentionAction: action,
-          });
+        if (increment < band.suggestedIncrementMin) {
+          flightRisk = 'HIGH';
+          riskReason = `Score ${score.toFixed(2)} but +${increment}% is below the ${bandLabel}.`;
+          action = 'Raise to at least the band minimum, or record a justification for the lower increment.';
+        } else if (increment < bandMid || (peerAvg !== null && increment < peerAvg - 2)) {
+          flightRisk = 'MEDIUM';
+          riskReason =
+            increment < bandMid
+              ? `+${increment}% is in the lower half of the ${bandLabel}.`
+              : `+${increment}% is more than 2 points below the ${peerAvg}% average for other top performers in this cohort.`;
+          action = 'Review during HOD calibration and hold a career growth conversation.';
         }
+        if (isSystemDefault) {
+          riskReason += ' (System default — manager has not proposed an increment yet.)';
+        }
+
+        return {
+          employeeId: a.employeeId,
+          employeeName: a.employeeName,
+          employeeCode: a.employeeCode,
+          departmentName: a.departmentName,
+          designationName: a.designationName,
+          score,
+          incrementPercent: increment,
+          rating: a.recommendedRating,
+          guidelineMinPercent: band.suggestedIncrementMin,
+          guidelineMaxPercent: band.suggestedIncrementMax,
+          peerAverageIncrementPercent: peerAvg,
+          isSystemDefaultIncrement: isSystemDefault,
+          flightRisk,
+          riskReason,
+          recommendedRetentionAction: action,
+        };
       });
+      const riskOrder = { HIGH: 0, MEDIUM: 1, LOW: 2 };
+      attritionRiskInsights.sort((x, y) => riskOrder[x.flightRisk as 'HIGH'] - riskOrder[y.flightRisk as 'HIGH'] || y.score - x.score);
 
       // Appraisal Cycle Progress Comparison
       const cycleProgressComparison = allCycles.map((c) => {
@@ -717,8 +738,12 @@ appraisalRouter.get(
         cohortSummary: {
           totalEmployees: allEmployees.length,
           totalActiveAppraisals: totalAppraisals,
+          ratedAppraisals: orgRated,
+          unratedAppraisals: orgCounts.UNRATED,
           averageScore,
           averageIncrementPercent,
+          committedAppraisals: committed.length,
+          committedAverageIncrementPercent,
           totalPayrollPre: totalCurrentPayroll,
           totalPayrollPost: totalRevisedPayroll,
           totalBudgetSpent,
@@ -733,6 +758,7 @@ appraisalRouter.get(
             exceeds: countExceeds,
             meets: countMeets,
             needsImprovement: countNeedsImp,
+            unrated: orgCounts.UNRATED,
           },
         },
         departmentBudgets,
@@ -877,35 +903,9 @@ appraisalRouter.post(
           continue;
         }
 
-        // Fetch all historical reviews for this employee
-        const employeeReviews: EmployeeReview[] = await (
-          await reviewsCol.find({ employeeId: emp.id })
-        ).toArray();
-
-        // Sort reviews chronologically
-        employeeReviews.sort((a, b) => new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime());
-
-        // Aggregate quarterly history
-        const quarterlyHistory: AppraisalQuarterRecord[] = employeeReviews.map((rev) => ({
-          periodId: rev.reviewPeriodId,
-          periodName: rev.reviewPeriodName,
-          score: rev.finalScore || 0,
-          reviewId: rev.id,
-          strengths: rev.strengths,
-          managerComments: rev.managerOverallComments,
-          status: rev.status,
-        }));
-
-        // Calculate rolling 4-quarter average score from manager-evaluated reviews only
-        const evaluatedStatuses = ['MANAGER_COMPLETED', 'HR_PENDING', 'CLOSED'];
-        const validScores = quarterlyHistory
-          .filter((q) => (q.status ? evaluatedStatuses.includes(q.status) : false) && (q.score || 0) > 0)
-          .map((q) => q.score);
-        const hasScores = validScores.length > 0;
-        const avgScore =
-          hasScores
-            ? Number((validScores.reduce((sum, s) => sum + s, 0) / validScores.length).toFixed(2))
-            : 0;
+        // Rolling score: average of the latest 4 manager-evaluated quarters
+        const { quarterlyHistory, avgScore, evaluatedCount } = await buildQuarterlyRollup(emp.id);
+        const hasScores = evaluatedCount > 0;
 
         const matrix = computeAppraisalMatrix(avgScore);
         const currentCtc = emp.currentCtc || 0;
@@ -936,6 +936,7 @@ appraisalRouter.post(
           currency: emp.currency || '₹',
           quarterlyHistory,
           averageQuarterlyScore: avgScore,
+          evaluatedQuarterCount: evaluatedCount,
           recommendedRating: hasScores ? matrix.recommendedRating : 'PENDING',
           suggestedIncrementMin: hasScores ? matrix.suggestedIncrementMin : 0,
           suggestedIncrementMax: hasScores ? matrix.suggestedIncrementMax : 0,
@@ -1011,6 +1012,28 @@ appraisalRouter.post(
 );
 
 /**
+ * GET /api/appraisals/:id/budget
+ * Department budget pool for this appraisal, so the calibration UI can warn before submit.
+ * The same pool is enforced server-side on every increment write (see checkDepartmentBudget).
+ */
+appraisalRouter.get(
+  '/appraisals/:id/budget',
+  requireRoles('SUPER_ADMIN', 'HR', 'HOD', 'MANAGEMENT', 'REPORTING_MANAGER', 'MANAGER'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const appraisal: Appraisal | null = await getDbCollection('appraisals').findOne({ id: req.params.id });
+      if (!appraisal) {
+        return res.status(404).json({ error: 'Appraisal record not found' });
+      }
+      res.json(await getDepartmentBudgetSnapshot(appraisal));
+    } catch (err: any) {
+      console.error('Error in GET /api/appraisals/:id/budget:', err);
+      res.status(500).json({ error: err.message || 'Failed to load department budget' });
+    }
+  }
+);
+
+/**
  * PUT /api/appraisals/:id/manager-recommend
  * Manager submits recommended increment %, promotion recommendation, and qualitative justification
  */
@@ -1077,6 +1100,11 @@ appraisalRouter.put(
       const incPercent = Number(suggestedIncrementPercent) || appraisal.suggestedIncrementMin || 10;
       const incrementAmount = Math.round((currentCtc * incPercent) / 100);
       const revisedCtc = currentCtc + incrementAmount;
+
+      const budgetError = await checkDepartmentBudget(appraisal, incrementAmount);
+      if (budgetError) {
+        return res.status(400).json({ error: budgetError, code: 'BUDGET_CAP_EXCEEDED' });
+      }
 
       const managerRecommendation = {
         suggestedIncrementPercent: incPercent,
@@ -1232,6 +1260,11 @@ appraisalRouter.put(
       const finalInc = Number(calibratedIncrementPercent) || appraisal.proposedIncrementPercentage;
       const incrementAmount = Math.round((currentCtc * finalInc) / 100);
       const revisedCtc = currentCtc + incrementAmount;
+
+      const budgetError = await checkDepartmentBudget(appraisal, incrementAmount);
+      if (budgetError) {
+        return res.status(400).json({ error: budgetError, code: 'BUDGET_CAP_EXCEEDED' });
+      }
 
       const hodCalibration = {
         calibratedIncrementPercent: finalInc,
@@ -1450,6 +1483,11 @@ appraisalRouter.put(
       const incrementAmount = Math.round((currentCtc * approvedInc) / 100);
       const revisedCtc = currentCtc + incrementAmount;
 
+      const budgetError = await checkDepartmentBudget(appraisal, incrementAmount);
+      if (budgetError) {
+        return res.status(400).json({ error: budgetError, code: 'BUDGET_CAP_EXCEEDED' });
+      }
+
       const hrApproval = {
         finalIncrementPercent: approvedInc,
         finalRating: finalRating || appraisal.finalRating,
@@ -1575,6 +1613,10 @@ appraisalRouter.put(
         });
       }
 
+      // Bring the rolling score/history up to date so the locked record reflects every
+      // evaluated quarter (refreshAppraisalScore never touches increments or HR's rating).
+      await refreshAppraisalScore(appraisal);
+
       // Super Admin may make last-mile edits before the final lock; when present, these
       // final values supersede whatever HR had approved and become what gets locked in
       // and reflected on the official appraisal letter.
@@ -1582,6 +1624,12 @@ appraisalRouter.put(
       const finalInc = finalIncrementPercent !== undefined ? Number(finalIncrementPercent) : appraisal.approvedIncrementPercentage || 0;
       const incrementAmount = Math.round((currentCtc * finalInc) / 100);
       const finalRevisedCtc = revisedCtcOverride !== undefined ? Number(revisedCtcOverride) : currentCtc + incrementAmount;
+
+      // Checked against the CTC actually being locked in, so a revisedCtc override can't bypass the cap.
+      const budgetError = await checkDepartmentBudget(appraisal, finalRevisedCtc - currentCtc);
+      if (budgetError) {
+        return res.status(400).json({ error: budgetError, code: 'BUDGET_CAP_EXCEEDED' });
+      }
       const finalRatingValue = finalRating || appraisal.finalRating;
       const finalEffectiveDate = effectiveDate || appraisal.effectiveDate || `${appraisal.appraisalYear}-10-01`;
       const finalPromotionRecommended = promotionApproved !== undefined ? Boolean(promotionApproved) : Boolean(appraisal.promotionRecommended);
