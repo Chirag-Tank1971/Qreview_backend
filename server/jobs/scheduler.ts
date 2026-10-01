@@ -2,6 +2,7 @@ import cron from 'node-cron';
 import { getDbCollection } from '../db.js';
 import { ReviewPeriod, EmployeeReview, Employee, Cycle, PerformanceImprovementPlan } from '../../src/types/index.js';
 import { syncAllActiveEmployees } from '../syncHelpers.js';
+import { autoActivateCurrentPeriod } from '../services/periodLifecycle.js';
 
 // Captured before server.ts's production log-silencing override runs (ES module imports
 // evaluate before the importing module's own top-level code), so these stay callable even
@@ -36,6 +37,32 @@ function errorJob(job: string, message: string, err: any): void {
  */
 export function startBackgroundScheduler(): void {
   logJob('Init', 'Initializing automated background cron tasks...');
+
+  // Quarter rollover: activate the period for the current calendar quarter (locking the
+  // previous one). Runs once at boot — so a server that was down over the rollover catches
+  // up immediately — and daily just after midnight, ahead of every job below that keys off
+  // the ACTIVE period. When a period is newly activated, reviews are generated right away
+  // rather than waiting for the 07:00 eligibility sync.
+  const runPeriodRollover = async () => {
+    const job = 'PeriodAutoActivation';
+    const startedAt = Date.now();
+    try {
+      const { activated, lockedIds, skippedReason } = await autoActivateCurrentPeriod();
+      if (!activated) {
+        logJob(job, `Skipped in ${Date.now() - startedAt}ms — ${skippedReason}`);
+        return;
+      }
+      const { employeesProcessed } = await syncAllActiveEmployees();
+      logJob(
+        job,
+        `Completed in ${Date.now() - startedAt}ms — activated ${activated.name}, locked ${lockedIds.length} prior period(s), re-evaluated ${employeesProcessed} employees.`
+      );
+    } catch (err: any) {
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
+    }
+  };
+  void runPeriodRollover();
+  cron.schedule('5 0 * * *', runPeriodRollover);
 
   // 0. Daily at 07:00 AM: Auto-generate quarterly reviews for any employee who has newly
   // become eligible (KRA assigned, tenure now met, manager assigned, etc.) without requiring
