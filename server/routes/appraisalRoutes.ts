@@ -13,16 +13,11 @@ import {
 } from '../validation.js';
 import {
   Appraisal,
-  AppraisalQuarterRecord,
   AppraisalSummaryStats,
   Employee,
   Department,
   Cycle,
-  EmployeeReview,
-  AuditLog,
   Notification,
-  User,
-  Designation,
 } from '../../src/types/index.js';
 import { sendNotificationEmail, resolveRecipient } from '../services/emailService.js';
 import { renderAppraisalLetterReleasedEmail } from '../services/emailTemplates.js';
@@ -34,8 +29,6 @@ export const appraisalRouter = Router();
 
 // Apply real JWT authentication to ALL appraisal routes
 appraisalRouter.use(authenticateToken);
-
-export { computeAppraisalMatrix };
 
 /**
  * GET /api/appraisals/due
@@ -864,9 +857,7 @@ appraisalRouter.post(
       }
 
       const employeesCol = getDbCollection('employees');
-      const reviewsCol = getDbCollection('employeeReviews');
       const appraisalsCol = getDbCollection('appraisals');
-      const auditLogsCol = getDbCollection('auditLogs');
       const notificationsCol = getDbCollection('notifications');
 
       const eligibleEmployees: Employee[] = await (
@@ -910,8 +901,6 @@ appraisalRouter.post(
         const matrix = computeAppraisalMatrix(avgScore);
         const currentCtc = emp.currentCtc || 0;
         const proposedIncrementPercent = hasScores ? matrix.defaultIncrement : 0;
-        const incrementAmount = hasScores ? Math.round((currentCtc * proposedIncrementPercent) / 100) : 0;
-        const revisedCtc = currentCtc + incrementAmount;
 
         const appraisalDoc: Appraisal = {
           id: existing ? existing.id : `appr_${appraisalYear}_${emp.id}`,

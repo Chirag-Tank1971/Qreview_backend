@@ -835,9 +835,6 @@ mastersRouter.post('/employees', requireRoles('SUPER_ADMIN', 'HR'), async (req: 
     const isTargetHod =
       systemRole === 'HOD' ||
       Boolean(des && (des.level >= 4 || des.name?.toLowerCase().includes('vp') || des.name?.toLowerCase().includes('head')));
-    const isTargetManager =
-      systemRole === 'MANAGER' ||
-      Boolean(des && (des.level >= 3 || des.name?.toLowerCase().includes('manager') || des.name?.toLowerCase().includes('lead')));
 
     if (!employeeCode || !name || !email || !departmentId || !designationId || !joiningDate || !cycleId || (!hodId && !isTargetHod) || !startingReviewPeriodId) {
       return res.status(400).json({
@@ -1420,9 +1417,6 @@ mastersRouter.put('/employees/:id', requireRoles('SUPER_ADMIN', 'HR'), async (re
     const isTargetHod =
       effectiveRole === 'HOD' ||
       Boolean(currentDes && (currentDes.level >= 4 || currentDes.name?.toLowerCase().includes('vp') || currentDes.name?.toLowerCase().includes('head')));
-    const isTargetManager =
-      effectiveRole === 'MANAGER' ||
-      Boolean(currentDes && (currentDes.level >= 3 || currentDes.name?.toLowerCase().includes('manager') || currentDes.name?.toLowerCase().includes('lead')));
 
     if (managerId !== undefined) {
       if (!managerId && !isTargetHod && status !== 'INACTIVE' && emp.status !== 'INACTIVE') {
@@ -1849,38 +1843,6 @@ mastersRouter.post('/masters/normalize-employee-codes', requireRoles('SUPER_ADMI
 // ==========================================
 
 /**
- * Helper to check if a notification's underlying workflow task is completed.
- * If completed, the notification is automatically resolved and removed from the active view.
- */
-/**
- * Helper to check if a specific notification target is completed (optional hint)
- */
-async function isNotificationTargetCompleted(notif: any): Promise<boolean> {
-  try {
-    const appraisalsCol = getDbCollection('appraisals');
-    const reviewsCol = getDbCollection('employeeReviews');
-
-    if (notif.metadata?.appraisalId) {
-      const appr = await appraisalsCol.findOne({ id: notif.metadata.appraisalId });
-      if (appr && (appr.status === 'LOCKED' && appr.employeeAcknowledgement?.acknowledged)) {
-        return true;
-      }
-    }
-
-    if (notif.metadata?.reviewId) {
-      const rev = await reviewsCol.findOne({ id: notif.metadata.reviewId });
-      if (rev && rev.status === 'HR_COMPLETED') {
-        return true;
-      }
-    }
-
-    return false;
-  } catch (err) {
-    return false;
-  }
-}
-
-/**
  * Auto-syncs and auto-resolves workflow notifications for a user before they're read —
  * creates/resolves self-assessment reminders and clears stale review-action notifications
  * once their underlying review has moved on. Shared by both the full list and the
@@ -2022,7 +1984,7 @@ async function runNotificationAutoSync(currentUser: User): Promise<void> {
  * GET /notifications/unread-count (badge count), so the count can never drift from what the
  * list endpoint actually shows.
  */
-async function computeVisibleNotifications(currentUser: User): Promise<any[]> {
+export async function computeVisibleNotifications(currentUser: User): Promise<any[]> {
   const notifsCol = getDbCollection('notifications');
 
   await runNotificationAutoSync(currentUser);

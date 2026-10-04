@@ -18,7 +18,6 @@ import {
   Employee,
   KraTemplate,
   Cycle,
-  Department,
   ReviewSummaryStats,
 } from '../../src/types/index.js';
 import { sendNotificationEmail, resolveRecipient } from '../services/emailService.js';
@@ -28,14 +27,12 @@ import {
   submitManagerReview,
   returnReview,
   completeHRReview,
-  saveManagerDraft,
   hodApproveReview,
   hodReturnReview,
 } from '../services/workflowService.js';
 import {
   checkEmployeeReviewEligibility,
   createQuarterlyReview,
-  calculatePeriodTenureDays,
 } from '../services/reviewEligibility.js';
 
 export const reviewRouter = express.Router();
@@ -582,7 +579,6 @@ reviewRouter.get(
       const employeesCol = getDbCollection('employees');
       const managerEmployeeId = req.user?.employeeId;
       const managerUserId = req.user?.id;
-      const managerName = req.user?.name?.toLowerCase().trim();
       const role = req.user?.role;
 
       let reviews: EmployeeReview[] = await (await reviewCol.find({})).toArray();

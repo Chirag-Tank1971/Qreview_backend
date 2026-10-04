@@ -1,5 +1,4 @@
 import jwt from 'jsonwebtoken';
-import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
 import { Request, Response, NextFunction } from 'express';
 import { getDbCollection } from './db.js';
@@ -52,8 +51,8 @@ export function generateTempPassword(): string {
 }
 
 // Dev: 8 hours for convenient local/Postman testing | Production: 15 minutes for security
-export const ACCESS_TOKEN_EXPIRY = process.env.NODE_ENV === 'production' ? '15m' : '8h';
-export const REFRESH_TOKEN_EXPIRY = '7d';
+const ACCESS_TOKEN_EXPIRY = process.env.NODE_ENV === 'production' ? '15m' : '8h';
+const REFRESH_TOKEN_EXPIRY = '7d';
 
 export interface AuthenticatedRequest extends Request {
   user?: User;
@@ -175,10 +174,6 @@ export function generateRefreshToken(user: User, tokenVersion: number = 1): stri
     JWT_REFRESH_SECRET,
     { expiresIn: REFRESH_TOKEN_EXPIRY }
   );
-}
-
-export function generateToken(user: User): string {
-  return generateAccessToken(user);
 }
 
 /**
@@ -358,14 +353,12 @@ export async function authenticateToken(req: AuthenticatedRequest, res: Response
   next();
 }
 
-export const authenticateUser = authenticateToken;
-
 /**
  * Step 2: Role Authorization Middleware
  * Verifies that the authenticated user possesses one of the allowed roles.
  * Returns 401 if not authenticated, 403 if authenticated but not permitted.
  */
-export function authorizeRoles(...allowedRoles: UserRole[]) {
+export function requireRoles(...allowedRoles: UserRole[]) {
   return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
     if (!req.user || !req.userRole) {
       return res.status(401).json({ error: 'Authentication required.' });
@@ -384,37 +377,6 @@ export function authorizeRoles(...allowedRoles: UserRole[]) {
     if (!effectiveAllowed.includes(req.userRole)) {
       return res.status(403).json({
         error: `Forbidden: Access denied for role ${req.userRole}. Required roles: [${allowedRoles.join(', ')}]`,
-      });
-    }
-
-    next();
-  };
-}
-
-export const requireRoles = authorizeRoles;
-
-/**
- * Step 3: Permission-Based Authorization Middleware
- * Checks granular permissions against user role/profile.
- */
-export function authorizePermission(...requiredPermissions: Permission[]) {
-  return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-    if (!req.user || !req.userRole) {
-      return res.status(401).json({ error: 'Authentication required.' });
-    }
-
-    if (req.userRole === 'SUPER_ADMIN') {
-      return next();
-    }
-
-    const userPerms: Permission[] = req.permissions && req.permissions.length > 0
-      ? req.permissions
-      : (ROLE_PERMISSIONS[req.userRole] || []);
-
-    const hasAll = requiredPermissions.every((p) => userPerms.includes(p));
-    if (!hasAll) {
-      return res.status(403).json({
-        error: `Forbidden: Missing required permission(s): [${requiredPermissions.join(', ')}]`,
       });
     }
 
@@ -517,38 +479,6 @@ export function authorizeEmployeeAccess(paramName: string = 'id') {
     } catch (err: any) {
       return res.status(500).json({ error: 'Employee authorization verification failed.' });
     }
-  };
-}
-
-/**
- * Step 5: Department Scope Authorization
- * Enforces departmental data boundaries for HODs.
- */
-export function authorizeDepartmentScope(departmentIdParam: string = 'departmentId') {
-  return (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
-    if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required.' });
-    }
-
-    const role = req.user.role;
-    if (role === 'SUPER_ADMIN' || role === 'HR' || role === 'MANAGEMENT') {
-      return next();
-    }
-
-    const targetDeptId = req.params[departmentIdParam] || req.query[departmentIdParam] || req.body[departmentIdParam];
-    if (!targetDeptId) {
-      return next();
-    }
-
-    if (role === 'HOD') {
-      const hodDeptId = req.employeeProfile?.departmentId;
-      if (hodDeptId && hodDeptId === targetDeptId) {
-        return next();
-      }
-      return res.status(403).json({ error: 'Forbidden: You can only access your designated department.' });
-    }
-
-    return res.status(403).json({ error: 'Forbidden: Insufficient departmental privileges.' });
   };
 }
 
@@ -800,44 +730,6 @@ export function authorizeReviewAccess(
       return res.status(500).json({ error: 'Review authorization verification failed.' });
     }
   };
-}
-
-/**
- * Step 7: State Machine Validation Helper
- */
-export function validateReviewTransition(
-  currentStatus: ReviewStatus,
-  action: 'submit' | 'return' | 'complete' | 'score' | 'self_assess'
-): { allowed: boolean; nextStatus?: ReviewStatus; error?: string } {
-  switch (action) {
-    case 'score':
-    case 'self_assess':
-      if (currentStatus === 'CLOSED') {
-        return { allowed: false, error: 'Cannot modify a closed review.' };
-      }
-      return { allowed: true, nextStatus: currentStatus };
-
-    case 'submit':
-      if (!['DRAFT', 'ASSIGNED', 'MANAGER_PENDING', 'RETURNED'].includes(currentStatus)) {
-        return { allowed: false, error: `Cannot submit review in status ${currentStatus}. Must be editable.` };
-      }
-      return { allowed: true, nextStatus: 'HR_PENDING' };
-
-    case 'return':
-      if (currentStatus !== 'HR_PENDING') {
-        return { allowed: false, error: `Cannot return review in status ${currentStatus}. Must be HR_PENDING.` };
-      }
-      return { allowed: true, nextStatus: 'RETURNED' };
-
-    case 'complete':
-      if (currentStatus !== 'HR_PENDING') {
-        return { allowed: false, error: `Cannot complete review in status ${currentStatus}. Must be HR_PENDING.` };
-      }
-      return { allowed: true, nextStatus: 'CLOSED' };
-
-    default:
-      return { allowed: false, error: 'Unknown workflow action.' };
-  }
 }
 
 /**

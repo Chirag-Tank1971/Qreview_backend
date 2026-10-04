@@ -291,6 +291,7 @@ export const memoryDb = {
   talentRecords: new InMemoryCollection<TalentRecord>('talent_records', []),
   complianceFlags: new InMemoryCollection<ComplianceFlag>('compliance_flags', []),
   emailLogs: new InMemoryCollection<EmailLog>('email_logs', []),
+  locations: new InMemoryCollection<any>('locations', []),
   performanceImprovementPlans: new InMemoryCollection<PerformanceImprovementPlan>('performance_improvement_plans', []),
   systemConfig: new InMemoryCollection<SystemConfig>('system_config', [
     { id: 'default', hodApprovalEnabled: false, selfAssessmentEnabled: false, updatedAt: new Date().toISOString() },
@@ -322,7 +323,7 @@ export async function initDatabase(): Promise<void> {
       
       dbMode = 'MONGODB';
       console.log(`[Database] Connected to MongoDB database '${mongoDb.databaseName}' successfully`);
-      await ensureMongoIndexes(mongoDb);
+      await ensureMongoIndexes();
       return;
     } catch (err: any) {
       console.warn(`[Database] MongoDB connection attempt failed: ${err.message}. Running in Persistent Embedded Mode.`);
@@ -355,7 +356,7 @@ const MONGO_COLLECTION_MAP: Record<string, string> = {
   performanceImprovementPlans: 'performance_improvement_plans',
 };
 
-export function getDbCollection<T extends { id?: string; _id?: any }>(collectionName: keyof typeof memoryDb): any {
+export function getDbCollection(collectionName: keyof typeof memoryDb): any {
   if (dbMode === 'MONGODB' && mongoDb) {
     const mapped = MONGO_COLLECTION_MAP[collectionName] || collectionName;
     return mongoDb.collection(mapped);
@@ -363,7 +364,7 @@ export function getDbCollection<T extends { id?: string; _id?: any }>(collection
   return memoryDb[collectionName];
 }
 
-async function ensureMongoIndexes(db: Db): Promise<void> {
+async function ensureMongoIndexes(): Promise<void> {
   console.log('[Database] Ensuring MongoDB collections and indexes are ready...');
   try {
     const revCol = getDbCollection('employeeReviews');

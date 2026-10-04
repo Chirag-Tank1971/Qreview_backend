@@ -2,7 +2,7 @@ import { getDbCollection } from '../db.js';
 import { Appraisal, AppraisalQuarterRecord, EmployeeReview, ReviewPeriod } from '../../src/types/index.js';
 
 // Reviews count toward the rolling score once the manager has evaluated them.
-const EVALUATED_STATUSES = ['MANAGER_COMPLETED', 'HR_PENDING', 'CLOSED'];
+export const EVALUATED_STATUSES = ['MANAGER_COMPLETED', 'HR_PENDING', 'CLOSED'];
 const ROLLING_WINDOW = 4;
 
 export const RATING_BANDS = ['OUTSTANDING', 'EXCEEDS_EXPECTATIONS', 'MEETS_EXPECTATIONS', 'NEEDS_IMPROVEMENT'] as const;

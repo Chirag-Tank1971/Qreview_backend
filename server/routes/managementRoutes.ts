@@ -765,7 +765,6 @@ managementRouter.get(
       const appraisalCol = getDbCollection('appraisals');
       const deptCol = getDbCollection('departments');
       const cycleCol = getDbCollection('cycles');
-      const empCol = getDbCollection('employees');
 
       const query: any = { appraisalYear: targetYear };
       if (cycleId && cycleId !== 'ALL') query.cycleId = cycleId;
@@ -775,7 +774,6 @@ managementRouter.get(
       const allDepts: Department[] = await (await deptCol.find({})).toArray();
       const allCyclesRaw: Cycle[] = await (await cycleCol.find({})).toArray();
       const allCycles: Cycle[] = allCyclesRaw.filter((c) => c.active !== false);
-      const allEmployees: Employee[] = await (await empCol.find({ status: { $ne: 'INACTIVE' } })).toArray();
 
       const totalDue = appraisals.length;
       const completedCount = appraisals.filter((a) => a.isLocked || a.status === 'LOCKED').length;

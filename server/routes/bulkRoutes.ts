@@ -101,7 +101,7 @@ bulkRouter.get('/templates/:type', (req: AuthenticatedRequest, res: Response) =>
  * Resolves managerId / managerName from managerEmployeeCode.
  * Resolves hodId / hodName from hodEmployeeCode, or falls back to department's assigned HOD.
  */
-export async function resolveAndSyncHierarchy(): Promise<{ updatedCount: number; totalScanned: number }> {
+async function resolveAndSyncHierarchy(): Promise<{ updatedCount: number; totalScanned: number }> {
   try {
     const employeesCol = getDbCollection('employees');
     const departmentsCol = getDbCollection('departments');
@@ -237,7 +237,7 @@ setTimeout(() => {
   }).catch(() => {});
 }, 3000);
 
-export function cleanCode(val: any): string {
+function cleanCode(val: any): string {
   const str = String(val || '').trim();
   if (str.includes(' - ')) {
     return str.split(' - ')[0].trim().toUpperCase();
@@ -245,7 +245,7 @@ export function cleanCode(val: any): string {
   return str.toUpperCase();
 }
 
-export function parseExcelDateStr(val: any): string {
+function parseExcelDateStr(val: any): string {
   if (!val) return '';
   if (typeof val === 'number') {
     const d = new Date(Math.round((val - 25569) * 86400 * 1000));
@@ -267,7 +267,7 @@ export function parseExcelDateStr(val: any): string {
   return str;
 }
 
-export function normalizeEmployeeInputRow(raw: any): any {
+function normalizeEmployeeInputRow(raw: any): any {
   if (!raw || typeof raw !== 'object') return raw;
   const row = { ...raw };
 
@@ -420,7 +420,7 @@ export function normalizeEmployeeInputRow(raw: any): any {
   return row;
 }
 
-export function normalizeKraInputRow(raw: any): any {
+function normalizeKraInputRow(raw: any): any {
   if (!raw || typeof raw !== 'object') return raw;
   const row = { ...raw };
 
@@ -580,13 +580,11 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
     const departmentsCol = getDbCollection('departments');
     const designationsCol = getDbCollection('designations');
     const cyclesCol = getDbCollection('cycles');
-    const usersCol = getDbCollection('users');
 
     const existingEmployees = await (await employeesCol.find({})).toArray();
     const existingDepartments = await (await departmentsCol.find({})).toArray();
     const existingDesignations = await (await designationsCol.find({})).toArray();
     const existingCycles = await (await cyclesCol.find({ active: { $ne: false } })).toArray();
-    const existingUsers = await (await usersCol.find({})).toArray();
 
     const empCodeMap = new Set(existingEmployees.map((e) => String(e.employeeCode || '').trim().toUpperCase()));
     const empObjMap = new Map<string, any>();
@@ -594,7 +592,6 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
       if (e.employeeCode) empObjMap.set(String(e.employeeCode).trim().toUpperCase(), e);
     });
     const empEmailMap = new Set(existingEmployees.map((e) => String(e.email || '').trim().toLowerCase()));
-    const userEmailMap = new Set(existingUsers.map((u) => String(u.email || '').trim().toLowerCase()));
 
     const deptNameSet = new Set(existingDepartments.map((d) => String(d.name || '').trim().toLowerCase()));
     const deptCodeSet = new Set(existingDepartments.map((d) => String(d.code || '').trim().toLowerCase()));
@@ -841,7 +838,7 @@ bulkRouter.post('/validate/:type', async (req: AuthenticatedRequest, res: Respon
 bulkRouter.post('/import/:type', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const datasetType = req.params.type as BulkDatasetType;
-    const { rows, skipInvalid = true, allowUpdateExisting = true, fileName = 'bulk_upload.xlsx' } = req.body;
+    const { rows, allowUpdateExisting = true, fileName = 'bulk_upload.xlsx' } = req.body;
     const currentUser = req.user;
 
     if (!Array.isArray(rows) || rows.length === 0) {

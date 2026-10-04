@@ -22,25 +22,6 @@ export function validateBody<T extends z.ZodTypeAny>(schema: T) {
 }
 
 /**
- * Express middleware to validate req.query against a Zod schema
- */
-export function validateQuery<T extends z.ZodTypeAny>(schema: T) {
-  return (req: Request, res: Response, next: NextFunction) => {
-    const result = schema.safeParse(req.query);
-    if (!result.success) {
-      const errorDetails = formatZodErrors(result.error);
-      const detailMsg = errorDetails.map((d) => d.message).join('; ');
-      return res.status(400).json({
-        error: detailMsg ? `Invalid query parameters: ${detailMsg}` : 'Invalid query parameters.',
-        details: errorDetails,
-      });
-    }
-    req.query = result.data as any;
-    next();
-  };
-}
-
-/**
  * Format Zod errors into a clean array of field-level errors
  */
 function formatZodErrors(error: ZodError): Array<{ field: string; message: string }> {
@@ -70,10 +51,6 @@ export const ChangePasswordSchema = z
     path: ['confirmPassword'],
   });
 
-export const RefreshTokenSchema = z.object({
-  refreshToken: z.string().min(1, 'Refresh token is required'),
-});
-
 // ============================================================================
 // 2. KRA SCHEMAS
 // ============================================================================
@@ -91,7 +68,7 @@ export const CreateKraSchema = z.object({
 
 export const UpdateKraSchema = CreateKraSchema.partial();
 
-export const KraTemplateItemSchema = z.object({
+const KraTemplateItemSchema = z.object({
   id: z.string().optional(),
   kraId: z.string().optional(),
   kraName: z.string().optional(),
@@ -131,7 +108,7 @@ export const KraTemplateSchema = z.object({
 // 3. QUARTERLY REVIEW SCHEMAS
 // ============================================================================
 
-export const ReviewKraSnapshotItemSchema = z.object({
+const ReviewKraSnapshotItemSchema = z.object({
   id: z.string().optional(),
   kraId: z.string().optional(),
   kraName: z.string().optional(),
@@ -180,15 +157,6 @@ export const SubmitManagerReviewSchema = z
       path: ['kraSnapshot'],
     }
   );
-
-export const FinalizeAppraisalSchema = z.object({
-  remarks: z.string().trim().max(3000).optional(),
-  updateEmployeeCtc: z.boolean().optional().default(true),
-});
-
-export const ReturnReviewSchema = z.object({
-  remarks: z.string().trim().min(3, 'Return remarks must be at least 3 characters long').max(2000),
-});
 
 // ============================================================================
 // 4. APPRAISAL & CALIBRATION SCHEMAS
@@ -262,7 +230,7 @@ export const AcknowledgementSchema = z.object({
 // 5. PERFORMANCE IMPROVEMENT PLAN (PIP) SCHEMAS
 // ============================================================================
 
-export const PipGoalSchema = z.object({
+const PipGoalSchema = z.object({
   id: z.string().optional(),
   description: z.string().trim().min(3, 'Goal description is required').max(1000),
   targetMetric: z.string().max(500).optional(),
@@ -290,7 +258,7 @@ export const UpdatePipSchema = CreatePipSchema.partial().extend({
   employeeId: z.string().min(1).optional(),
 });
 
-export const PipGoalRatingEntrySchema = z.object({
+const PipGoalRatingEntrySchema = z.object({
   goalId: z.string().min(1),
   rating: z.number().int().min(1).max(5),
 });

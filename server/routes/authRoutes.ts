@@ -2,7 +2,6 @@ import express, { Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import { getDbCollection, getDatabaseStatus } from '../db.js';
 import {
-  generateToken,
   generateAccessToken,
   generateRefreshToken,
   verifyRefreshToken,
@@ -12,7 +11,7 @@ import {
   recordAuditLog,
   AuthenticatedRequest,
 } from '../auth.js';
-import { validateBody, LoginSchema, ChangePasswordSchema, RefreshTokenSchema } from '../validation.js';
+import { validateBody, LoginSchema, ChangePasswordSchema } from '../validation.js';
 import { User, Employee, Role, UserRole } from '../../src/types/index.js';
 
 export const authRouter = express.Router();

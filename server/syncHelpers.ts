@@ -7,7 +7,6 @@ import {
   KraTemplate,
   Cycle,
   ReviewKraSnapshot,
-  AppraisalQuarterRecord,
 } from '../src/types/index.js';
 import {
   checkEmployeeReviewEligibility,

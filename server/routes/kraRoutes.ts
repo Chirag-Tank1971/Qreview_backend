@@ -236,7 +236,7 @@ kraRouter.post(
   validateBody(KraTemplateSchema),
   async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { title, departmentId, designationId, employeeId, employeeCode, employeeName, items, description, cycleId, cycleCode } = req.body;
+    const { title, departmentId, designationId, employeeId, employeeCode, employeeName, items, cycleId, cycleCode } = req.body;
 
     if (!title || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({

@@ -6,7 +6,6 @@ import {
   AuditTimelineEvent,
   ComplianceFlag,
   ComplianceRiskReport,
-  AuditFilterParams,
   AuditSummaryMetrics,
   ReviewPeriod,
 } from '../../src/types/index.js';
@@ -239,8 +238,7 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
     const kraTemplatesCol = getDbCollection('kraTemplates');
     const reviewsCol = getDbCollection('employeeReviews');
     const appraisalsCol = getDbCollection('appraisals');
-    const auditLogsCol = getDbCollection('auditLogs');
-    const reviewPeriodsCol = getDbCollection<ReviewPeriod>('reviewPeriods');
+    const reviewPeriodsCol = getDbCollection('reviewPeriods');
 
     const allReviewPeriods: ReviewPeriod[] = await (await reviewPeriodsCol.find({})).toArray();
     const periodMap = new Map<string, ReviewPeriod>();
@@ -291,15 +289,6 @@ auditRouter.get('/timeline/:employeeId', async (req: AuthenticatedRequest, res: 
       $or: [{ employeeId: employee.id }, { employeeCode: employee.employeeCode }],
     });
 
-    // 4. Fetch specific Audit Logs for this employee
-    const auditLogs = await (await auditLogsCol.find({
-      $or: [
-        { targetEmployeeId: employee.id },
-        { recordId: employee.id },
-        ...(appraisal ? [{ recordId: appraisal.id }] : []),
-        ...reviews.map((r) => ({ recordId: r.id })),
-      ],
-    })).toArray();
 
     const events: AuditTimelineEvent[] = [];
 

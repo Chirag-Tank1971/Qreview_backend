@@ -99,7 +99,7 @@ export function buildKraSnapshotFromTemplate(template?: KraTemplate | null): Rev
  * 3. If joining date is within the quarter (startDate < joiningDate <= endDate) ->
  *    Tenure is measured from joiningDate to period endDate (inclusive).
  */
-export function calculatePeriodTenureDays(
+function calculatePeriodTenureDays(
   joiningDateStr?: string,
   periodStartDateStr?: string,
   periodEndDateStr?: string

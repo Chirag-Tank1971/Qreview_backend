@@ -6,7 +6,6 @@ import {
   EmployeeReview,
   Appraisal,
   KraTemplate,
-  ReviewPeriod,
 } from '../../src/types/index.js';
 
 export const essRouter = express.Router();
@@ -133,6 +132,46 @@ essRouter.get('/ess/overview/:employeeId?', authenticateToken, async (req: Authe
     let activeKraTemplate: KraTemplate | null = initialTemplate;
     if (!activeKraTemplate && employee.designationId) {
       activeKraTemplate = await kraTemplatesCol.findOne({ designationId: employee.designationId });
+    }
+    if (!activeKraTemplate) {
+      const krasCol = getDbCollection('kras');
+      let itemsList: any[] = [];
+      if (employee.designationId) {
+        itemsList = await krasCol.find({ designationId: employee.designationId, active: true }).toArray();
+      }
+      if (!itemsList.length && employee.departmentId) {
+        itemsList = await krasCol.find({ departmentId: employee.departmentId, active: true }).toArray();
+      }
+      if (!itemsList.length) {
+        itemsList = await krasCol.find({ active: true }).toArray();
+      }
+      if (itemsList.length > 0) {
+        const defaultWeight = Math.floor(100 / itemsList.length);
+        activeKraTemplate = {
+          id: `tpl_assigned_${employee.id}`,
+          title: `${employee.designationName || employee.departmentName || 'Role'} Performance Goals & KRAs`,
+          name: `${employee.designationName || employee.departmentName || 'Role'} Performance Goals & KRAs`,
+          description: `Standard performance metrics and target rubrics assigned for ${employee.name}`,
+          departmentId: employee.departmentId,
+          departmentName: employee.departmentName,
+          designationId: employee.designationId,
+          designationName: employee.designationName,
+          totalWeight: 100,
+          active: true,
+          items: itemsList.map((k, idx) => ({
+            id: k.id,
+            kraId: k.id,
+            kraName: k.title,
+            title: k.title,
+            description: k.description || `Target deliverables for ${k.title}`,
+            target: k.target || (k.targetUnit ? `Target in ${k.targetUnit}` : '100% Target SLA'),
+            measurementCriteria: k.metricType || 'PERCENTAGE',
+            weight: typeof k.weight === 'number' && k.weight > 0
+              ? k.weight
+              : (idx === itemsList.length - 1 ? 100 - defaultWeight * (itemsList.length - 1) : defaultWeight),
+          })),
+        };
+      }
     }
 
     // 5. Calculate longitudinal performance trajectory

@@ -12,7 +12,7 @@ export interface BaseTemplateOptions {
   ctaUrl?: string;
 }
 
-export function renderBaseEmailLayout(options: BaseTemplateOptions): string {
+function renderBaseEmailLayout(options: BaseTemplateOptions): string {
   const {
     headerTitle = 'Enterprise Performance & Appraisal System',
     badge = 'HR Notification',

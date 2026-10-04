@@ -11,7 +11,6 @@ import {
   Employee,
   KraTemplate,
   Cycle,
-  Appraisal,
 } from '../../src/types/index.js';
 
 export interface ReviewGenerationReport {
@@ -275,7 +274,7 @@ export async function generateQuarterlyReviews(
  * `ratingField` lets the same calculator serve the Manager's own score ('rating', default)
  * and the HOD's own independent score ('hodRating') without duplicating the formula.
  */
-export function calculateWeightedScore(
+function calculateWeightedScore(
   kraSnapshot: ReviewKraSnapshot[],
   ratingField: 'rating' | 'hodRating' = 'rating'
 ): number {
@@ -290,10 +289,9 @@ export function calculateWeightedScore(
 
 /**
  * Merges incoming KRA rating/comment fields onto the existing review's KRA snapshot,
- * matching entries by id, kraId, kraName, or title. Shared by saveManagerDraft and
- * submitManagerReview so both stay in sync.
+ * matching entries by id, kraId, kraName, or title. Used by submitManagerReview.
  */
-export function mergeKraSnapshot(
+function mergeKraSnapshot(
   existingSnapshot: ReviewKraSnapshot[] | undefined,
   incomingKras: any[] | undefined
 ): ReviewKraSnapshot[] {
@@ -327,7 +325,7 @@ export function mergeKraSnapshot(
  * rating/achievement/comments are never touched here, regardless of what the incoming
  * payload contains, so HOD scoring can never overwrite the Manager's assessment.
  */
-export function mergeHodKraSnapshot(
+function mergeHodKraSnapshot(
   existingSnapshot: ReviewKraSnapshot[] | undefined,
   incomingHodKras: any[] | undefined
 ): ReviewKraSnapshot[] {
@@ -352,85 +350,6 @@ export function mergeHodKraSnapshot(
     }
     return existingKra;
   });
-}
-
-/**
- * Manager saves draft of review
- */
-export async function saveManagerDraft(
-  reviewId: string,
-  payload: {
-    kraSnapshot?: any[];
-    kraRatings?: any[];
-    strengths?: string;
-    improvements?: string;
-    managerOverallComments?: string;
-  },
-  user: { id: string; name: string; role: any; employeeId?: string }
-): Promise<EmployeeReview> {
-  const reviewCol = getDbCollection('employeeReviews');
-  const review: EmployeeReview | null = await reviewCol.findOne({ id: reviewId });
-  if (!review) {
-    throw new Error('Review not found.');
-  }
-  if (review.isClosed) {
-    throw new Error('This review is closed and cannot be modified.');
-  }
-
-  // Ownership verification
-  const isManager = review.managerId === user.employeeId;
-  const isSuperAdminOrHr = user.role === 'SUPER_ADMIN' || user.role === 'HR';
-  if (!isManager && !isSuperAdminOrHr) {
-    throw new Error('Forbidden: You are not authorized to edit this review.');
-  }
-
-  let finalScore = review.finalScore || 0;
-  let updatedSnapshot = review.kraSnapshot;
-
-  const incomingKras = payload.kraSnapshot || payload.kraRatings;
-  if (incomingKras && Array.isArray(incomingKras)) {
-    updatedSnapshot = mergeKraSnapshot(review.kraSnapshot, incomingKras);
-    finalScore = calculateWeightedScore(updatedSnapshot);
-  }
-
-  const now = new Date().toISOString();
-  const action: ReviewAction = {
-    id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-    reviewId,
-    action: 'DRAFT_SAVED',
-    performedBy: user.id,
-    performedByName: user.name,
-    performedByRole: user.role,
-    remarks: 'Manager saved review draft',
-    performedAt: now,
-  };
-
-  const updated: EmployeeReview = {
-    ...review,
-    kraSnapshot: updatedSnapshot,
-    finalScore,
-    strengths: payload.strengths !== undefined ? payload.strengths : review.strengths,
-    improvements: payload.improvements !== undefined ? payload.improvements : review.improvements,
-    managerOverallComments:
-      payload.managerOverallComments !== undefined ? payload.managerOverallComments : review.managerOverallComments,
-    actionHistory: [...(review.actionHistory || []), action],
-    updatedAt: now,
-  };
-
-  await reviewCol.updateOne({ id: reviewId }, { $set: updated });
-  await recordAuditLog(
-    user.id,
-    user.name,
-    user.role,
-    'EMPLOYEE_REVIEWS',
-    'REVIEW_DRAFT_SAVED',
-    reviewId,
-    String(review.finalScore || 0),
-    String(finalScore),
-    `Saved draft scores for ${review.employeeName}`
-  );
-
-  return updated;
 }
 
 /**
