@@ -23,6 +23,7 @@ import {
   DbStatus,
   SystemConfig,
   PerformanceImprovementPlan,
+  ReviewReturnDraft,
 } from '../src/types/index.js';
 
 let mongoClient: MongoClient | null = null;
@@ -293,6 +294,7 @@ export const memoryDb = {
   emailLogs: new InMemoryCollection<EmailLog>('email_logs', []),
   locations: new InMemoryCollection<any>('locations', []),
   performanceImprovementPlans: new InMemoryCollection<PerformanceImprovementPlan>('performance_improvement_plans', []),
+  reviewReturnDrafts: new InMemoryCollection<ReviewReturnDraft>('review_return_drafts', []),
   systemConfig: new InMemoryCollection<SystemConfig>('system_config', [
     { id: 'default', hodApprovalEnabled: false, selfAssessmentEnabled: false, updatedAt: new Date().toISOString() },
   ]),
@@ -354,6 +356,7 @@ const MONGO_COLLECTION_MAP: Record<string, string> = {
   emailLogs: 'email_logs',
   systemConfig: 'system_config',
   performanceImprovementPlans: 'performance_improvement_plans',
+  reviewReturnDrafts: 'review_return_drafts',
 };
 
 export function getDbCollection(collectionName: keyof typeof memoryDb): any {

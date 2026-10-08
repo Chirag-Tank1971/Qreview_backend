@@ -4,6 +4,7 @@ import { ReviewPeriod, EmployeeReview, Employee, Cycle, PerformanceImprovementPl
 import { syncAllActiveEmployees } from '../syncHelpers.js';
 import { autoActivateCurrentPeriod } from '../services/periodLifecycle.js';
 import { refreshAllOpenAppraisalScores } from '../services/appraisalScoring.js';
+import { runReturnSlaSweep } from '../services/reviewReturnService.js';
 
 // Captured before server.ts's production log-silencing override runs (ES module imports
 // evaluate before the importing module's own top-level code), so these stay callable even
@@ -507,6 +508,19 @@ export function startBackgroundScheduler(): void {
       } else {
         logJob(job, `Completed in ${Date.now() - startedAt}ms — nothing to report, digest skipped.`);
       }
+    } catch (err: any) {
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
+    }
+  });
+
+  // 7. Daily at 09:45 AM: Return SLA — remind whoever holds an overdue KRA return, and
+  // escalate to HR once it is overdue by a further full SLA window.
+  cron.schedule('45 9 * * *', async () => {
+    const job = 'ReturnSlaSweep';
+    const startedAt = Date.now();
+    try {
+      const { reminded, escalated } = await runReturnSlaSweep();
+      logJob(job, `Completed in ${Date.now() - startedAt}ms — ${reminded} reminder(s), ${escalated} escalation(s).`);
     } catch (err: any) {
       errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
     }

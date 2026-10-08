@@ -9,6 +9,7 @@ import {
   ReviewPeriod,
   Appraisal,
   AuditLog,
+  RETURN_REASON_TEMPLATES,
 } from '../../src/types/index.js';
 
 export const reportRouter = Router();
@@ -670,6 +671,178 @@ reportRouter.get('/reports/kra-performance', async (req: AuthenticatedRequest, r
     res.json({ reportData });
   } catch (error: any) {
     res.status(500).json({ error: 'Failed to generate KRA performance report.' });
+  }
+});
+
+/**
+ * 8b. Review Return Analytics
+ * Who gets returns most often (by recipient), which KRAs are returned most, why, and how fast
+ * returns are resolved. Only KRA-level returns (returnRequests) are counted; returns made
+ * before KRA-level returns existed carry no KRA/reason detail.
+ */
+reportRouter.get('/reports/return-analytics', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { periodId } = req.query;
+    const { reviews: scoped } = await getScopedReportData(req);
+    const reviews = periodId && periodId !== 'ALL' ? scoped.filter((r) => r.reviewPeriodId === periodId) : scoped;
+    const now = Date.now();
+    const HOUR = 60 * 60 * 1000;
+
+    type RecipientStat = {
+      recipientId: string;
+      recipientName: string;
+      role: 'MANAGER' | 'HOD';
+      reviewsHandled: number;
+      returnsReceived: number;
+      reviewsReturned: Set<string>;
+      krasReturned: number;
+      resolutionHours: number[];
+      open: number;
+      overdue: number;
+    };
+    const recipients = new Map<string, RecipientStat>();
+    const kraStats = new Map<string, { kraName: string; timesReturned: number; reviewsWithKra: number; ratingChanged: number }>();
+    const reasonStats = new Map<string, number>();
+    const byInitiator = { HOD: 0, HR: 0 };
+    let totalReturns = 0;
+    let fullReturns = 0;
+    let totalKrasReturned = 0;
+    let open = 0;
+    let overdue = 0;
+    const allResolutionHours: number[] = [];
+    const reviewsWithReturns = new Set<string>();
+
+    const recipientFor = (r: EmployeeReview, role: 'MANAGER' | 'HOD'): RecipientStat => {
+      const id = role === 'HOD' ? r.hodId || 'unassigned-hod' : r.managerId || 'unassigned-manager';
+      const key = `${role}:${id}`;
+      if (!recipients.has(key)) {
+        recipients.set(key, {
+          recipientId: id,
+          recipientName: (role === 'HOD' ? r.hodName : r.managerName) || 'Unassigned',
+          role,
+          reviewsHandled: 0,
+          returnsReceived: 0,
+          reviewsReturned: new Set(),
+          krasReturned: 0,
+          resolutionHours: [],
+          open: 0,
+          overdue: 0,
+        });
+      }
+      return recipients.get(key)!;
+    };
+
+    for (const r of reviews) {
+      recipientFor(r, 'MANAGER').reviewsHandled++;
+      if (r.hodId) recipientFor(r, 'HOD').reviewsHandled++;
+
+      for (const k of r.kraSnapshot || []) {
+        const name = k.kraName || k.title || 'General KRA';
+        if (!kraStats.has(name)) kraStats.set(name, { kraName: name, timesReturned: 0, reviewsWithKra: 0, ratingChanged: 0 });
+        kraStats.get(name)!.reviewsWithKra++;
+      }
+
+      const seenGroups = new Set<string>();
+      for (const req of r.returnRequests || []) {
+        // A "return to both" is two linked requests (Manager + HOD) but one return.
+        const groupKey = req.groupId || req.id;
+        const firstOfGroup = !seenGroups.has(groupKey);
+        seenGroups.add(groupKey);
+        reviewsWithReturns.add(r.id);
+        totalKrasReturned += req.kraIds.length;
+        if (firstOfGroup) {
+          totalReturns++;
+          byInitiator[req.returnedByRole] = (byInitiator[req.returnedByRole] || 0) + 1;
+          if (req.isFullReturn) fullReturns++;
+          req.reasonCodes.forEach((code) => reasonStats.set(code, (reasonStats.get(code) || 0) + 1));
+          if (req.reasonCodes.length === 0) reasonStats.set('UNSPECIFIED', (reasonStats.get('UNSPECIFIED') || 0) + 1);
+        }
+
+        const stat = recipientFor(r, req.target);
+        stat.returnsReceived++;
+        stat.reviewsReturned.add(r.id);
+        stat.krasReturned += req.kraIds.length;
+
+        if (req.status === 'OPEN') {
+          open++;
+          stat.open++;
+          if (new Date(req.dueAt).getTime() < now) {
+            overdue++;
+            stat.overdue++;
+          }
+        } else if (req.status === 'RESOLVED' && req.resolvedAt) {
+          const hours = (new Date(req.resolvedAt).getTime() - new Date(req.createdAt).getTime()) / HOUR;
+          if (Number.isFinite(hours) && hours >= 0) {
+            stat.resolutionHours.push(hours);
+            allResolutionHours.push(hours);
+          }
+        }
+
+        const snapById = new Map((r.kraSnapshot || []).map((k) => [k.id, k]));
+        req.kraIds.forEach((id, i) => {
+          const name = snapById.get(id)?.kraName || snapById.get(id)?.title || req.kraTitles[i] || 'General KRA';
+          if (!kraStats.has(name)) kraStats.set(name, { kraName: name, timesReturned: 0, reviewsWithKra: 0, ratingChanged: 0 });
+          kraStats.get(name)!.timesReturned++;
+        });
+        (req.changes || []).forEach((c) => {
+          if (c.before !== c.after && kraStats.has(c.kraName)) kraStats.get(c.kraName)!.ratingChanged++;
+        });
+      }
+    }
+
+    const avg = (xs: number[]) => (xs.length ? Number((xs.reduce((a, b) => a + b, 0) / xs.length).toFixed(1)) : null);
+
+    const byRecipient = Array.from(recipients.values())
+      .filter((s) => s.returnsReceived > 0)
+      .map((s) => ({
+        recipientId: s.recipientId,
+        recipientName: s.recipientName,
+        role: s.role,
+        reviewsHandled: s.reviewsHandled,
+        returnsReceived: s.returnsReceived,
+        reviewsReturned: s.reviewsReturned.size,
+        returnRatePercent: s.reviewsHandled ? Number(((s.reviewsReturned.size / s.reviewsHandled) * 100).toFixed(1)) : 0,
+        avgKrasPerReturn: Number((s.krasReturned / s.returnsReceived).toFixed(1)),
+        avgResolutionHours: avg(s.resolutionHours),
+        open: s.open,
+        overdue: s.overdue,
+      }))
+      .sort((a, b) => b.returnsReceived - a.returnsReceived || b.returnRatePercent - a.returnRatePercent);
+
+    const byKra = Array.from(kraStats.values())
+      .filter((k) => k.timesReturned > 0)
+      .map((k) => ({
+        ...k,
+        returnRatePercent: k.reviewsWithKra ? Number(((k.timesReturned / k.reviewsWithKra) * 100).toFixed(1)) : 0,
+        ratingChangedPercent: k.timesReturned ? Number(((k.ratingChanged / k.timesReturned) * 100).toFixed(1)) : 0,
+      }))
+      .sort((a, b) => b.timesReturned - a.timesReturned);
+
+    const reasonLabels = new Map(RETURN_REASON_TEMPLATES.map((t) => [t.code as string, t.label]));
+    const byReason = Array.from(reasonStats.entries())
+      .map(([code, count]) => ({ code, label: reasonLabels.get(code) || 'Not specified', count }))
+      .sort((a, b) => b.count - a.count);
+
+    res.json({
+      summary: {
+        totalReviews: reviews.length,
+        totalReturns,
+        reviewsReturned: reviewsWithReturns.size,
+        returnRatePercent: reviews.length ? Number(((reviewsWithReturns.size / reviews.length) * 100).toFixed(1)) : 0,
+        fullReturns,
+        partialReturns: totalReturns - fullReturns,
+        avgKrasPerReturn: totalReturns ? Number((totalKrasReturned / totalReturns).toFixed(1)) : 0,
+        avgResolutionHours: avg(allResolutionHours),
+        open,
+        overdue,
+        byInitiator,
+      },
+      reportData: byRecipient,
+      byKra,
+      byReason,
+    });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to generate return analytics report.' });
   }
 });
 

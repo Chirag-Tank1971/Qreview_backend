@@ -21,7 +21,7 @@ export type DashboardUrgency = 'OVERDUE' | 'DUE_SOON' | 'UPCOMING' | 'NO_DATE';
 /** Where a task's action button takes the user — mirrors App.tsx handleNavigate(view, params). */
 export interface DashboardTaskLink {
   view:
-    | 'portal'
+    | 'dashboard'
     | 'reviews'
     | 'appraisals'
     | 'pip'
@@ -61,19 +61,22 @@ export interface DashboardPeriod {
   startDate: string;
   endDate: string;
   dueDate: string;
-  daysRemaining: number;
-  completionRate: number;
 }
 
 export interface DashboardMyReview {
   employee: {
     id: string;
     name: string;
+    employeeCode?: string;
     designationName?: string;
     departmentName?: string;
     managerName?: string;
     hodName?: string;
     cycleName?: string;
+    email?: string;
+    phone?: string;
+    joiningDate?: string;
+    status?: string;
   };
   currentReview: {
     id: string;
@@ -83,6 +86,26 @@ export interface DashboardMyReview {
     isSelfSubmitted: boolean;
     finalScore?: number;
     dueDate?: string;
+  } | null;
+  /** Snapshot of the active/most-recent annual appraisal for this employee */
+  activeAppraisal: {
+    id: string;
+    appraisalYear: number;
+    appraisalMonth: number;
+    status: string;
+    isLocked: boolean;
+    averageQuarterlyScore?: number;
+    suggestedIncrementMin?: number;
+    suggestedIncrementMax?: number;
+    recommendedRating?: string;
+    managerRecommendedIncrement?: number;
+    hrApprovedIncrement?: number;
+    ctcBreakdown?: {
+      currentCTC?: number;
+      newCTC?: number;
+      incrementAmount?: number;
+    };
+    acknowledged: boolean;
   } | null;
   /** Average of the last four manager-evaluated quarters (same rule as the appraisal matrix). */
   rollingScore: number;
@@ -139,32 +162,6 @@ export interface DashboardDepartmentProgress {
   status: 'Completed' | 'In Progress' | 'Not Started';
 }
 
-export interface DashboardAppraisalHealth {
-  totalEmployees: number;
-  draft: number;
-  selfReview: number;
-  managerReview: number;
-  hrReview: number;
-  calibration: number;
-  locked: number;
-}
-
-export interface DashboardRatingDistribution {
-  rating: number;
-  count: number;
-  benchmark: number;
-}
-
-export interface DashboardActivityItem {
-  id: string;
-  actorName: string;
-  initials: string;
-  action: string;
-  description: string;
-  timestamp: string;
-  relativeTime: string;
-}
-
 export interface DashboardUpcomingEvent {
   id: string;
   title: string;
@@ -176,27 +173,73 @@ export interface DashboardUpcomingEvent {
   daysText: string;
 }
 
-export interface DashboardComplianceStatus {
-  lastAuditEvent: {
-    description: string;
-    actorName: string;
-    relativeTime: string;
-  } | null;
-  workflowStatus: {
-    isActive: boolean;
-    statusText: string;
-    pendingIssuesCount: number;
-  };
-  lastDataSync: {
-    statusText: string;
-    formattedTime: string;
-  };
+/** Who in scope has no review for the active period, grouped by the eligibility check that blocks them. */
+export interface DashboardCoverage {
+  periodName: string;
+  inScope: number;
+  withReview: number;
+  missing: number;
+  reasons: {
+    key: 'NO_MANAGER' | 'NO_KRA' | 'START_LATER' | 'TENURE' | 'READY' | 'OTHER';
+    label: string;
+    hint: string;
+    count: number;
+    people: string[];
+    link: DashboardTaskLink;
+  }[];
+}
+
+/** A Manager or HOD with active-period reviews waiting on them. */
+export interface DashboardReviewerBacklog {
+  reviewerId: string;
+  reviewerName: string;
+  role: 'MANAGER' | 'HOD';
+  pending: number;
+  employees: string[];
+  oldestWaitingDays: number;
+  overdueDays: number;
+  lastRemindedAt?: string;
+}
+
+/** Active-period rating spread vs the Bell Curve targets, Manager/HOD disagreement and returns. */
+export interface DashboardCalibration {
+  scored: number;
+  bands: {
+    key: 'OUTSTANDING' | 'EXCEEDS_EXPECTATIONS' | 'MEETS_EXPECTATIONS' | 'NEEDS_IMPROVEMENT';
+    label: string;
+    count: number;
+    percent: number;
+    targetPercent: number;
+  }[];
+  krasCompared: number;
+  krasDisagreeing: number;
+  reviewsWithDisagreement: number;
+  returnsThisCycle: number;
+  returnsOpen: number;
+  returnsOverdue: number;
+}
+
+export interface DashboardDataHealthItem {
+  key: string;
+  label: string;
+  count: number;
+  people: string[];
+  link: DashboardTaskLink;
+}
+
+export interface DashboardEmailDelivery {
+  days: number;
+  providerConfigured: boolean;
+  sent: number;
+  failed: number;
+  skipped: number;
+  queued: number;
+  recentFailures: { recipientName: string; subject: string; error?: string; at: string }[];
 }
 
 export interface DashboardHrOverview {
   totalEmployees: number;
   totalDepartments: number;
-  employeeTrendPercent: number;
   reviewsTotal: number;
   reviewsCompleted: number;
   reviewsPendingHr: number;
@@ -204,18 +247,13 @@ export interface DashboardHrOverview {
   reviewsPendingManager: number;
   completionRate: number;
   pendingAppraisals: number;
-  appraisalsTrendPercent: number;
   employeesWithoutKras: number;
   kraCoverageRate: number;
-  kraCoverageLabel: 'Low' | 'Medium' | 'High';
-  reviewOnTimeRate: number;
-  reviewOnTimeTrendPercent: number;
   departmentProgress: DashboardDepartmentProgress[];
-  appraisalHealth: DashboardAppraisalHealth;
-  performanceDistribution: DashboardRatingDistribution[];
-  recentActivity: DashboardActivityItem[];
   upcomingEvents: DashboardUpcomingEvent[];
-  compliance: DashboardComplianceStatus;
+  coverage: DashboardCoverage | null;
+  reviewerBacklog: DashboardReviewerBacklog[];
+  calibration: DashboardCalibration;
   alerts: {
     id: string;
     type: 'crit' | 'warn' | 'info';
@@ -224,30 +262,15 @@ export interface DashboardHrOverview {
     actionLabel?: string;
     link?: DashboardTaskLink;
   }[];
-  cycleBreakdowns?: Record<
-    string,
-    {
-      key: string;
-      label: string;
-      appraisalHealth: DashboardAppraisalHealth;
-      performanceDistribution: DashboardRatingDistribution[];
-      totalStaff: number;
-      averageScore?: number | null;
-      highPerformersCount?: number;
-    }
-  >;
 }
 
 export interface DashboardHodOverview {
   departmentName: string;
-  departmentId: string;
   totalEmployees: number;
   reviewsTotal: number;
   reviewsCompleted: number;
   reviewsPendingHod: number;
   completionRate: number;
-  pendingAppraisals: number;
-  kraCoverageRate: number;
   averageScore: number | null;
   highPerformersCount: number;
   ratingSpread: {
@@ -268,8 +291,6 @@ export interface DashboardHodOverview {
     lastScore?: number;
     onPip: boolean;
   }[];
-  performanceDistribution: DashboardRatingDistribution[];
-  recentActivity: DashboardActivityItem[];
   alerts: {
     id: string;
     type: 'crit' | 'warn' | 'info';
@@ -285,46 +306,9 @@ export interface DashboardAdminOverview {
   activeUsers: number;
   totalEmployees: number;
   totalDepartments: number;
-  totalDesignations: number;
-  totalCycles: number;
-  activeCycleName?: string;
-  activeCycleId?: string;
-  activePeriodId?: string;
   activePeriodName?: string;
-  activePeriodStatus?: string;
-  activePeriodStart?: string;
-  activePeriodEnd?: string;
-  totalTemplates: number;
-  totalAuditLogs: number;
-  systemStatus: 'HEALTHY' | 'DEGRADED' | 'MAINTENANCE';
-  /** Count of employees who joined in the current calendar month */
   newJoinersThisMonth: number;
-  /** Count of employees who joined last calendar month (for trend) */
-  newJoinersLastMonth: number;
-  /** Count of employees who left (isPastEmployee) this month */
   exitsThisMonth: number;
-  /** Count of employees who left last month */
-  exitsLastMonth: number;
-  /** Employee count last month (for % change badge) */
-  totalEmployeesLastMonth: number;
-  /** Pending appraisals needing calibration/approval */
-  pendingApprovalsCount: number;
-  /** Count of actionable system alerts */
-  systemAlertsCount: number;
-  /** Monthly headcount trend: last 7 months with total employees & new joiners */
-  headcountTrend: {
-    month: string;       // e.g. "Apr", "May"
-    total: number;
-    newJoiners: number;
-  }[];
-  /** Distribution of active employees across departments */
-  departmentDistribution: {
-    departmentId: string;
-    departmentName: string;
-    count: number;
-    percentage: number;
-  }[];
-  /** Per-department review completion progress for the active period */
   reviewCycleProgress: {
     departmentId: string;
     departmentName: string;
@@ -332,7 +316,6 @@ export interface DashboardAdminOverview {
     reviewed: number;
     completionRate: number;
   }[];
-  /** Items needing admin attention */
   attentionItems: {
     id: string;
     icon: 'warning' | 'info' | 'calendar' | 'user';
@@ -342,21 +325,8 @@ export interface DashboardAdminOverview {
     count: number;
     link: DashboardTaskLink;
   }[];
-  recentSecurityEvents: DashboardActivityItem[];
-  masterBreakdown: {
-    name: string;
-    count: number;
-    description: string;
-    route: DashboardTaskLink['view'];
-  }[];
-  alerts: {
-    id: string;
-    type: 'crit' | 'warn' | 'info';
-    title: string;
-    detail?: string;
-    actionLabel?: string;
-    link?: DashboardTaskLink;
-  }[];
+  dataHealth: DashboardDataHealthItem[];
+  emailDelivery: DashboardEmailDelivery;
 }
 
 export interface DashboardSummary {

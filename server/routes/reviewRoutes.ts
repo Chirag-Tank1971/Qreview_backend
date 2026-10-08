@@ -34,6 +34,18 @@ import {
   checkEmployeeReviewEligibility,
   createQuarterlyReview,
 } from '../services/reviewEligibility.js';
+import {
+  createReviewReturn,
+  applyReturnEdits,
+  describeChanges,
+  getReturnPolicy,
+  updateReturnPolicy,
+  getReturnCount,
+  getReturnDraft,
+  saveReturnDraft,
+  deleteReturnDraft,
+} from '../services/reviewReturnService.js';
+import { RETURN_REASON_TEMPLATES } from '../../src/types/index.js';
 
 export const reviewRouter = express.Router();
 
@@ -627,6 +639,94 @@ reviewRouter.get(
 );
 
 /**
+ * GET /api/reviews/return-policy
+ * Return limit, limit behaviour, SLA days and the standard reason templates.
+ */
+reviewRouter.get('/reviews/return-policy', async (_req: AuthenticatedRequest, res: Response) => {
+  try {
+    const policy = await getReturnPolicy();
+    res.json({ ...policy, reasonTemplates: RETURN_REASON_TEMPLATES });
+  } catch (error: any) {
+    res.status(500).json({ error: 'Failed to load return policy.' });
+  }
+});
+
+/**
+ * PUT /api/reviews/return-policy
+ * HR / Super Admin update the return limit, limit behaviour and SLA.
+ */
+reviewRouter.put(
+  '/reviews/return-policy',
+  requireRoles('SUPER_ADMIN', 'HR'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const policy = await updateReturnPolicy(req.body || {}, {
+        id: req.user!.id,
+        name: req.user!.name,
+        role: req.user!.role,
+      });
+      res.json({ ...policy, reasonTemplates: RETURN_REASON_TEMPLATES });
+    } catch (error: any) {
+      res.status(400).json({ error: error.message || 'Failed to update return policy.' });
+    }
+  }
+);
+
+/** Only the people who can actually return a review may keep a return draft for it. */
+function canDraftReturn(req: AuthenticatedRequest, review: EmployeeReview): boolean {
+  const role = req.user?.role;
+  if (role === 'SUPER_ADMIN' || role === 'HR') return true;
+  return Boolean(review.hodId && review.hodId === req.user?.employeeId);
+}
+
+/**
+ * GET/PUT/DELETE /api/reviews/:id/return-draft
+ * The caller's in-progress return selection (KRAs, comments, reason) for this review.
+ */
+reviewRouter.get(
+  '/reviews/:id/return-draft',
+  authorizeReviewAccess('read'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (!canDraftReturn(req, req.review!)) return res.json({ draft: null });
+      const draft = await getReturnDraft(req.params.id, req.user!.id);
+      res.json({ draft, returnCount: getReturnCount(req.review!) });
+    } catch (error: any) {
+      res.status(500).json({ error: 'Failed to load return draft.' });
+    }
+  }
+);
+
+reviewRouter.put(
+  '/reviews/:id/return-draft',
+  authorizeReviewAccess('read'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (!canDraftReturn(req, req.review!)) {
+        return res.status(403).json({ error: 'Forbidden: You cannot return this review.' });
+      }
+      const draft = await saveReturnDraft(req.review!, req.user!.id, req.body || {});
+      res.json({ draft });
+    } catch (error: any) {
+      res.status(500).json({ error: 'Failed to save return draft.' });
+    }
+  }
+);
+
+reviewRouter.delete(
+  '/reviews/:id/return-draft',
+  authorizeReviewAccess('read'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      await deleteReturnDraft(req.params.id, req.user!.id);
+      res.json({ success: true });
+    } catch (error: any) {
+      res.status(500).json({ error: 'Failed to discard return draft.' });
+    }
+  }
+);
+
+/**
  * GET /api/reviews/:id
  * Protected by authorizeReviewAccess('read')
  */
@@ -978,6 +1078,7 @@ reviewRouter.put(
       employeeComments,
       hrComments,
       isDraft,
+      returnResponses,
     } = req.body;
 
     const reviewCol = getDbCollection('employeeReviews');
@@ -1008,23 +1109,6 @@ reviewRouter.put(
       return res.status(400).json({ error: 'Cannot score review: This employee is marked INACTIVE (Offboarded/Exited).' });
     }
 
-    // Calculate real-time weighted score: sum(rating * weight) / 100
-    let totalWeightedScore = 0;
-    const updatedSnapshot: ReviewKraSnapshot[] = (kraSnapshot || existing.kraSnapshot).map((k: any) => {
-      const rating = Number(k.rating) || 0;
-      const weight = Number(k.weight) || 0;
-      totalWeightedScore += (rating * weight) / 100;
-
-      return {
-        ...k,
-        rating,
-        weight,
-        achievement: k.achievement || '',
-        comments: k.comments || '',
-      };
-    });
-
-    const managerScore = Number(totalWeightedScore.toFixed(2));
     const isSubmitting = !isDraft;
 
     // If HR returned this review directly to the manager (status 'RETURNED'), resubmission
@@ -1049,11 +1133,65 @@ reviewRouter.put(
     }
     const managerSubmitHodMissing = submittedByManager && !existing.hodId;
 
+    // Merge ONLY the manager-owned fields onto the stored snapshot (matched by id). Self and
+    // HOD fields, weights and targets always come from the stored review, never the client.
+    const incomingList: any[] = Array.isArray(kraSnapshot) ? kraSnapshot : [];
+    const mergedSnapshot: ReviewKraSnapshot[] = (existing.kraSnapshot || []).map((stored) => {
+      const k =
+        incomingList.find((inc) => inc.id === stored.id) ||
+        incomingList.find((inc) => inc.kraId && inc.kraId === stored.kraId);
+      if (!k) return stored;
+      return {
+        ...stored,
+        rating: Number(k.rating) || 0,
+        achievement: k.achievement || '',
+        comments: k.comments || '',
+        issueReason: k.issueReason ?? stored.issueReason,
+        ratingJustification: k.ratingJustification || '',
+      };
+    });
+
+    // KRA-level return: lock un-returned KRAs, require every returned KRA to be addressed.
+    const returnPolicy = await getReturnPolicy();
+    let returnEdits: ReturnType<typeof applyReturnEdits>;
+    try {
+      returnEdits = applyReturnEdits({
+        existing,
+        merged: mergedSnapshot,
+        target: 'MANAGER',
+        responses: returnResponses,
+        isDraft: !isSubmitting,
+        user: { id: req.user?.id || 'system', name: req.user?.name || 'Manager' },
+        routesToHod: newStatus === 'HOD_PENDING',
+        returnSlaDays: returnPolicy.returnSlaDays,
+      });
+    } catch (validationErr: any) {
+      return res.status(400).json({ error: validationErr.message });
+    }
+    const updatedSnapshot = returnEdits.snapshot;
+    const resolvedReturn = returnEdits.resolvedRequest;
+
+    // HR returned to both: the Manager's resubmission goes to the HOD (not straight to HR).
+    const activatedHodLeg = returnEdits.activatedRequest;
+    if (activatedHodLeg) {
+      newStatus = 'HOD_PENDING';
+      skippedHodForHrReturn = false;
+    }
+
+    // Calculate real-time weighted score: sum(rating * weight) / 100
+    const totalWeightedScore = updatedSnapshot.reduce(
+      (sum, k) => sum + ((Number(k.rating) || 0) * (Number(k.weight) || 0)) / 100,
+      0
+    );
+    const managerScore = Number(totalWeightedScore.toFixed(2));
+
     // Official finalScore: Manager's own score until HOD has also independently scored,
-    // at which point it becomes the average of the two (HOD's own score is never altered here).
+    // at which point it becomes the average of the two. HOD's own score is never altered here,
+    // except that resolving an HOD return resets it until the HOD re-scores the revised KRAs.
+    const effectiveHodScore = returnEdits.clearedHodScore ? undefined : existing.hodScore;
     const finalScore =
-      existing.hodScore !== undefined && existing.hodScore !== null
-        ? Number(((managerScore + existing.hodScore) / 2).toFixed(2))
+      effectiveHodScore !== undefined && effectiveHodScore !== null
+        ? Number(((managerScore + effectiveHodScore) / 2).toFixed(2))
         : managerScore;
 
     const userRole = req.user?.role || 'MANAGER';
@@ -1063,23 +1201,35 @@ reviewRouter.put(
     const action: ReviewAction = {
       id: `act_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
       reviewId: id,
-      action: managerSubmitHodMissing ? 'HOD_MISSING_EXCEPTION' : isSubmitting ? 'SUBMITTED' : 'DRAFT_SAVED',
+      action: managerSubmitHodMissing ? 'HOD_MISSING_EXCEPTION' : resolvedReturn ? 'RESUBMITTED' : isSubmitting ? 'SUBMITTED' : 'DRAFT_SAVED',
       performedBy: req.user?.id || 'system',
       performedByName: userName,
       performedByRole: userRole,
       remarks: managerSubmitHodMissing
         ? `${roleLabel} submitted evaluation scores with final weighted score: ${finalScore}. No HOD is configured for ${existing.employeeName} — review is blocked pending HOD assignment.`
+        : resolvedReturn
+        ? `${roleLabel} resubmitted after ${resolvedReturn.returnedByRole} return (round ${resolvedReturn.round}) — ${describeChanges(returnEdits.changes || [])}.${
+            activatedHodLeg
+              ? ` Sent to the HOD to re-evaluate ${activatedHodLeg.kraIds.length} KRA${activatedHodLeg.kraIds.length === 1 ? '' : 's'} (${activatedHodLeg.kraTitles.join(', ')}).`
+              : skippedHodForHrReturn
+              ? ' Sent directly back to HR without another HOD pass.'
+              : ''
+          }`
         : skippedHodForHrReturn
         ? `${roleLabel} resubmitted evaluation scores (${managerScore}) after HR return — sent directly back to HR without another HOD pass.`
         : isSubmitting
         ? `${roleLabel} submitted evaluation scores with final weighted score: ${finalScore}`
         : 'Saved score and comment drafts',
+      returnRequestId: resolvedReturn?.id,
+      kraChanges: returnEdits.changes,
       performedAt: new Date().toISOString(),
     };
 
     const updatedReview: EmployeeReview = {
       ...existing,
       kraSnapshot: updatedSnapshot,
+      returnRequests: returnEdits.returnRequests || existing.returnRequests,
+      hodScore: effectiveHodScore,
       finalScore,
       managerScore,
       strengths: strengths !== undefined ? strengths : existing.strengths,
@@ -1136,6 +1286,27 @@ reviewRouter.put(
           },
           { upsert: true }
         );
+      } else if (activatedHodLeg && existing.hodId) {
+        // Second leg of HR's return to both — now the HOD's turn.
+        await notifsCol.insertOne({
+          id: `notif_${id}_${activatedHodLeg.id}`,
+          userId: existing.hodId,
+          userRole: 'HOD',
+          type: 'RETURNED',
+          title: `Review Returned by HR: ${existing.employeeName}`,
+          message: `HR returned ${activatedHodLeg.kraIds.length} KRA${activatedHodLeg.kraIds.length === 1 ? '' : 's'} on ${existing.employeeName}'s ${existing.reviewPeriodName} review for you to re-evaluate (${activatedHodLeg.kraTitles.join(', ')}). The Manager has finished their changes: ${describeChanges(returnEdits.changes || [])}. Reason: ${activatedHodLeg.reason}`,
+          isRead: false,
+          priority: 'HIGH',
+          metadata: {
+            reviewId: id,
+            periodId: existing.reviewPeriodId,
+            status: newStatus,
+            returnRequestId: activatedHodLeg.id,
+            kraIds: activatedHodLeg.kraIds,
+            dueAt: activatedHodLeg.dueAt,
+          },
+          createdAt: now,
+        });
       } else if (skippedHodForHrReturn) {
         // HR returned this directly to the manager — resubmission goes straight back to HR.
         await notifsCol.updateOne(
@@ -1147,7 +1318,9 @@ reviewRouter.put(
               userRole: 'HR',
               type: 'HR_PENDING',
               title: `Review Resubmitted: ${existing.employeeName}`,
-              message: `${req.user?.name || 'Manager'} resubmitted evaluation scores (${managerScore}) for ${existing.employeeName} after your return. Ready for your review.`,
+              message: resolvedReturn
+                ? `${req.user?.name || 'Manager'} re-evaluated the returned KRAs for ${existing.employeeName}: ${describeChanges(returnEdits.changes || [])}. Ready for your review.`
+                : `${req.user?.name || 'Manager'} resubmitted evaluation scores (${managerScore}) for ${existing.employeeName} after your return. Ready for your review.`,
               isRead: false,
               priority: 'HIGH',
               metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: newStatus },
@@ -1166,8 +1339,12 @@ reviewRouter.put(
               userId: existing.hodId,
               userRole: 'HOD',
               type: 'HOD_PENDING',
-              title: `Review Ready for Your Approval: ${existing.employeeName}`,
-              message: `${req.user?.name || 'Manager'} submitted evaluation scores (${finalScore}) for ${existing.employeeName}. Ready for HOD review.`,
+              title: resolvedReturn
+                ? `Returned KRAs Revised: ${existing.employeeName}`
+                : `Review Ready for Your Approval: ${existing.employeeName}`,
+              message: resolvedReturn
+                ? `${req.user?.name || 'Manager'} re-evaluated the ${resolvedReturn.kraIds.length} KRA${resolvedReturn.kraIds.length === 1 ? '' : 's'} you returned for ${existing.employeeName}: ${describeChanges(returnEdits.changes || [])}. Please re-score those KRAs.`
+                : `${req.user?.name || 'Manager'} submitted evaluation scores (${finalScore}) for ${existing.employeeName}. Ready for HOD review.`,
               isRead: false,
               priority: 'MEDIUM',
               metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: newStatus },
@@ -1245,7 +1422,8 @@ reviewRouter.put(
       // the review lands — the actual DB status still uses the existing enum values (HOD_PENDING),
       // and the returnTarget below carries the distinction for badges/audit history.
       const returnTarget: 'MANAGER' | 'HOD' = status === 'RETURNED' && target === 'HOD' ? 'HOD' : 'MANAGER';
-      if (status === 'RETURNED' && returnTarget === 'HOD' && !existing.hodId) {
+      const returnToBoth = status === 'RETURNED' && target === 'BOTH';
+      if (status === 'RETURNED' && (returnTarget === 'HOD' || returnToBoth) && !existing.hodId) {
         return res.status(400).json({ error: 'Cannot return to HOD: no HOD is configured for this employee.' });
       }
       const effectiveStatus: ReviewStatus = status === 'RETURNED' && returnTarget === 'HOD' ? 'HOD_PENDING' : status;
@@ -1274,17 +1452,38 @@ reviewRouter.put(
         });
       }
 
+      // Returns (to Manager or HOD) carry a KRA selection, reason codes, an SLA and a return
+      // limit — all handled by the shared return service.
+      if (status === 'RETURNED') {
+        try {
+          const updated = await createReviewReturn(
+            existing,
+            {
+              target: returnToBoth ? 'BOTH' : returnTarget,
+              kraIds: req.body.kraIds,
+              hodKraIds: req.body.hodKraIds,
+              kraComments: req.body.kraComments,
+              reasonCodes: req.body.reasonCodes,
+              reason: String(remarks),
+            },
+            { id: req.user!.id, name: req.user!.name, role: req.user!.role },
+            'HR'
+          );
+          return res.json(updated);
+        } catch (returnErr: any) {
+          return res.status(400).json({ error: returnErr.message || 'Failed to return review.' });
+        }
+      }
+
       const isClosing = effectiveStatus === 'CLOSED';
       let actionType: ReviewAction['action'] = 'SUBMITTED';
-      if (status === 'RETURNED') actionType = 'RETURNED';
-      else if (effectiveStatus === 'HR_COMPLETED' || effectiveStatus === 'MANAGER_COMPLETED' || effectiveStatus === 'HOD_COMPLETED') actionType = 'APPROVED';
+      if (effectiveStatus === 'HR_COMPLETED' || effectiveStatus === 'MANAGER_COMPLETED' || effectiveStatus === 'HOD_COMPLETED') actionType = 'APPROVED';
       else if (effectiveStatus === 'CLOSED') actionType = 'CLOSED';
 
       const action: ReviewAction = {
         id: `act_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,
         reviewId: id,
         action: actionType,
-        returnTarget: status === 'RETURNED' ? returnTarget : undefined,
         performedBy: req.user?.id || 'system',
         performedByName: req.user?.name || 'Administrator',
         performedByRole: req.user?.role || 'HR',
@@ -1321,45 +1520,7 @@ reviewRouter.put(
       const notifsCol = getDbCollection('notifications');
       const now = new Date().toISOString();
 
-      if (status === 'RETURNED' && returnTarget === 'HOD' && existing.hodId) {
-        await notifsCol.updateOne(
-          { 'metadata.reviewId': id, type: 'RETURNED', userId: existing.hodId },
-          {
-            $set: {
-              id: `notif_${id}_ret_hod`,
-              userId: existing.hodId,
-              userRole: 'HOD',
-              type: 'RETURNED',
-              title: `Review Returned by HR: ${existing.employeeName}`,
-              message: `HR returned the ${existing.reviewPeriodName} review for ${existing.employeeName} to you for recalibration: ${remarks || 'Please re-evaluate scores.'}`,
-              isRead: false,
-              priority: 'HIGH',
-              metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: 'HOD_PENDING' },
-              createdAt: now,
-            },
-          },
-          { upsert: true }
-        );
-      } else if (status === 'RETURNED' && existing.managerId) {
-        await notifsCol.updateOne(
-          { 'metadata.reviewId': id, type: 'RETURNED', userId: existing.managerId },
-          {
-            $set: {
-              id: `notif_${id}_ret`,
-              userId: existing.managerId,
-              userRole: 'MANAGER',
-              type: 'RETURNED',
-              title: `Review Returned by HR: ${existing.employeeName}`,
-              message: `HR returned the ${existing.reviewPeriodName} review for ${existing.employeeName}: ${remarks || 'Please re-evaluate scores.'}`,
-              isRead: false,
-              priority: 'HIGH',
-              metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: 'RETURNED' },
-              createdAt: now,
-            },
-          },
-          { upsert: true }
-        );
-      } else if (effectiveStatus === 'HR_COMPLETED') {
+      if (effectiveStatus === 'HR_COMPLETED') {
         await notifsCol.updateOne(
           { 'metadata.reviewId': id, userId: existing.employeeId, type: 'HR_COMPLETED' },
           {
@@ -1444,6 +1605,7 @@ reviewRouter.put(
       const selfRating = incoming && incoming.selfRating !== undefined ? Number(incoming.selfRating) : (k.selfRating || 0);
       const selfAchievement = incoming && incoming.selfAchievement !== undefined ? incoming.selfAchievement : (k.selfAchievement || '');
       const selfComments = incoming && incoming.selfComments !== undefined ? incoming.selfComments : (k.selfComments || '');
+      const selfJustification = incoming && incoming.selfJustification !== undefined ? incoming.selfJustification : (k.selfJustification || '');
 
       if (selfRating > 0) {
         totalSelfWeightedScore += (selfRating * (k.weight || 0)) / 100;
@@ -1455,6 +1617,7 @@ reviewRouter.put(
         selfRating,
         selfAchievement,
         selfComments,
+        selfJustification,
       };
     });
 
@@ -1685,11 +1848,22 @@ reviewRouter.post(
         return res.status(400).json({ error: 'Return reason is mandatory. Please provide specific feedback.' });
       }
 
-      const updated = await returnReview(id, reason, {
-        id: req.user!.id,
-        name: req.user!.name,
-        role: req.user!.role,
-      });
+      const updated = await returnReview(
+        id,
+        {
+          target: req.body.target === 'HOD' || req.body.target === 'BOTH' ? req.body.target : 'MANAGER',
+          kraIds: req.body.kraIds,
+          hodKraIds: req.body.hodKraIds,
+          kraComments: req.body.kraComments,
+          reasonCodes: req.body.reasonCodes,
+          reason,
+        },
+        {
+          id: req.user!.id,
+          name: req.user!.name,
+          role: req.user!.role,
+        }
+      );
 
       res.json(updated);
     } catch (error: any) {
@@ -1739,12 +1913,21 @@ reviewRouter.post(
         return res.status(400).json({ error: 'Return reason is mandatory. Please provide specific feedback.' });
       }
 
-      const updated = await hodReturnReview(id, reason, {
-        id: req.user!.id,
-        name: req.user!.name,
-        role: req.user!.role,
-        employeeId: req.user!.employeeId,
-      });
+      const updated = await hodReturnReview(
+        id,
+        {
+          kraIds: req.body.kraIds,
+          kraComments: req.body.kraComments,
+          reasonCodes: req.body.reasonCodes,
+          reason,
+        },
+        {
+          id: req.user!.id,
+          name: req.user!.name,
+          role: req.user!.role,
+          employeeId: req.user!.employeeId,
+        }
+      );
 
       res.json(updated);
     } catch (error: any) {

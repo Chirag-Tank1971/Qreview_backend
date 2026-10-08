@@ -1702,7 +1702,7 @@ appraisalRouter.put(
             const { subject, html } = renderAppraisalLetterReleasedEmail({
               employeeName: appraisal.employeeName,
               cycleName: appraisal.cycleName || 'Annual Cycle',
-              appraisalUrl: `${baseUrl}/#portal`,
+              appraisalUrl: `${baseUrl}/#dashboard`,
               effectiveDate: finalEffectiveDate,
             });
             await sendNotificationEmail({

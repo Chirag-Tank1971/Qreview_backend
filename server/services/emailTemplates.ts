@@ -170,6 +170,39 @@ function renderBaseEmailLayout(options: BaseTemplateOptions): string {
 }
 
 /**
+ * Reminder from HR -> Manager / HOD with reviews waiting on them
+ */
+export function renderReviewReminderEmail(data: {
+  reviewerName: string;
+  senderName: string;
+  periodName: string;
+  dueDate?: string;
+  employees: string[];
+  reviewUrl: string;
+}): { subject: string; html: string } {
+  const n = data.employees.length;
+  const subject = `Reminder: ${n} review${n === 1 ? '' : 's'} waiting for you (${data.periodName})`;
+  const html = renderBaseEmailLayout({
+    headerTitle: 'Reviews Waiting for You',
+    badge: 'Action Required',
+    badgeColor: '#d97706', // Amber
+    preheader: `${n} quarterly review${n === 1 ? ' is' : 's are'} waiting for your evaluation.`,
+    contentHtml: `
+      <p>Hello <strong>${data.reviewerName}</strong>,</p>
+      <p><strong>${data.senderName}</strong> from HR is reminding you that the following ${data.periodName} review${n === 1 ? ' is' : 's are'} waiting for you:</p>
+      <div class="info-card">
+        ${data.employees.map((e) => `<div class="info-row">• ${e}</div>`).join('')}
+        ${data.dueDate ? `<div class="info-row"><span class="info-label">Due:</span> <strong>${data.dueDate}</strong></div>` : ''}
+      </div>
+      <p>Please log in and complete your evaluations so the review cycle can close on time.</p>
+    `,
+    ctaText: 'Open My Reviews',
+    ctaUrl: data.reviewUrl,
+  });
+  return { subject, html };
+}
+
+/**
  * 1. Self-Assessment Submitted -> Notify Manager
  */
 export function renderSelfAssessmentSubmittedEmail(data: {

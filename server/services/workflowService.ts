@@ -2,6 +2,7 @@ import { getDbCollection } from '../db.js';
 import { recordAuditLog } from '../auth.js';
 import { checkEmployeeReviewEligibility } from './reviewEligibility.js';
 import { refreshEmployeeAppraisalScores } from './appraisalScoring.js';
+import { createReviewReturn, applyReturnEdits, describeChanges, ReturnInput, ReturnResponses } from './reviewReturnService.js';
 import {
   EmployeeReview,
   ReviewPeriod,
@@ -346,6 +347,7 @@ function mergeHodKraSnapshot(
         hodRating: Number(incoming.hodRating) || 0,
         hodAchievement: incoming.hodAchievement || '',
         hodComments: incoming.hodComments || '',
+        hodJustification: incoming.hodJustification || '',
       };
     }
     return existingKra;
@@ -365,6 +367,7 @@ export async function submitManagerReview(
     strengths?: string;
     improvements?: string;
     managerOverallComments?: string;
+    returnResponses?: ReturnResponses;
   },
   user: { id: string; name: string; role: any; employeeId?: string }
 ): Promise<EmployeeReview> {
@@ -390,6 +393,17 @@ export async function submitManagerReview(
     updatedSnapshot = mergeKraSnapshot(review.kraSnapshot, incomingKras);
   }
 
+  const returnEdits = applyReturnEdits({
+    existing: review,
+    merged: updatedSnapshot,
+    target: 'MANAGER',
+    responses: payload.returnResponses,
+    isDraft: false,
+    user,
+    routesToHod: true,
+  });
+  updatedSnapshot = returnEdits.snapshot;
+
   // Strict Validation: ratings must be between 1 and 5
   for (const kra of updatedSnapshot) {
     if (!kra.rating || kra.rating < 1 || kra.rating > 5) {
@@ -412,14 +426,21 @@ export async function submitManagerReview(
     performedByRole: user.role,
     remarks: hodMissing
       ? `Reporting manager submitted review with final weighted score ${finalScore}. No HOD is configured for ${review.employeeName} — review is blocked pending HOD assignment.`
+      : returnEdits.resolvedRequest
+      ? `Reporting manager resubmitted after return (round ${returnEdits.resolvedRequest.round}) — ${describeChanges(returnEdits.changes || [])}. Score ${finalScore}.`
       : `Reporting manager submitted review with final weighted score ${finalScore}. Transitioned to ${nextStatus}.`,
+    returnRequestId: returnEdits.resolvedRequest?.id,
+    kraChanges: returnEdits.changes,
     performedAt: now,
   };
 
   const updated: EmployeeReview = {
     ...review,
     kraSnapshot: updatedSnapshot,
+    returnRequests: returnEdits.returnRequests || review.returnRequests,
+    hodScore: returnEdits.clearedHodScore ? undefined : review.hodScore,
     finalScore,
+    managerScore: finalScore,
     strengths: payload.strengths !== undefined ? payload.strengths : review.strengths,
     improvements: payload.improvements !== undefined ? payload.improvements : review.improvements,
     managerOverallComments:
@@ -504,6 +525,7 @@ export async function hodApproveReview(
     hodOverallComments?: string;
     hodComments?: string; // legacy alias for hodOverallComments
     isDraft?: boolean;
+    returnResponses?: ReturnResponses;
   },
   user: { id: string; name: string; role: any; employeeId?: string }
 ): Promise<EmployeeReview> {
@@ -524,11 +546,23 @@ export async function hodApproveReview(
   }
 
   const incomingHodKras = payload.kraSnapshot || payload.hodRatings;
-  const updatedSnapshot = incomingHodKras
+  const mergedSnapshot = incomingHodKras
     ? mergeHodKraSnapshot(review.kraSnapshot, incomingHodKras)
     : review.kraSnapshot || [];
 
   const isDraft = Boolean(payload.isDraft);
+
+  // If HR returned specific KRAs to the HOD, only those KRAs are editable and each must be
+  // addressed before resubmitting.
+  const returnEdits = applyReturnEdits({
+    existing: review,
+    merged: mergedSnapshot,
+    target: 'HOD',
+    responses: payload.returnResponses,
+    isDraft,
+    user,
+  });
+  let updatedSnapshot = returnEdits.snapshot;
   const hodOverallComments = payload.hodOverallComments !== undefined ? payload.hodOverallComments : payload.hodComments;
 
   const now = new Date().toISOString();
@@ -547,6 +581,7 @@ export async function hodApproveReview(
     const draftUpdated: EmployeeReview = {
       ...review,
       kraSnapshot: updatedSnapshot,
+      returnRequests: returnEdits.returnRequests || review.returnRequests,
       hodOverallComments: hodOverallComments !== undefined ? hodOverallComments : review.hodOverallComments,
       actionHistory: [...(review.actionHistory || []), draftAction],
       updatedAt: now,
@@ -560,28 +595,41 @@ export async function hodApproveReview(
     if (!kra.hodRating || kra.hodRating < 1 || kra.hodRating > 5) {
       throw new Error(`KRA "${kra.kraName || kra.title}" must have a valid HOD rating between 1 and 5.`);
     }
+    if ([1, 2, 5].includes(kra.hodRating) && (!kra.hodJustification || kra.hodJustification.trim().length < 15)) {
+      throw new Error(`A mandatory justification note (minimum 15 characters) is required for KRA "${kra.kraName || kra.title}" rated ${kra.hodRating}★.`);
+    }
   }
+
+  // The HOD has now seen the Manager's revisions — clear the "revised after return" markers.
+  updatedSnapshot = updatedSnapshot.map(({ revisedAfterReturn: _revised, ...rest }) => rest);
 
   const hodScore = calculateWeightedScore(updatedSnapshot, 'hodRating');
   const managerScore = review.managerScore ?? review.finalScore ?? 0;
   const finalScore = Number(((managerScore + hodScore) / 2).toFixed(2));
 
+  const resolvedReturn = returnEdits.resolvedRequest;
+  const baseRemarks = hodOverallComments
+    ? `HOD submitted independent scoring (${hodScore}). Comments: ${hodOverallComments}`
+    : `HOD submitted independent scoring (${hodScore}).`;
   const action: ReviewAction = {
     id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
     reviewId,
-    action: 'HOD_APPROVED',
+    action: resolvedReturn ? 'RESUBMITTED' : 'HOD_APPROVED',
     performedBy: user.id,
     performedByName: user.name,
     performedByRole: user.role,
-    remarks: hodOverallComments
-      ? `HOD submitted independent scoring (${hodScore}). Comments: ${hodOverallComments}`
-      : `HOD submitted independent scoring (${hodScore}).`,
+    remarks: resolvedReturn
+      ? `HOD resubmitted after HR return (round ${resolvedReturn.round}) — ${describeChanges(returnEdits.changes || [])}. ${baseRemarks}`
+      : baseRemarks,
+    returnRequestId: resolvedReturn?.id,
+    kraChanges: returnEdits.changes,
     performedAt: now,
   };
 
   const updated: EmployeeReview = {
     ...review,
     kraSnapshot: updatedSnapshot,
+    returnRequests: returnEdits.returnRequests || review.returnRequests,
     hodScore,
     finalScore,
     hodOverallComments: hodOverallComments !== undefined ? hodOverallComments : review.hodOverallComments,
@@ -605,8 +653,12 @@ export async function hodApproveReview(
     userId: 'ALL',
     userRole: 'HR',
     type: 'HOD_APPROVED',
-    title: `Review Ready for HR Approval: ${review.employeeName}`,
-    message: `${user.name} (HOD) submitted their independent score (${hodScore}) for ${review.employeeName} (${review.reviewPeriodName}). Final score: ${finalScore}.`,
+    title: resolvedReturn
+      ? `Returned Review Resubmitted by HOD: ${review.employeeName}`
+      : `Review Ready for HR Approval: ${review.employeeName}`,
+    message: resolvedReturn
+      ? `${user.name} (HOD) re-evaluated ${resolvedReturn.kraIds.length} returned KRA${resolvedReturn.kraIds.length === 1 ? '' : 's'} for ${review.employeeName}: ${describeChanges(returnEdits.changes || [])}. Final score: ${finalScore}.`
+      : `${user.name} (HOD) submitted their independent score (${hodScore}) for ${review.employeeName} (${review.reviewPeriodName}). Final score: ${finalScore}.`,
     isRead: false,
     priority: 'HIGH',
     metadata: { reviewId, periodId: review.reviewPeriodId, status: 'HR_PENDING' },
@@ -629,177 +681,52 @@ export async function hodApproveReview(
 }
 
 /**
- * HOD returns review to the reporting manager for correction
+ * HOD returns selected KRAs (or the full review) to the reporting manager.
  * STRICT RULE: Return reason is MANDATORY
  * Transitions: HOD_PENDING -> MANAGER_PENDING
  */
 export async function hodReturnReview(
   reviewId: string,
-  reason: string,
+  input: Omit<ReturnInput, 'target'>,
   user: { id: string; name: string; role: any; employeeId?: string }
 ): Promise<EmployeeReview> {
   if (user.role !== 'SUPER_ADMIN' && user.role !== 'HOD') {
     throw new Error('Forbidden: Only the designated HOD or Super Admin can return a review.');
   }
 
-  if (!reason || !reason.trim()) {
-    throw new Error('Return reason is mandatory. Please provide specific feedback for the manager.');
-  }
-
   const reviewCol = getDbCollection('employeeReviews');
   const review: EmployeeReview | null = await reviewCol.findOne({ id: reviewId });
   if (!review) {
     throw new Error('Review not found.');
   }
-  if (review.isClosed) {
-    throw new Error('Cannot return a closed review.');
+  if (review.status !== 'HOD_PENDING' && user.role !== 'SUPER_ADMIN') {
+    throw new Error(`Cannot return review in status "${review.status}". Must be HOD_PENDING.`);
   }
 
-  const now = new Date().toISOString();
-  const action: ReviewAction = {
-    id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-    reviewId,
-    action: 'HOD_RETURNED',
-    performedBy: user.id,
-    performedByName: user.name,
-    performedByRole: user.role,
-    remarks: `Returned by HOD: ${reason.trim()}`,
-    performedAt: now,
-  };
-
-  const updated: EmployeeReview = {
-    ...review,
-    status: 'MANAGER_PENDING',
-    actionHistory: [...(review.actionHistory || []), action],
-    updatedAt: now,
-  };
-
-  await reviewCol.updateOne({ id: reviewId }, { $set: updated });
-
-  const notifCol = getDbCollection('notifications');
-  await notifCol.updateMany(
-    { 'metadata.reviewId': reviewId, type: 'HOD_PENDING', isRead: false },
-    { $set: { isRead: true } }
-  );
-
-  if (review.managerId) {
-    await notifCol.insertOne({
-      id: `notif_${reviewId}_hod_returned_${Date.now()}`,
-      userId: review.managerId,
-      userRole: 'MANAGER',
-      type: 'RETURNED',
-      title: `Review Returned by HOD: ${review.employeeName}`,
-      message: `The HOD returned the review for ${review.employeeName}. Reason: ${reason.trim()}`,
-      isRead: false,
-      priority: 'HIGH',
-      metadata: { reviewId, periodId: review.reviewPeriodId, reason: reason.trim() },
-      createdAt: now,
-    });
-  }
-
-  await recordAuditLog(
-    user.id,
-    user.name,
-    user.role,
-    'EMPLOYEE_REVIEWS',
-    'REVIEW_HOD_RETURNED',
-    reviewId,
-    'HOD_PENDING',
-    'MANAGER_PENDING',
-    `Review returned to manager by HOD for ${review.employeeName}. Reason: ${reason.trim()}`
-  );
-
-  return updated;
+  return createReviewReturn(review, { ...input, target: 'MANAGER' }, user, 'HOD');
 }
 
 /**
- * HR returns review to manager
+ * HR returns selected KRAs (or the full review) to the Manager or the HOD.
  * STRICT RULE: Return reason is MANDATORY
- * Transitions: HR_PENDING -> RETURNED -> MANAGER_PENDING
+ * Transitions: HR_PENDING -> RETURNED (Manager) | HOD_PENDING (HOD)
  */
 export async function returnReview(
   reviewId: string,
-  reason: string,
+  input: ReturnInput,
   user: { id: string; name: string; role: any }
 ): Promise<EmployeeReview> {
   if (user.role !== 'SUPER_ADMIN' && user.role !== 'HR') {
     throw new Error('Forbidden: Only HR or Super Admin can return a review.');
   }
 
-  if (!reason || !reason.trim()) {
-    throw new Error('Return reason is mandatory. Please provide specific feedback for the manager.');
-  }
-
   const reviewCol = getDbCollection('employeeReviews');
   const review: EmployeeReview | null = await reviewCol.findOne({ id: reviewId });
   if (!review) {
     throw new Error('Review not found.');
   }
-  if (review.isClosed) {
-    throw new Error('Cannot return a closed review.');
-  }
 
-  const now = new Date().toISOString();
-  const action: ReviewAction = {
-    id: `act_${Date.now()}_${Math.random().toString(36).substring(2, 6)}`,
-    reviewId,
-    action: 'RETURNED',
-    performedBy: user.id,
-    performedByName: user.name,
-    performedByRole: user.role,
-    remarks: `Returned by HR: ${reason.trim()}`,
-    performedAt: now,
-  };
-
-  const updated: EmployeeReview = {
-    ...review,
-    status: 'RETURNED',
-    actionHistory: [...(review.actionHistory || []), action],
-    updatedAt: now,
-  };
-
-  await reviewCol.updateOne({ id: reviewId }, { $set: updated });
-
-  // Auto-resolve pending manager submissions since review is returned
-  const notifCol = getDbCollection('notifications');
-  await notifCol.updateMany(
-    {
-      'metadata.reviewId': reviewId,
-      type: { $in: ['MANAGER_SUBMITTED', 'HOD_APPROVED'] },
-      isRead: false,
-    },
-    { $set: { isRead: true } }
-  );
-
-  // Notify Reporting Manager
-  if (review.managerId) {
-    await notifCol.insertOne({
-      id: `notif_${reviewId}_returned_${Date.now()}`,
-      userId: review.managerId,
-      userRole: 'MANAGER',
-      type: 'RETURNED',
-      title: `Review Returned by HR: ${review.employeeName}`,
-      message: `HR returned review for ${review.employeeName}. Reason: ${reason.trim()}`,
-      isRead: false,
-      priority: 'HIGH',
-      metadata: { reviewId, periodId: review.reviewPeriodId, reason: reason.trim() },
-      createdAt: now,
-    });
-  }
-
-  await recordAuditLog(
-    user.id,
-    user.name,
-    user.role,
-    'EMPLOYEE_REVIEWS',
-    'REVIEW_RETURNED',
-    reviewId,
-    review.status,
-    'RETURNED',
-    `Review returned to manager for ${review.employeeName}. Reason: ${reason.trim()}`
-  );
-
-  return updated;
+  return createReviewReturn(review, input, user, 'HR');
 }
 
 /**

@@ -1,20 +1,25 @@
 import express, { Response } from 'express';
 import { getDbCollection } from '../db.js';
-import { AuthenticatedRequest, authenticateToken } from '../auth.js';
+import { AuthenticatedRequest, authenticateToken, requireRoles } from '../auth.js';
+import {
+  buildCalibration,
+  buildCoverage,
+  buildDataHealth,
+  buildEmailDelivery,
+  computeReviewerBacklog,
+  hasScorecardCheck,
+  publicBacklog,
+  sendReviewerReminder,
+} from '../services/dashboardInsights.js';
 import {
   Appraisal,
-  AuditLog,
   Cycle,
-  DashboardActivityItem,
   DashboardAdminOverview,
-  DashboardAppraisalHealth,
-  DashboardComplianceStatus,
   DashboardDepartmentProgress,
   DashboardHodOverview,
   DashboardHrOverview,
   DashboardMyReview,
   DashboardPeriod,
-  DashboardRatingDistribution,
   DashboardReviewStage,
   DashboardSummary,
   DashboardTask,
@@ -98,10 +103,7 @@ function bandOf(score: number): string | null {
   return computeAppraisalMatrix(score).recommendedRating;
 }
 
-function toPeriod(p: ReviewPeriod, completionRate: number = 100): DashboardPeriod {
-  const due = new Date(p.dueDate).getTime();
-  const now = Date.now();
-  const daysRemaining = Math.max(0, Math.ceil((due - now) / DAY_MS));
+function toPeriod(p: ReviewPeriod): DashboardPeriod {
   return {
     id: p.id,
     name: p.name,
@@ -109,9 +111,16 @@ function toPeriod(p: ReviewPeriod, completionRate: number = 100): DashboardPerio
     startDate: p.startDate,
     endDate: p.endDate,
     dueDate: p.dueDate,
-    daysRemaining,
-    completionRate,
   };
+}
+
+/** 1–5 rating band for a weighted score (same thresholds across the HR and HOD views). */
+function ratingFor(score: number): 1 | 2 | 3 | 4 | 5 {
+  if (score >= 4.5) return 5;
+  if (score >= 3.8) return 4;
+  if (score >= 2.8) return 3;
+  if (score >= 1.8) return 2;
+  return 1;
 }
 
 const periodOrder = (p: ReviewPeriod) => Number(p.year) * 4 + Number(p.quarter);
@@ -147,7 +156,7 @@ function buildEmployeeTasks(
       detail: `${review.kraSnapshot?.length || 0} KRAs to rate. ${review.managerName || 'Your manager'} sees it once you submit.`,
       dueDate: period?.dueDate,
       urgency: urgencyFor(period?.dueDate, now),
-      link: { view: 'portal', params: { subTab: 'reviews', reviewId: review.id } },
+      link: { view: 'reviews', params: { reviewId: review.id, openSelfAssess: true } },
     });
   }
 
@@ -159,7 +168,7 @@ function buildEmployeeTasks(
       title: `Acknowledge your ${appraisal.appraisalYear} appraisal letter`,
       detail: 'Your letter has been released. Read it and confirm you have received it.',
       urgency: 'NO_DATE',
-      link: { view: 'portal', params: { subTab: 'appraisal', appraisalId: appraisal.id, openLetter: true } },
+      link: { view: 'dashboard', params: { appraisalId: appraisal.id, openLetter: true } },
     });
   }
 
@@ -191,18 +200,16 @@ async function buildNotificationTasks(user: User): Promise<DashboardTask[]> {
 
       if (meta.subTab === 'appraisal' || meta.appraisalId || (n.type === 'LETTER_RELEASED' && meta.cycleId)) {
         link = {
-          view: 'portal',
+          view: 'dashboard',
           params: {
-            subTab: 'appraisal',
             ...(meta.appraisalId ? { appraisalId: meta.appraisalId } : {}),
             openLetter: true,
           },
         };
       } else if (meta.subTab === 'reviews' || meta.reviewId) {
         link = {
-          view: 'portal',
+          view: 'reviews',
           params: {
-            subTab: 'reviews',
             ...(meta.reviewId ? { reviewId: meta.reviewId } : {}),
             ...(meta.openSelfAssess ? { openSelfAssess: true } : {}),
           },
@@ -369,6 +376,7 @@ function buildManagerTasks(
 async function buildMyReview(
   employee: Employee,
   myReviews: EmployeeReview[],
+  myAppraisals: Appraisal[],
   periodMap: Map<string, ReviewPeriod>,
   cycles: Cycle[],
   now: Date
@@ -455,15 +463,62 @@ async function buildMyReview(
     nextAppraisal = { month: cycle.appraisalMonth, year, cycleName: cycle.name };
   }
 
+  // Build active appraisal snapshot from already-fetched myAppraisals (no extra DB query)
+  const activeAppraisalRaw = myAppraisals
+    .sort((a, b) => {
+      // Prefer most recent year/month
+      const aTime = (a.appraisalYear || 0) * 12 + (a.appraisalMonth || 0);
+      const bTime = (b.appraisalYear || 0) * 12 + (b.appraisalMonth || 0);
+      return bTime - aTime;
+    })[0] || null;
+
+  const activeAppraisal: DashboardMyReview['activeAppraisal'] = activeAppraisalRaw
+    ? (() => {
+        const score = activeAppraisalRaw.averageQuarterlyScore || 0;
+        const matrix = score > 0 ? computeAppraisalMatrix(score) : null;
+        const currentCTC = activeAppraisalRaw.currentCtc || (activeAppraisalRaw as any).currentCTC || (activeAppraisalRaw as any).ctcBreakdown?.currentCTC;
+        const hrApproved = activeAppraisalRaw.approvedIncrementPercentage ?? (activeAppraisalRaw as any).hrApprovedIncrement;
+        const mgrRecommended = activeAppraisalRaw.proposedIncrementPercentage ?? (activeAppraisalRaw as any).managerRecommendedIncrement;
+        const incrementAmount = hrApproved || mgrRecommended;
+        const newCTC = currentCTC && incrementAmount
+          ? Math.round(currentCTC * (1 + incrementAmount / 100))
+          : undefined;
+        return {
+          id: activeAppraisalRaw.id,
+          appraisalYear: activeAppraisalRaw.appraisalYear,
+          appraisalMonth: activeAppraisalRaw.appraisalMonth,
+          status: activeAppraisalRaw.status,
+          isLocked: Boolean(activeAppraisalRaw.isLocked),
+          averageQuarterlyScore: score > 0 ? score : undefined,
+          suggestedIncrementMin: matrix?.suggestedIncrementMin,
+          suggestedIncrementMax: matrix?.suggestedIncrementMax,
+          recommendedRating: matrix?.recommendedRating,
+          managerRecommendedIncrement: mgrRecommended,
+          hrApprovedIncrement: hrApproved,
+          ctcBreakdown: currentCTC ? {
+            currentCTC,
+            newCTC,
+            incrementAmount,
+          } : undefined,
+          acknowledged: Boolean(activeAppraisalRaw.employeeAcknowledgement?.acknowledged),
+        };
+      })()
+    : null;
+
   return {
     employee: {
       id: employee.id,
       name: employee.name,
+      employeeCode: employee.employeeCode,
       designationName: employee.designationName,
       departmentName: employee.departmentName,
       managerName: employee.managerName,
       hodName: employee.hodName,
       cycleName: cycle?.name || employee.cycleName,
+      email: employee.email,
+      phone: employee.phone,
+      joiningDate: employee.joiningDate,
+      status: employee.status,
     },
     currentReview: current
       ? {
@@ -476,6 +531,7 @@ async function buildMyReview(
           dueDate: periodMap.get(current.reviewPeriodId)?.dueDate,
         }
       : null,
+    activeAppraisal,
     rollingScore: rollup.avgScore,
     evaluatedQuarters: rollup.evaluatedCount,
     ratingBand: bandOf(rollup.avgScore),
@@ -564,8 +620,8 @@ function buildTeam(
       type: 'info',
       title: `${pipsInTeam.length} active PIP${pipsInTeam.length > 1 ? 's' : ''} in your team`,
       detail: `Track progress milestones for ${pipsInTeam.map((r) => r.name).join(', ')}`,
-      actionLabel: 'View Workspace',
-      link: { view: 'portal' },
+      actionLabel: 'View PIP',
+      link: { view: 'pip' },
     });
   }
 
@@ -592,29 +648,6 @@ function buildTeam(
     ratingSpread,
     alerts,
   };
-}
-
-function toRelativeTime(dateString: string | undefined): string {
-  if (!dateString) return 'Just now';
-  const time = new Date(dateString).getTime();
-  if (isNaN(time)) return 'Recently';
-  const diffMs = Date.now() - time;
-  const diffMinutes = Math.floor(diffMs / (1000 * 60));
-  if (diffMinutes < 1) return 'Just now';
-  if (diffMinutes < 60) return `${diffMinutes} minute${diffMinutes === 1 ? '' : 's'} ago`;
-  const diffHours = Math.floor(diffMinutes / 60);
-  if (diffHours < 24) return `${diffHours} hour${diffHours === 1 ? '' : 's'} ago`;
-  const diffDays = Math.floor(diffHours / 24);
-  if (diffDays < 30) return `${diffDays} day${diffDays === 1 ? '' : 's'} ago`;
-  const diffMonths = Math.floor(diffDays / 30);
-  return `${diffMonths} month${diffMonths === 1 ? '' : 's'} ago`;
-}
-
-function getInitials(name: string | undefined): string {
-  if (!name) return 'SYS';
-  const parts = name.trim().split(/\s+/);
-  if (parts.length === 1) return parts[0].substring(0, 2).toUpperCase();
-  return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
 
 /** Tasks the viewer owes as HR or Super Admin: finalize completed manager/HOD reviews, calibrate appraisals, etc. */
@@ -676,12 +709,10 @@ async function buildHrTasks(
     });
   }
 
-  // Employees without KRA template assigned
-  const templateDeptDesigSet = new Set(allTemplates.map((t: any) => `${t.departmentId}_${t.designationId}`));
+  // Employees without their own KRA scorecard (same rule as review generation)
+  const hasScorecard = hasScorecardCheck(allTemplates);
   const activeEmps = allEmployees.filter((e) => e.status === 'ACTIVE');
-  const employeesWithoutKras = activeEmps.filter(
-    (e) => !e.currentKraTemplateId && !templateDeptDesigSet.has(`${e.departmentId}_${e.designationId}`)
-  ).length;
+  const employeesWithoutKras = activeEmps.filter((e) => !hasScorecard(e)).length;
 
   if (employeesWithoutKras > 0) {
     tasks.push({
@@ -714,13 +745,11 @@ async function buildHrTasks(
 async function buildHodOverview(
   hodEmployeeId: string,
   periodMap: Map<string, ReviewPeriod>,
-  allEmployees: Employee[],
-  now: number
+  allEmployees: Employee[]
 ): Promise<DashboardHodOverview> {
   const reviewsCol = getDbCollection('employeeReviews');
   const appraisalsCol = getDbCollection('appraisals');
   const pipsCol = getDbCollection('performanceImprovementPlans');
-  const auditLogsCol = getDbCollection('auditLogs');
 
   // Find HOD's employee record to get their departmentId
   const hodEmployee = allEmployees.find((e) => e.id === hodEmployeeId);
@@ -732,11 +761,10 @@ async function buildHodOverview(
     : [];
   const deptEmployeeIds = deptEmployees.map((e) => e.id);
 
-  const [deptReviews, deptAppraisals, deptPips, rawAudits]: [
+  const [deptReviews, deptAppraisals, deptPips]: [
     EmployeeReview[],
     Appraisal[],
-    PerformanceImprovementPlan[],
-    AuditLog[]
+    PerformanceImprovementPlan[]
   ] = await Promise.all([
     deptEmployeeIds.length
       ? (await reviewsCol.find({ employeeId: { $in: deptEmployeeIds } })).toArray()
@@ -747,7 +775,6 @@ async function buildHodOverview(
     deptEmployeeIds.length
       ? (await pipsCol.find({ employeeId: { $in: deptEmployeeIds } })).toArray()
       : Promise.resolve([]),
-    (await auditLogsCol.find({ departmentId: deptId }).sort({ createdAt: -1 }).limit(5)).toArray(),
   ]);
 
   const visibleReviews = deptReviews.filter((r) => periodMap.get(r.reviewPeriodId)?.status !== 'UPCOMING');
@@ -770,10 +797,7 @@ async function buildHodOverview(
   // KRA coverage
   const kraTemplatesCol = getDbCollection('kraTemplates');
   const allTemplates: KraTemplate[] = await (await kraTemplatesCol.find({})).toArray();
-  const templateDeptDesigSet = new Set(allTemplates.map((t: any) => `${t.departmentId}_${t.designationId}`));
-  const withKra = deptEmployees.filter(
-    (e) => e.currentKraTemplateId || templateDeptDesigSet.has(`${e.departmentId}_${e.designationId}`)
-  ).length;
+  const withKra = deptEmployees.filter(hasScorecardCheck(allTemplates)).length;
   const kraCoverageRate = deptEmployees.length > 0 ? Math.round((withKra / deptEmployees.length) * 100) : 0;
 
   // Rating/performance computation
@@ -799,15 +823,8 @@ async function buildHodOverview(
   let scoredCount = 0;
   let highCount = 0;
 
-  const ratingCounts: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-
   employeeScores.forEach((score) => {
-    let rating = 1;
-    if (score >= 4.5) rating = 5;
-    else if (score >= 3.8) rating = 4;
-    else if (score >= 2.8) rating = 3;
-    else if (score >= 1.8) rating = 2;
-    ratingCounts[rating] = (ratingCounts[rating] || 0) + 1;
+    const rating = ratingFor(score);
     if (rating === 5) ratingSpread.outstanding++;
     else if (rating === 4) ratingSpread.exceeds++;
     else if (rating === 3) ratingSpread.meets++;
@@ -819,15 +836,6 @@ async function buildHodOverview(
   ratingSpread.unrated = deptEmployees.length - scoredCount;
 
   const averageScore = scoredCount > 0 ? Number((totalScoreSum / scoredCount).toFixed(2)) : null;
-  const benchmarkBase = deptEmployees.length;
-  const performanceDistribution = [
-    { rating: 1, count: ratingCounts[1] || 0, benchmark: benchmarkBase > 0 ? Math.max(1, Math.round(benchmarkBase * 0.08)) : 0 },
-    { rating: 2, count: ratingCounts[2] || 0, benchmark: benchmarkBase > 0 ? Math.max(1, Math.round(benchmarkBase * 0.15)) : 0 },
-    { rating: 3, count: ratingCounts[3] || 0, benchmark: benchmarkBase > 0 ? Math.max(1, Math.round(benchmarkBase * 0.45)) : 0 },
-    { rating: 4, count: ratingCounts[4] || 0, benchmark: benchmarkBase > 0 ? Math.max(1, Math.round(benchmarkBase * 0.22)) : 0 },
-    { rating: 5, count: ratingCounts[5] || 0, benchmark: benchmarkBase > 0 ? Math.max(1, Math.round(benchmarkBase * 0.10)) : 0 },
-  ];
-
   // Department member rows
   const departmentMembers = deptEmployees.map((emp) => {
     const review = employeeReviewMap.get(emp.id);
@@ -844,20 +852,6 @@ async function buildHodOverview(
       onPip: onPipSet.has(emp.id),
     };
   }).sort((a, b) => a.name.localeCompare(b.name));
-
-  // Recent activity (dept-level audit logs)
-  const recentActivity = rawAudits.map((a: any) => {
-    const rawName = a.userName || a.actorName || 'System';
-    return {
-      id: a.id || String(a._id),
-      actorName: rawName,
-      initials: getInitials(rawName),
-      action: a.action || 'UPDATED',
-      description: a.details || a.description || `${rawName} performed an update`,
-      timestamp: a.createdAt || a.timestamp || new Date().toISOString(),
-      relativeTime: toRelativeTime(a.createdAt || a.timestamp),
-    };
-  });
 
   // HOD-specific alerts
   const alerts: DashboardHodOverview['alerts'] = [];
@@ -894,20 +888,15 @@ async function buildHodOverview(
 
   return {
     departmentName: hodEmployee?.departmentName || 'Your Department',
-    departmentId: deptId || '',
     totalEmployees: deptEmployees.length,
     reviewsTotal,
     reviewsCompleted,
     reviewsPendingHod,
     completionRate,
-    pendingAppraisals,
-    kraCoverageRate,
     averageScore,
     highPerformersCount: highCount,
     ratingSpread,
     departmentMembers,
-    performanceDistribution,
-    recentActivity,
     alerts,
   };
 }
@@ -930,6 +919,34 @@ async function buildHodTasks(
     const period = periodMap.get(review.reviewPeriodId);
     if (period?.status === 'UPCOMING') continue;
     const dueDate = period?.dueDate;
+
+    // A return to the HOD puts the review back in HOD_PENDING, so tell the HOD it came back
+    // (with the returner's note and the return's own deadline) instead of "Manager submitted".
+    const openReturn = [...(review.returnRequests || [])]
+      .reverse()
+      .find((r) => r.status === 'OPEN' && r.target === 'HOD');
+    if (openReturn) {
+      const returnDue = openReturn.dueAt || dueDate;
+      const scope = openReturn.isFullReturn
+        ? 'the full review'
+        : `${openReturn.kraIds.length} KRA${openReturn.kraIds.length === 1 ? '' : 's'}`;
+      tasks.push({
+        id: `hod_revise_${review.id}`,
+        type: 'REVISE_RETURNED_REVIEW',
+        title: `Revise returned review · ${review.employeeName}`,
+        detail: openReturn.reason
+          ? `${openReturn.returnedByRole} note: “${openReturn.reason}”`
+          : `${openReturn.returnedByRole} sent ${scope} back for re-evaluation.`,
+        employeeId: review.employeeId,
+        employeeName: review.employeeName,
+        dueDate: returnDue,
+        urgency: urgencyFor(returnDue, now),
+        priority: 'High',
+        link: { view: 'reviews', params: { reviewId: review.id } },
+      });
+      continue;
+    }
+
     tasks.push({
       id: `hod_score_${review.id}`,
       type: 'HOD_SCORE_REVIEW',
@@ -953,28 +970,19 @@ async function buildHrOverview(
   allEmployees: Employee[],
   allDepartments: Department[],
   cycles: Cycle[],
-  allTemplates: KraTemplate[],
-  requestedCycle?: string
+  allTemplates: KraTemplate[]
 ): Promise<DashboardHrOverview> {
   const reviewsCol = getDbCollection('employeeReviews');
   const appraisalsCol = getDbCollection('appraisals');
-  const auditLogsCol = getDbCollection('auditLogs');
 
   const activeEmployees = allEmployees.filter((e) => e.status === 'ACTIVE');
   const periodId = activePeriod?.id;
 
-  const [currentReviews, allReviews, allAppraisals, rawAudits]: [
-    EmployeeReview[],
-    EmployeeReview[],
-    Appraisal[],
-    AuditLog[]
-  ] = await Promise.all([
+  const [currentReviews, allAppraisals]: [EmployeeReview[], Appraisal[]] = await Promise.all([
     periodId
       ? (await reviewsCol.find({ reviewPeriodId: periodId })).toArray()
       : (await reviewsCol.find({})).toArray(),
-    (await reviewsCol.find({})).toArray(),
     (await appraisalsCol.find({})).toArray(),
-    (await auditLogsCol.find({}).sort({ createdAt: -1 }).limit(6)).toArray(),
   ]);
 
   const reviewsCompleted = currentReviews.filter((r) => isClosed(r)).length;
@@ -982,31 +990,18 @@ async function buildHrOverview(
   const reviewsPendingHod = currentReviews.filter((r) => r.status === 'HOD_PENDING').length;
   const reviewsPendingManager = currentReviews.filter((r) => MANAGER_OPEN_STATUSES.includes(r.status)).length;
   const reviewsTotal = currentReviews.length;
-  const completionRate = reviewsTotal > 0 ? Math.round((reviewsCompleted / reviewsTotal) * 100) : 100;
+  const completionRate = reviewsTotal > 0 ? Math.round((reviewsCompleted / reviewsTotal) * 100) : 0;
 
   const pendingAppraisals = allAppraisals.filter((a) => !a.isLocked).length;
 
-  // Employees without KRA template assigned
-  const templateDeptDesigSet = new Set(allTemplates.map((t: any) => `${t.departmentId}_${t.designationId}`));
-  const employeesWithoutKras = activeEmployees.filter(
-    (e) => !e.currentKraTemplateId && !templateDeptDesigSet.has(`${e.departmentId}_${e.designationId}`)
-  ).length;
+  // Employees without their own KRA scorecard (same rule as review generation)
+  const hasScorecard = hasScorecardCheck(allTemplates);
+  const employeesWithoutKras = activeEmployees.filter((e) => !hasScorecard(e)).length;
 
   const kraCoverageCount = activeEmployees.length - employeesWithoutKras;
   const kraCoverageRate = activeEmployees.length > 0
     ? Math.round((kraCoverageCount / activeEmployees.length) * 100)
     : 0;
-  const kraCoverageLabel = kraCoverageRate < 30 ? 'Low' : kraCoverageRate < 70 ? 'Medium' : 'High';
-
-  // Review On-Time Rate
-  const onTimeSubmissions = currentReviews.filter((r) => {
-    const submittedAction = r.actionHistory?.find((a) => a.action === 'SUBMITTED');
-    if (!submittedAction || !activePeriod?.dueDate) return true;
-    return new Date(submittedAction.performedAt).getTime() <= new Date(activePeriod.dueDate).getTime();
-  }).length;
-  const reviewOnTimeRate = currentReviews.length > 0
-    ? Math.round((onTimeSubmissions / currentReviews.length) * 100)
-    : 92;
 
   // Department progress
   const deptEmployees = new Map<string, number>();
@@ -1032,9 +1027,7 @@ async function buildHrOverview(
       const stats = deptReviews.get(d.id) || { initiated: 0, completed: 0 };
       const totalEmps = deptEmployees.get(d.id) || 0;
       const rate = stats.initiated > 0 ? Math.round((stats.completed / stats.initiated) * 100) : 0;
-      const deptsEmpsWithKra = activeEmployees.filter(
-        (e) => e.departmentId === d.id && (e.currentKraTemplateId || templateDeptDesigSet.has(`${e.departmentId}_${e.designationId}`))
-      ).length;
+      const deptsEmpsWithKra = activeEmployees.filter((e) => e.departmentId === d.id && hasScorecard(e)).length;
       const kraRate = totalEmps > 0 ? Math.round((deptsEmpsWithKra / totalEmps) * 100) : 0;
       const pending = stats.initiated - stats.completed;
       let status: 'Completed' | 'In Progress' | 'Not Started' = 'Not Started';
@@ -1055,270 +1048,48 @@ async function buildHrOverview(
     })
     .sort((a, b) => b.totalEmployees - a.totalEmployees);
 
-  // Helper to compute appraisal health and performance distribution for any cycle/period
-  function computeHealthAndDistribution(
-    cycleEmployees: Employee[],
-    cycleAppraisals: Appraisal[],
-    cycleReviews: EmployeeReview[]
-  ): {
-    appraisalHealth: DashboardAppraisalHealth;
-    performanceDistribution: DashboardRatingDistribution[];
-    averageScore: number | null;
-    highPerformersCount: number;
-  } {
-    const draftAppraisals = cycleAppraisals.filter(
-      (a) => a.status === 'PENDING' || (a.status as unknown as string) === 'DRAFT'
-    ).length;
-    const selfReviewCount = cycleReviews.filter((r) => !r.isSelfSubmitted && !isClosed(r)).length;
-    const managerReviewCount = cycleReviews.filter((r) => ['ASSIGNED', 'MANAGER_PENDING'].includes(r.status)).length;
-    const hrReviewCount = cycleReviews.filter((r) => ['HR_PENDING', 'MANAGER_COMPLETED'].includes(r.status)).length;
-    const lockedCount = cycleAppraisals.filter((a) => a.isLocked).length;
-    const calibrationCount = cycleAppraisals.filter((a) => !a.isLocked).length;
 
-    const totalStaff = cycleEmployees.length || cycleAppraisals.length;
-
-    const appraisalHealth: DashboardAppraisalHealth = {
-      totalEmployees: totalStaff,
-      draft: draftAppraisals,
-      selfReview: selfReviewCount,
-      managerReview: managerReviewCount,
-      hrReview: hrReviewCount,
-      calibration: calibrationCount,
-      locked: lockedCount,
-    };
-
-    const ratingCounts: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-    const employeeScores = new Map<string, number>();
-
-    cycleReviews.forEach((r) => {
-      const score = r.finalScore || r.managerScore;
-      if (score && score > 0 && r.employeeId) {
-        employeeScores.set(r.employeeId, score);
-      }
-    });
-
-    cycleAppraisals.forEach((a) => {
-      const score = a.averageQuarterlyScore || (a as unknown as { finalScore?: number }).finalScore;
-      if (score && score > 0 && a.employeeId) {
-        employeeScores.set(a.employeeId, score);
-      }
-    });
-
-    let totalScoreSum = 0;
-    let scoredStaffCount = 0;
-    let highCount = 0;
-
-    employeeScores.forEach((score) => {
-      let rating = 1;
-      if (score >= 4.5) rating = 5;
-      else if (score >= 3.8) rating = 4;
-      else if (score >= 2.8) rating = 3;
-      else if (score >= 1.8) rating = 2;
-      else rating = 1;
-
-      ratingCounts[rating] = (ratingCounts[rating] || 0) + 1;
-      totalScoreSum += score;
-      scoredStaffCount += 1;
-      if (rating >= 4) highCount += 1;
-    });
-
-    const averageScore = scoredStaffCount > 0 ? Number((totalScoreSum / scoredStaffCount).toFixed(2)) : null;
-    const highPerformersCount = highCount;
-
-    const benchmarkBase = totalStaff > 0 ? totalStaff : 0;
-    const performanceDistribution: DashboardRatingDistribution[] = [
-      { rating: 1, count: ratingCounts[1] || 0, benchmark: benchmarkBase > 0 ? Math.max(1, Math.round(benchmarkBase * 0.08)) : 0 },
-      { rating: 2, count: ratingCounts[2] || 0, benchmark: benchmarkBase > 0 ? Math.max(1, Math.round(benchmarkBase * 0.15)) : 0 },
-      { rating: 3, count: ratingCounts[3] || 0, benchmark: benchmarkBase > 0 ? Math.max(1, Math.round(benchmarkBase * 0.45)) : 0 },
-      { rating: 4, count: ratingCounts[4] || 0, benchmark: benchmarkBase > 0 ? Math.max(1, Math.round(benchmarkBase * 0.22)) : 0 },
-      { rating: 5, count: ratingCounts[5] || 0, benchmark: benchmarkBase > 0 ? Math.max(1, Math.round(benchmarkBase * 0.10)) : 0 },
-    ];
-
-    return { appraisalHealth, performanceDistribution, averageScore, highPerformersCount };
-  }
-
-  // 1. Overall / All Cycles
-  const overall = computeHealthAndDistribution(activeEmployees, allAppraisals, allReviews);
-
-  // 2. Q3 2026 (September Cycle / SEP / cycle_f)
-  const q3Employees = activeEmployees.filter((e) => e.cycleId === 'cycle_f' || e.cycleCode === 'SEP');
-  const q3Appraisals = allAppraisals.filter((a) => a.cycleId === 'cycle_f' || a.cycleCode === 'SEP' || a.appraisalMonth === 9);
-  const q3Reviews = allReviews.filter((r) => r.cycleId === 'cycle_f' || r.cycleCode === 'SEP' || r.reviewPeriodId?.toLowerCase().includes('q3'));
-  const q3Data = computeHealthAndDistribution(q3Employees, q3Appraisals, q3Reviews.length > 0 ? q3Reviews : currentReviews);
-
-  // 3. Q2 2026 (June Cycle / JUN / cycle_d)
-  const q2Employees = activeEmployees.filter((e) => e.cycleId === 'cycle_d' || e.cycleCode === 'JUN');
-  const q2Appraisals = allAppraisals.filter((a) => a.cycleId === 'cycle_d' || a.cycleCode === 'JUN' || a.appraisalMonth === 6);
-  const q2Reviews = allReviews.filter((r) => r.cycleId === 'cycle_d' || r.cycleCode === 'JUN' || r.reviewPeriodId?.toLowerCase().includes('q2'));
-  const q2Data = computeHealthAndDistribution(q2Employees, q2Appraisals, q2Reviews);
-
-  // 4. Q4 2026 (2026-Q4 / Oct - Dec / cycle_g, cycle_h)
-  const q4Employees = activeEmployees.filter((e) => ['cycle_g', 'cycle_h'].includes(e.cycleId || '') || ['G', 'H'].includes(e.cycleCode || ''));
-  const q4Appraisals = allAppraisals.filter((a) => [10, 11, 12].includes(a.appraisalMonth || 0));
-  const q4Reviews = allReviews.filter((r) => r.reviewPeriodId?.toLowerCase().includes('q4'));
-  const q4Data = computeHealthAndDistribution(q4Employees, q4Appraisals, q4Reviews);
-
-  // 5. Q1 2026 (Jan - Apr / cycle_a, cycle_b, cycle_c)
-  const q1Employees = activeEmployees.filter((e) => ['cycle_a', 'cycle_b', 'cycle_c'].includes(e.cycleId || '') || ['A', 'B', 'C'].includes(e.cycleCode || ''));
-  const q1Appraisals = allAppraisals.filter((a) => [1, 2, 3, 4].includes(a.appraisalMonth || 0));
-  const q1Reviews = allReviews.filter((r) => r.reviewPeriodId?.toLowerCase().includes('q1'));
-  const q1Data = computeHealthAndDistribution(q1Employees, q1Appraisals, q1Reviews);
-
-  const cycleBreakdowns: DashboardHrOverview['cycleBreakdowns'] = {
-    'Q3 2026': {
-      key: 'Q3 2026',
-      label: `Q3 2026 (${q3Employees.length} staff · September Cycle)`,
-      appraisalHealth: q3Data.appraisalHealth,
-      performanceDistribution: q3Data.performanceDistribution,
-      totalStaff: q3Employees.length,
-      averageScore: q3Data.averageScore,
-      highPerformersCount: q3Data.highPerformersCount,
-    },
-    'Q2 2026': {
-      key: 'Q2 2026',
-      label: `Q2 2026 (${q2Employees.length} staff · June Cycle)`,
-      appraisalHealth: q2Data.appraisalHealth,
-      performanceDistribution: q2Data.performanceDistribution,
-      totalStaff: q2Employees.length,
-      averageScore: q2Data.averageScore,
-      highPerformersCount: q2Data.highPerformersCount,
-    },
-    '2026-Q4 (Oct - Dec)': {
-      key: '2026-Q4 (Oct - Dec)',
-      label: '2026-Q4 (Oct - Dec · Upcoming)',
-      appraisalHealth: q4Data.appraisalHealth,
-      performanceDistribution: q4Data.performanceDistribution,
-      totalStaff: q4Employees.length,
-      averageScore: q4Data.averageScore,
-      highPerformersCount: q4Data.highPerformersCount,
-    },
-    'Q4 2026': {
-      key: 'Q4 2026',
-      label: 'Q4 2026 (Oct - Dec · Upcoming)',
-      appraisalHealth: q4Data.appraisalHealth,
-      performanceDistribution: q4Data.performanceDistribution,
-      totalStaff: q4Employees.length,
-      averageScore: q4Data.averageScore,
-      highPerformersCount: q4Data.highPerformersCount,
-    },
-    'Q1 2026': {
-      key: 'Q1 2026',
-      label: 'Q1 2026 (Jan - Apr)',
-      appraisalHealth: q1Data.appraisalHealth,
-      performanceDistribution: q1Data.performanceDistribution,
-      totalStaff: q1Employees.length,
-      averageScore: q1Data.averageScore,
-      highPerformersCount: q1Data.highPerformersCount,
-    },
-    'All Cycles': {
-      key: 'All Cycles',
-      label: 'All Cycles (2026 FY)',
-      appraisalHealth: overall.appraisalHealth,
-      performanceDistribution: overall.performanceDistribution,
-      totalStaff: activeEmployees.length,
-      averageScore: overall.averageScore,
-      highPerformersCount: overall.highPerformersCount,
-    },
-  };
-
-  // Determine active health and distribution based on requestedCycle or fallback to Q3/active
-  let activeAppraisalHealth = q3Data.appraisalHealth;
-  let activePerformanceDistribution = q3Data.performanceDistribution;
-
-  if (requestedCycle && cycleBreakdowns[requestedCycle]) {
-    activeAppraisalHealth = cycleBreakdowns[requestedCycle].appraisalHealth;
-    activePerformanceDistribution = cycleBreakdowns[requestedCycle].performanceDistribution;
-  } else if (requestedCycle === 'All Cycles' || requestedCycle === 'ALL') {
-    activeAppraisalHealth = overall.appraisalHealth;
-    activePerformanceDistribution = overall.performanceDistribution;
-  }
-
-  // Recent Activity Feed
-  const recentActivity: DashboardActivityItem[] = rawAudits.map((a: any) => {
-    const rawName = a.userName || a.actorName || 'System Admin';
-    return {
-      id: a.id || String(a._id),
-      actorName: rawName,
-      initials: getInitials(rawName),
-      action: a.action || a.actionType || 'UPDATED',
-      description: a.details || a.description || `${rawName} performed an update`,
-      timestamp: a.createdAt || a.timestamp || new Date().toISOString(),
-      relativeTime: toRelativeTime(a.createdAt || a.timestamp),
-    };
-  });
-
-  // Upcoming Deadlines & Events
+  // Upcoming Deadlines & Events — derived from the active period and appraisal cycles.
   const nowMs = Date.now();
-  const upcomingEvents: DashboardUpcomingEvent[] = [];
-
-  if (activePeriod?.dueDate) {
-    const dueMs = new Date(activePeriod.dueDate).getTime();
-    const days = Math.max(1, Math.ceil((dueMs - nowMs) / DAY_MS));
-    upcomingEvents.push({
-      id: 'event_review_due',
-      title: 'Review due date',
-      category: `${activePeriod.name} - Manager Review`,
-      timeRange: '10:00 AM - 11:00 AM',
-      dateMonth: 'OCT',
-      dateDay: '10',
+  const toEvent = (id: string, title: string, category: string, iso: string): DashboardUpcomingEvent | null => {
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return null;
+    const startOfToday = new Date(nowMs);
+    startOfToday.setHours(0, 0, 0, 0);
+    const day = new Date(d);
+    day.setHours(0, 0, 0, 0);
+    const days = Math.round((day.getTime() - startOfToday.getTime()) / DAY_MS);
+    if (days < 0) return null;
+    return {
+      id,
+      title,
+      category,
+      timeRange: 'All day',
+      dateMonth: MONTHS[d.getMonth()].toUpperCase(),
+      dateDay: String(d.getDate()),
       daysRemaining: days,
-      daysText: `in ${days} days`,
-    });
-  }
-
-  upcomingEvents.push(
-    {
-      id: 'event_calibration_session',
-      title: 'Calibration session',
-      category: 'Annual Appraisals',
-      timeRange: '2:00 PM - 3:00 PM',
-      dateMonth: 'OCT',
-      dateDay: '15',
-      daysRemaining: 7,
-      daysText: 'in 7 days',
-    },
-    {
-      id: 'event_quarterly_close',
-      title: 'Quarterly close',
-      category: activePeriod?.name || 'Q4 2026',
-      timeRange: 'All Day',
-      dateMonth: 'DEC',
-      dateDay: '31',
-      daysRemaining: 84,
-      daysText: 'in 84 days',
-    },
-    {
-      id: 'event_appraisal_lock',
-      title: 'Appraisal lock date',
-      category: 'Finalize ratings and salary',
-      timeRange: 'All Day',
-      dateMonth: 'JAN',
-      dateDay: '15',
-      daysRemaining: 104,
-      daysText: 'in 104 days',
-    }
-  );
-
-  // Compliance Status
-  const lastAudit = rawAudits[0];
-  const compliance: DashboardComplianceStatus = {
-    lastAuditEvent: lastAudit
-      ? {
-          description: (lastAudit as any).details || (lastAudit as any).description || 'Review cycle 2026-Q4 updated',
-          actorName: (lastAudit as any).userName || 'Urmila HR',
-          relativeTime: toRelativeTime((lastAudit as any).createdAt || (lastAudit as any).timestamp),
-        }
-      : null,
-    workflowStatus: {
-      isActive: true,
-      statusText: 'All workflows are active · No pending issues',
-      pendingIssuesCount: 0,
-    },
-    lastDataSync: {
-      statusText: 'Employee data synchronized',
-      formattedTime: '3 Oct 2026, 11:30 AM',
-    },
+      daysText: days === 0 ? 'today' : days === 1 ? 'tomorrow' : `in ${days} days`,
+    };
   };
+  const eventCandidates: (DashboardUpcomingEvent | null)[] = [];
+  if (activePeriod) {
+    if (activePeriod.dueDate) eventCandidates.push(toEvent('event_review_due', 'Reviews due', activePeriod.name, activePeriod.dueDate));
+    if (activePeriod.endDate && activePeriod.endDate !== activePeriod.dueDate) {
+      eventCandidates.push(toEvent('event_period_end', 'Quarter ends', activePeriod.name, activePeriod.endDate));
+    }
+  }
+  const today = new Date(nowMs);
+  for (const c of cycles.filter((c) => c.active !== false && c.appraisalMonth)) {
+    const month = Number(c.appraisalMonth);
+    const year = month - 1 >= today.getMonth() ? today.getFullYear() : today.getFullYear() + 1;
+    eventCandidates.push(
+      toEvent(`event_appraisal_${c.id}`, 'Annual appraisals', c.name || c.code || 'Appraisal cycle', new Date(year, month - 1, 1).toISOString())
+    );
+  }
+  const upcomingEvents: DashboardUpcomingEvent[] = eventCandidates
+    .filter((e): e is DashboardUpcomingEvent => Boolean(e))
+    .sort((x, y) => x.daysRemaining - y.daysRemaining)
+    .slice(0, 5);
 
   // Missing manager assignments
   const employeesWithoutManager = activeEmployees.filter(
@@ -1350,14 +1121,23 @@ async function buildHrOverview(
     });
   }
 
-  alerts.push({
-    id: 'alert_approaching_deadlines',
-    type: 'crit',
-    title: '3 review deadlines approaching',
-    detail: 'Reviews due in next 7 days.',
-    actionLabel: 'View',
-    link: { view: 'reviews' },
-  });
+  if (activePeriod?.dueDate) {
+    const openReviews = currentReviews.filter((r) => !isClosed(r)).length;
+    const daysToDue = Math.ceil((new Date(activePeriod.dueDate).getTime() - nowMs) / DAY_MS);
+    if (openReviews > 0 && daysToDue <= 7) {
+      alerts.push({
+        id: 'alert_approaching_deadlines',
+        type: daysToDue < 0 ? 'crit' : 'warn',
+        title:
+          daysToDue < 0
+            ? `${openReviews} review${openReviews === 1 ? '' : 's'} past the due date`
+            : `${openReviews} review${openReviews === 1 ? '' : 's'} still open — due in ${daysToDue} day${daysToDue === 1 ? '' : 's'}`,
+        detail: `${activePeriod.name} reviews are due ${new Date(activePeriod.dueDate).toLocaleDateString()}.`,
+        actionLabel: 'View',
+        link: { view: 'reviews' },
+      });
+    }
+  }
 
   if (employeesWithoutManager.length > 0) {
     alerts.push({
@@ -1370,10 +1150,14 @@ async function buildHrOverview(
     });
   }
 
+  const [coverage, backlog] = await Promise.all([
+    buildCoverage(activePeriod, allEmployees, activePeriod ? currentReviews : []),
+    activePeriod ? computeReviewerBacklog(currentReviews, activePeriod) : Promise.resolve([]),
+  ]);
+
   return {
     totalEmployees: activeEmployees.length,
     totalDepartments: allDepartments.length,
-    employeeTrendPercent: 8,
     reviewsTotal,
     reviewsCompleted,
     reviewsPendingHr,
@@ -1381,19 +1165,13 @@ async function buildHrOverview(
     reviewsPendingManager,
     completionRate,
     pendingAppraisals,
-    appraisalsTrendPercent: 61,
     employeesWithoutKras,
     kraCoverageRate,
-    kraCoverageLabel,
-    reviewOnTimeRate,
-    reviewOnTimeTrendPercent: 12,
     departmentProgress,
-    appraisalHealth: activeAppraisalHealth,
-    performanceDistribution: activePerformanceDistribution,
-    cycleBreakdowns,
-    recentActivity,
     upcomingEvents,
-    compliance,
+    coverage,
+    reviewerBacklog: publicBacklog(backlog),
+    calibration: buildCalibration(activePeriod ? currentReviews : []),
     alerts,
   };
 }
@@ -1407,82 +1185,35 @@ async function buildAdminOverview(
   now: number
 ): Promise<DashboardAdminOverview> {
   const usersCol = getDbCollection('users');
-  const designationsCol = getDbCollection('designations');
-  const auditLogsCol = getDbCollection('auditLogs');
   const appraisalsCol = getDbCollection('appraisals');
   const reviewsCol = getDbCollection('employeeReviews');
 
-  const [users, designations, auditLogs] = await Promise.all([
-    (await usersCol.find({})).toArray(),
-    (await designationsCol.find({})).toArray(),
-    (await auditLogsCol.find({}).sort({ timestamp: -1 }).limit(20)).toArray(),
-  ]);
+  const users: User[] = await (await usersCol.find({})).toArray();
 
   const activeUsers = users.filter((u: any) => u.isActive !== false).length;
-  const activeCycle = cycles.find((c) => c.active) || cycles[0];
   const activePeriod = periods.find((p) => p.status === 'ACTIVE');
-  const totalAuditLogs = await auditLogsCol.countDocuments();
 
   // --- Date helpers ---
   const nowDate = new Date(now);
   const thisMonthStart = new Date(nowDate.getFullYear(), nowDate.getMonth(), 1);
-  const lastMonthStart = new Date(nowDate.getFullYear(), nowDate.getMonth() - 1, 1);
-  const lastMonthEnd = new Date(nowDate.getFullYear(), nowDate.getMonth(), 0, 23, 59, 59);
 
   // Active employees only (no past employees)
   const activeEmps = allEmployees.filter((e: any) => !e.isPastEmployee && e.status !== 'INACTIVE');
   const pastEmps = allEmployees.filter((e: any) => e.isPastEmployee === true);
 
-  // New joiners this month vs last month
+  // New joiners this month
   const newJoinersThisMonth = activeEmps.filter((e: any) => {
     const d = new Date(e.joiningDate || e.createdAt || '');
     return d >= thisMonthStart;
   }).length;
 
-  const newJoinersLastMonth = activeEmps.filter((e: any) => {
-    const d = new Date(e.joiningDate || e.createdAt || '');
-    return d >= lastMonthStart && d <= lastMonthEnd;
-  }).length;
-
-  // Exits this month vs last month (based on createdAt if past employee)
+  // Exits this month (past employees, by last update)
   const exitsThisMonth = pastEmps.filter((e: any) => {
     const d = new Date(e.updatedAt || e.createdAt || '');
     return d >= thisMonthStart;
   }).length;
 
-  const exitsLastMonth = pastEmps.filter((e: any) => {
-    const d = new Date(e.updatedAt || e.createdAt || '');
-    return d >= lastMonthStart && d <= lastMonthEnd;
-  }).length;
-
-  // Last month's total = current - this month's joiners + this month's exits
-  const totalEmployeesLastMonth = Math.max(0, activeEmps.length - newJoinersThisMonth + exitsThisMonth);
-
-  // --- Headcount Trend (last 7 months) ---
-  const MONTH_NAMES = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-  const headcountTrend: { month: string; total: number; newJoiners: number }[] = [];
-  for (let i = 6; i >= 0; i--) {
-    const monthDate = new Date(nowDate.getFullYear(), nowDate.getMonth() - i, 1);
-    const monthEnd = new Date(monthDate.getFullYear(), monthDate.getMonth() + 1, 0, 23, 59, 59);
-    const monthLabel = MONTH_NAMES[monthDate.getMonth()];
-
-    // Employees who had joined by end of this month (cumulative headcount)
-    const totalAtMonthEnd = allEmployees.filter((e: any) => {
-      if (e.isPastEmployee) return false;
-      const joined = new Date(e.joiningDate || e.createdAt || '');
-      return joined <= monthEnd;
-    }).length;
-
-    const newInMonth = allEmployees.filter((e: any) => {
-      if (e.isPastEmployee) return false;
-      const joined = new Date(e.joiningDate || e.createdAt || '');
-      return joined >= monthDate && joined <= monthEnd;
-    }).length;
-
-    headcountTrend.push({ month: monthLabel, total: totalAtMonthEnd, newJoiners: newInMonth });
-  }
-
-  // --- Department Distribution ---
+  // --- Employees per department (drives the per-department review progress) ---
   const deptCountMap = new Map<string, { name: string; count: number }>();
   for (const dept of allDepartments) {
     deptCountMap.set(dept.id, { name: dept.name, count: 0 });
@@ -1496,20 +1227,9 @@ async function buildAdminOverview(
     }
   }
 
-  const totalDeptCount = activeEmps.length || 1;
-  const departmentDistribution = Array.from(deptCountMap.entries())
-    .filter(([, v]) => v.count > 0)
-    .sort((a, b) => b[1].count - a[1].count)
-    .map(([id, v]) => ({
-      departmentId: id,
-      departmentName: v.name,
-      count: v.count,
-      percentage: Math.round((v.count / totalDeptCount) * 100),
-    }));
-
   // --- Review Cycle Progress per Department ---
   // Get all reviews for the active period
-  let reviewsByDept = new Map<string, { reviewed: number; total: number; name: string }>();
+  const reviewsByDept = new Map<string, { reviewed: number; total: number; name: string }>();
 
   // Initialize with all depts that have employees
   for (const [deptId, v] of deptCountMap.entries()) {
@@ -1546,7 +1266,6 @@ async function buildAdminOverview(
 
   // --- Pending Approvals (pending appraisals) ---
   const pendingAppraisals = await appraisalsCol.countDocuments({ status: 'PENDING' });
-  const pendingApprovalsCount = pendingAppraisals;
 
   // --- Attention Items ---
   const attentionItems: DashboardAdminOverview['attentionItems'] = [];
@@ -1565,11 +1284,9 @@ async function buildAdminOverview(
   }
 
   // 2. Employees without KRA template
-  const empsWithoutKra = activeEmps.filter((e: any) => !e.cycleId && !e.startingReviewPeriodId).length;
-  const kraTemplatesCount = allTemplates.length;
-  const empsWithNoKraTemplate = kraTemplatesCount === 0 ? activeEmps.length : 0;
-  if (empsWithNoKraTemplate > 0 || empsWithoutKra > 0) {
-    const cnt = Math.max(empsWithNoKraTemplate, empsWithoutKra);
+  const hasScorecard = hasScorecardCheck(allTemplates);
+  const cnt = activeEmps.filter((e) => !hasScorecard(e)).length;
+  if (cnt > 0) {
     attentionItems.push({
       id: 'attn_no_kra',
       icon: 'info',
@@ -1612,91 +1329,20 @@ async function buildAdminOverview(
     });
   }
 
-  // --- Recent Activity (audit log) ---
-  const recentSecurityEvents: DashboardActivityItem[] = auditLogs.slice(0, 8).map((log: any) => ({
-    id: log.id || String(log._id),
-    actorName: log.actorName || log.userName || log.userEmail || 'System',
-    initials: getInitials(log.actorName || log.userName || log.userEmail || 'SY'),
-    action: (log.actionType || log.action || 'System Action').replace(/_/g, ' '),
-    description: log.description || log.details?.reason || log.details?.message || log.module || 'Admin action recorded',
-    timestamp: String(log.timestamp || log.createdAt || ''),
-    relativeTime: toRelativeTime(log.timestamp || log.createdAt),
-  }));
-
-  const masterBreakdown: DashboardAdminOverview['masterBreakdown'] = [
-    { name: 'Employees', count: activeEmps.length, description: 'Active & onboarded staff directory', route: 'employees' },
-    { name: 'Departments', count: allDepartments.length, description: 'Organizational business units', route: 'hierarchy' },
-    { name: 'Designations', count: designations.length, description: 'Job titles & grading matrix', route: 'hierarchy' },
-    { name: 'Performance Cycles', count: cycles.length, description: 'Annual & quarterly cycle calendars', route: 'appraisals' },
-    { name: 'KRA Templates', count: allTemplates.length, description: 'Standardized evaluation templates', route: 'kras' },
-    { name: 'System Users', count: users.length, description: 'Authentication & role assignments', route: 'employees' },
-  ];
-
-  const alerts: DashboardAdminOverview['alerts'] = [];
-  if (missingManager > 0) {
-    alerts.push({
-      id: 'adm_unassigned_mgr',
-      type: 'warn',
-      title: `${missingManager} employees missing reporting manager`,
-      detail: 'Employees without a reporting manager cannot have their reviews evaluated.',
-      actionLabel: 'Review Directory',
-      link: { view: 'hierarchy' },
-    });
-  }
-  if (activePeriod) {
-    const dueTime = new Date(activePeriod.dueDate || activePeriod.endDate).getTime();
-    const daysLeft = Math.ceil((dueTime - now) / DAY_MS);
-    if (daysLeft <= 7 && daysLeft >= 0) {
-      alerts.push({
-        id: 'adm_cycle_deadline',
-        type: 'crit',
-        title: `Active period ${activePeriod.name} closes in ${daysLeft} days`,
-        detail: `Review period deadline is ${new Date(activePeriod.dueDate || activePeriod.endDate).toLocaleDateString()}`,
-        actionLabel: 'View Reviews',
-        link: { view: 'reviews' },
-      });
-    }
-  }
-  alerts.push({
-    id: 'adm_sys_health',
-    type: 'info',
-    title: 'All system subsystems operational',
-    detail: 'Database cluster, scheduled jobs, and audit ledger are running normally.',
-    actionLabel: 'View Audit Logs',
-    link: { view: 'audit' },
-  });
+  const [dataHealth, emailDelivery] = await Promise.all([buildDataHealth(allEmployees, allTemplates, users), buildEmailDelivery(7, now)]);
 
   return {
     totalUsers: users.length,
     activeUsers,
     totalEmployees: activeEmps.length,
     totalDepartments: allDepartments.length,
-    totalDesignations: designations.length,
-    totalCycles: cycles.length,
-    activeCycleName: activeCycle?.name,
-    activeCycleId: activeCycle?.id,
-    activePeriodId: activePeriod?.id,
     activePeriodName: activePeriod?.name,
-    activePeriodStatus: activePeriod?.status,
-    activePeriodStart: activePeriod?.startDate,
-    activePeriodEnd: activePeriod?.endDate,
-    totalTemplates: allTemplates.length,
-    totalAuditLogs,
-    systemStatus: 'HEALTHY',
     newJoinersThisMonth,
-    newJoinersLastMonth,
     exitsThisMonth,
-    exitsLastMonth,
-    totalEmployeesLastMonth,
-    pendingApprovalsCount,
-    systemAlertsCount: alerts.filter((a) => a.type !== 'info').length,
-    headcountTrend,
-    departmentDistribution,
     reviewCycleProgress,
     attentionItems,
-    recentSecurityEvents,
-    masterBreakdown,
-    alerts,
+    dataHealth,
+    emailDelivery,
   };
 }
 
@@ -1707,6 +1353,32 @@ async function buildAdminOverview(
  * direct reports — their team's review status. For HR and Admins, it also provides the
  * organization overview, department breakdown, and company-wide approval queues.
  */
+/**
+ * POST /api/dashboard/reviewer-reminder
+ * HR / Super Admin nudge a Manager or HOD about their pending reviews (in-app + email).
+ * Limited to one reminder per reviewer per 12 hours.
+ */
+dashboardRouter.post(
+  '/dashboard/reviewer-reminder',
+  requireRoles('HR', 'SUPER_ADMIN'),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { reviewerId, role } = req.body || {};
+      if (!reviewerId || (role !== 'MANAGER' && role !== 'HOD')) {
+        return res.status(400).json({ error: 'reviewerId and role (MANAGER or HOD) are required.' });
+      }
+      const result = await sendReviewerReminder(String(reviewerId), role, {
+        id: req.user!.id,
+        name: req.user!.name,
+        role: req.user!.role,
+      });
+      res.json(result);
+    } catch (error: any) {
+      res.status(error.status || 500).json({ error: error.message || 'Failed to send reminder.' });
+    }
+  }
+);
+
 dashboardRouter.get('/dashboard/summary', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const user = req.user!;
@@ -1771,7 +1443,6 @@ dashboardRouter.get('/dashboard/summary', async (req: AuthenticatedRequest, res:
       buildNotificationTasks(user),
     ]);
 
-    const seenActionKeys = new Set<string>();
     const allCandidateTasks = [
       ...employeeTasks,
       ...managerTasks,
@@ -1791,24 +1462,25 @@ dashboardRouter.get('/dashboard/summary', async (req: AuthenticatedRequest, res:
 
     const tasks = sortTasks(deduplicatedTasks);
 
-    const requestedCycle = (req.query.cycle || req.query.cycleId || req.query.period) as string | undefined;
-    const hrOverview = isHrOrAdmin
-      ? await buildHrOverview(activePeriod, allEmployees, allDepartments, cycles, allTemplates, requestedCycle)
-      : null;
-
-    const hodOverview = (isHod && myEmployeeId)
-      ? await buildHodOverview(myEmployeeId, periodMap, isHrOrAdmin ? allEmployees : await (await getDbCollection('employees').find({})).toArray(), now)
-      : null;
-
-    const adminOverview = isAdmin
-      ? await buildAdminOverview(allEmployees, allDepartments, cycles, allTemplates, periods, now)
-      : null;
+    // The role sections are independent — build them in parallel.
+    const [hrOverview, hodOverview, adminOverview] = await Promise.all([
+      isHrOrAdmin ? buildHrOverview(activePeriod, allEmployees, allDepartments, cycles, allTemplates) : Promise.resolve(null),
+      isHod && myEmployeeId
+        ? (async () =>
+            buildHodOverview(
+              myEmployeeId,
+              periodMap,
+              isHrOrAdmin ? allEmployees : await (await getDbCollection('employees').find({})).toArray()
+            ))()
+        : Promise.resolve(null),
+      isAdmin ? buildAdminOverview(allEmployees, allDepartments, cycles, allTemplates, periods, now) : Promise.resolve(null),
+    ]);
 
     const summary: DashboardSummary = {
       generatedAt: nowDate.toISOString(),
-      period: activePeriod ? toPeriod(activePeriod, hrOverview ? hrOverview.completionRate : 100) : null,
+      period: activePeriod ? toPeriod(activePeriod) : null,
       tasks,
-      me: me ? await buildMyReview(me, myReviews, periodMap, cycles, nowDate) : null,
+      me: me ? await buildMyReview(me, myReviews, myAppraisals, periodMap, cycles, nowDate) : null,
       team: team.length > 0 ? buildTeam(team, teamReviews, managedPips, periodMap) : null,
       hr: hrOverview,
       hod: hodOverview,

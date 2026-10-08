@@ -136,12 +136,24 @@ function calculatePeriodTenureDays(
 }
 
 /**
+ * Data a caller has already loaded, so bulk checks (e.g. the dashboard) don't hit the
+ * database once per employee. Anything omitted is looked up as before.
+ */
+export interface EligibilityPreload {
+  /** Employee ids that already have a review in `period`. */
+  reviewedEmployeeIds?: Set<string>;
+  templatesById?: Map<string, KraTemplate>;
+  periodsById?: Map<string, ReviewPeriod>;
+}
+
+/**
  * Check review eligibility for an employee in a given review period against system config.
  */
 export async function checkEmployeeReviewEligibility(
   emp: Employee,
   period: ReviewPeriod,
-  cachedConfig?: SystemConfig | null
+  cachedConfig?: SystemConfig | null,
+  preload?: EligibilityPreload
 ): Promise<ReviewEligibilityResult> {
   const reviewsCol = getDbCollection('employeeReviews');
   const templatesCol = getDbCollection('kraTemplates');
@@ -166,11 +178,9 @@ export async function checkEmployeeReviewEligibility(
   const hasManager = Boolean(emp.managerId || emp.hodId);
 
   // 3. Existing review check
-  const existingReview = await reviewsCol.findOne({
-    employeeId: emp.id,
-    reviewPeriodId: period.id,
-  });
-  const alreadyHasReview = Boolean(existingReview);
+  const alreadyHasReview = preload?.reviewedEmployeeIds
+    ? preload.reviewedEmployeeIds.has(emp.id)
+    : Boolean(await reviewsCol.findOne({ employeeId: emp.id, reviewPeriodId: period.id }));
 
   // 4. KRA Template check — an employee only "has" a KRA template if their OWN
   // currentKraTemplateId resolves to one. There is deliberately no designation/department/
@@ -181,7 +191,11 @@ export async function checkEmployeeReviewEligibility(
   // not eligible for review generation.
   let hasKraTemplate: boolean;
   try {
-    const template = emp.currentKraTemplateId ? await templatesCol.findOne({ id: emp.currentKraTemplateId }) : null;
+    const template = !emp.currentKraTemplateId
+      ? null
+      : preload?.templatesById
+      ? preload.templatesById.get(emp.currentKraTemplateId) || null
+      : await templatesCol.findOne({ id: emp.currentKraTemplateId });
     hasKraTemplate = Boolean(template && template.items && template.items.length > 0 && template.active !== false);
   } catch {
     hasKraTemplate = false;
@@ -200,7 +214,9 @@ export async function checkEmployeeReviewEligibility(
   let startingPeriodMet = true;
   let startingPeriodName: string | undefined;
   if (emp.startingReviewPeriodId) {
-    const startPeriod = await getDbCollection('reviewPeriods').findOne({ id: emp.startingReviewPeriodId });
+    const startPeriod = preload?.periodsById
+      ? preload.periodsById.get(emp.startingReviewPeriodId)
+      : await getDbCollection('reviewPeriods').findOne({ id: emp.startingReviewPeriodId });
     if (startPeriod) {
       startingPeriodName = startPeriod.name;
       const isPeriodTooEarly =

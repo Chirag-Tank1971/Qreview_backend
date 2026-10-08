@@ -124,9 +124,12 @@ const ReviewKraSnapshotItemSchema = z.object({
   achievement: z.string().optional(),
   comments: z.string().optional(),
   issueReason: z.string().optional(),
+  ratingJustification: z.string().optional(),
   hodRating: z.number().min(0, 'Rating cannot be negative').max(5, 'Rating cannot exceed 5').optional(),
   hodAchievement: z.string().optional(),
   hodComments: z.string().optional(),
+  hodJustification: z.string().optional(),
+  selfJustification: z.string().optional(),
 });
 
 export const SubmitSelfAssessmentSchema = z.object({
@@ -134,7 +137,24 @@ export const SubmitSelfAssessmentSchema = z.object({
   selfStrengths: z.string().max(3000).optional(),
   selfImprovements: z.string().max(3000).optional(),
   selfObstacles: z.string().max(3000).optional(),
-});
+  isDraft: z.boolean().optional(),
+}).refine(
+  (data) => {
+    if (data.isDraft) return true;
+    if (!data.kraSnapshot || data.kraSnapshot.length === 0) return true;
+    return data.kraSnapshot.every((k) => {
+      const r = Number(k.selfRating);
+      if ([1, 2, 5].includes(r)) {
+        return Boolean(k.selfJustification && k.selfJustification.trim().length >= 15);
+      }
+      return true;
+    });
+  },
+  {
+    message: 'A mandatory justification note (minimum 15 characters) is required for every self-rating of 1, 2, or 5.',
+    path: ['kraSnapshot'],
+  }
+);
 
 export const SubmitManagerReviewSchema = z
   .object({
@@ -145,6 +165,16 @@ export const SubmitManagerReviewSchema = z
     employeeComments: z.string().max(3000).optional(),
     hrComments: z.string().max(3000).optional(),
     isDraft: z.boolean().optional(),
+    returnResponses: z
+      .record(
+        z.string(),
+        z.object({
+          reply: z.string().max(1000).optional(),
+          keepRating: z.boolean().optional(),
+          keepReason: z.string().max(1000).optional(),
+        })
+      )
+      .optional(),
   })
   .refine(
     (data) => {
@@ -154,6 +184,23 @@ export const SubmitManagerReviewSchema = z
     },
     {
       message: 'When submitting evaluation scores, all rated KRAs must have a rating between 1.0 and 5.0.',
+      path: ['kraSnapshot'],
+    }
+  )
+  .refine(
+    (data) => {
+      if (data.isDraft) return true;
+      if (!data.kraSnapshot || data.kraSnapshot.length === 0) return true;
+      return data.kraSnapshot.every((k) => {
+        const r = Number(k.rating);
+        if ([1, 2, 5].includes(r)) {
+          return Boolean(k.ratingJustification && k.ratingJustification.trim().length >= 15);
+        }
+        return true;
+      });
+    },
+    {
+      message: 'A mandatory justification note (minimum 15 characters) is required for every KRA rating of 1, 2, or 5.',
       path: ['kraSnapshot'],
     }
   );

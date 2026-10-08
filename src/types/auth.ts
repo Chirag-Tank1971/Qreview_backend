@@ -57,6 +57,9 @@ export interface SystemConfig {
   selfAssessmentEnabled: boolean;
   minTenureDaysForReview?: number;
   includeProbationInReviews?: boolean;
+  maxReturnsPerReview?: number;
+  returnLimitAction?: 'BLOCK' | 'ESCALATE';
+  returnSlaDays?: number;
   updatedAt: string;
   updatedBy?: string;
 }

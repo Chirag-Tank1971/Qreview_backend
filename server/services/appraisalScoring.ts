@@ -9,6 +9,17 @@ export const RATING_BANDS = ['OUTSTANDING', 'EXCEEDS_EXPECTATIONS', 'MEETS_EXPEC
 export type RatingBand = (typeof RATING_BANDS)[number];
 
 // Compute standard rating and default increment bracket based on rolling 4-quarter score
+/**
+ * Target share of each rating band (%), as used by the Bell Curve & Budget module's
+ * normalisation guidance (appraisalRoutes bell-curve buckets use the same figures).
+ */
+export const BELL_CURVE_TARGETS = {
+  OUTSTANDING: 10,
+  EXCEEDS_EXPECTATIONS: 25,
+  MEETS_EXPECTATIONS: 45,
+  NEEDS_IMPROVEMENT: 20,
+} as const;
+
 export function computeAppraisalMatrix(avgScore: number) {
   if (avgScore <= 0) {
     return { recommendedRating: 'PENDING', suggestedIncrementMin: 0, suggestedIncrementMax: 0, defaultIncrement: 0 };
