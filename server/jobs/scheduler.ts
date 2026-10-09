@@ -5,6 +5,7 @@ import { syncAllActiveEmployees } from '../syncHelpers.js';
 import { autoActivateCurrentPeriod } from '../services/periodLifecycle.js';
 import { refreshAllOpenAppraisalScores } from '../services/appraisalScoring.js';
 import { runReturnSlaSweep } from '../services/reviewReturnService.js';
+import { generateDuePipReviews } from '../services/pipReviewService.js';
 
 // Captured before server.ts's production log-silencing override runs (ES module imports
 // evaluate before the importing module's own top-level code), so these stay callable even
@@ -340,15 +341,45 @@ export function startBackgroundScheduler(): void {
       ).toArray();
 
       const CHECKIN_REMINDER_THRESHOLD_DAYS = 7;
+      const ENDING_SOON_DAYS = 7;
+      const DAY_MS = 1000 * 60 * 60 * 24;
       const now = Date.now();
-      const todayKey = new Date().toISOString().slice(0, 10);
       let remindersSent = 0;
 
       for (const pip of activePips) {
+        // Plan ends within 7 days: warn manager and HR once per end date (an extension re-arms it)
+        const daysToEnd = (new Date(pip.endDate).getTime() - now) / DAY_MS;
+        if (daysToEnd > 0 && daysToEnd <= ENDING_SOON_DAYS) {
+          const endKey = pip.endDate.slice(0, 10);
+          const endingRecipients = [
+            pip.managerId ? { id: pip.managerId, role: 'MANAGER' } : null,
+            { id: 'ALL', role: 'HR' },
+          ].filter((r): r is { id: string; role: string } => !!r);
+          for (const recipient of endingRecipients) {
+            const notifId = `notif_pip_ending_${pip.id}_${recipient.role}_${endKey}`;
+            if (await notifCol.findOne({ id: notifId })) continue;
+            await notifCol.insertOne({
+              id: notifId,
+              userId: recipient.id,
+              userRole: recipient.role,
+              type: 'DUE_SOON',
+              title: `PIP ends in ${Math.ceil(daysToEnd)} day${Math.ceil(daysToEnd) === 1 ? '' : 's'}: ${pip.employeeName}`,
+              message: `${pip.employeeName}'s performance improvement plan ends on ${new Date(pip.endDate).toLocaleDateString()}. Complete the remaining check-ins and prepare for the final review and outcome.`,
+              isRead: false,
+              priority: 'HIGH',
+              metadata: { pipId: pip.id, employeeId: pip.employeeId, subTab: 'pip' },
+              createdAt: new Date().toISOString(),
+            });
+            remindersSent++;
+          }
+        }
+
         const lastCheckIn = pip.checkIns.length > 0 ? pip.checkIns[pip.checkIns.length - 1] : null;
         const lastActivityDate = new Date(lastCheckIn ? lastCheckIn.date : pip.startDate).getTime();
-        const daysSinceLastCheckIn = (now - lastActivityDate) / (1000 * 60 * 60 * 24);
+        const daysSinceLastCheckIn = (now - lastActivityDate) / DAY_MS;
         if (daysSinceLastCheckIn < CHECKIN_REMINDER_THRESHOLD_DAYS) continue;
+        // One reminder per overdue week since the last check-in, not one every day
+        const overdueWeekKey = `${lastActivityDate}_${Math.floor(daysSinceLastCheckIn / 7)}`;
 
         const recipients = [
           pip.managerId ? { id: pip.managerId, role: 'MANAGER' as const } : null,
@@ -356,7 +387,7 @@ export function startBackgroundScheduler(): void {
         ].filter((r): r is { id: string; role: 'MANAGER' | 'HOD' } => !!r);
 
         for (const recipient of recipients) {
-          const notifId = `notif_pip_checkin_${pip.id}_${recipient.id}_${todayKey}`;
+          const notifId = `notif_pip_checkin_${pip.id}_${recipient.id}_${overdueWeekKey}`;
           const existing = await notifCol.findOne({ id: notifId });
           if (existing) continue;
           await notifCol.insertOne({
@@ -375,6 +406,20 @@ export function startBackgroundScheduler(): void {
         }
       }
       logJob(job, `Completed in ${Date.now() - startedAt}ms — dispatched ${remindersSent} PIP check-in reminders (${activePips.length} active PIPs checked).`);
+    } catch (err: any) {
+      errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
+    }
+  });
+
+  // Daily at 01:15 AM: Automatically generate due 7-day periodic and final PIP reviews
+  cron.schedule('15 1 * * *', async () => {
+    const job = 'PipReviewGeneration';
+    const startedAt = Date.now();
+    try {
+      const { generatedCount, checkedCount } = await generateDuePipReviews();
+      if (generatedCount > 0) {
+        logJob(job, `Generated ${generatedCount} due PIP review(s) across ${checkedCount} active plan(s) in ${Date.now() - startedAt}ms.`);
+      }
     } catch (err: any) {
       errorJob(job, `Failed after ${Date.now() - startedAt}ms`, err);
     }

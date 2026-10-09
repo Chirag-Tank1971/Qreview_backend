@@ -1,4 +1,5 @@
 import { ReviewStatus } from './review.js';
+import { PerformanceImprovementPlan } from './pip.js';
 
 /** Work items the dashboard can raise. Each one exists only while the underlying record is still waiting on the viewer. */
 export type DashboardTaskType =
@@ -115,6 +116,7 @@ export interface DashboardMyReview {
   scoreHistory: { periodName: string; score: number }[];
   kras: { title: string; weight: number; lastRating?: number; description?: string; target?: string }[];
   nextAppraisal: { month: number; year: number; cycleName?: string } | null;
+  activePip?: PerformanceImprovementPlan | null;
 }
 
 export interface DashboardTeamMember {
@@ -128,6 +130,8 @@ export interface DashboardTeamMember {
   lastScore?: number;
   previousScore?: number;
   onPip: boolean;
+  pipId?: string;
+  pipStatus?: string;
 }
 
 export interface DashboardTeam {
@@ -140,6 +144,7 @@ export interface DashboardTeam {
   averageScore: number;
   members: DashboardTeamMember[];
   ratingSpread: { outstanding: number; exceeds: number; meets: number; needsImprovement: number; unrated: number };
+  activePips?: PerformanceImprovementPlan[];
   alerts?: {
     id: string;
     type: 'crit' | 'warn' | 'info';
@@ -290,7 +295,10 @@ export interface DashboardHodOverview {
     stage?: string;
     lastScore?: number;
     onPip: boolean;
+    pipId?: string;
+    pipStatus?: string;
   }[];
+  activePips?: PerformanceImprovementPlan[];
   alerts: {
     id: string;
     type: 'crit' | 'warn' | 'info';

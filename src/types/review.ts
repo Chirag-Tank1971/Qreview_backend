@@ -254,6 +254,9 @@ export interface EmployeeReview {
   initiatedBy?: string;
   submittedAt?: string;
   completedAt?: string;
+  reviewType?: 'QUARTERLY' | 'PIP_WEEKLY' | 'PIP_FINAL';
+  pipId?: string;
+  pipCycleNumber?: number;
   createdAt: string;
   updatedAt?: string;
 }

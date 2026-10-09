@@ -13,6 +13,7 @@ import {
 } from '../validation.js';
 import { Employee, PerformanceImprovementPlan, PipCheckIn } from '../../src/types/index.js';
 import { ACTIVE_PIP_STATUSES } from '../services/pipService.js';
+import { generatePipReviewForPlan } from '../services/pipReviewService.js';
 
 export const pipRouter = express.Router();
 
@@ -22,6 +23,14 @@ function addDays(dateStr: string, days: number): string {
   const d = new Date(dateStr);
   d.setDate(d.getDate() + days);
   return d.toISOString();
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+export function formatPipDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}`;
 }
 
 /** Whether the current user is allowed to see/act on this specific employee's PIP. */
@@ -171,7 +180,7 @@ pipRouter.post(
       });
       if (existingActive) {
         return res.status(400).json({
-          error: `${employee.name} already has an active performance improvement plan (started ${new Date(existingActive.startDate).toLocaleDateString()}). Resolve it before starting a new one.`,
+          error: `${employee.name} already has an active performance improvement plan (started ${formatPipDate(existingActive.startDate)}). Resolve it before starting a new one.`,
         });
       }
 
@@ -325,6 +334,33 @@ pipRouter.post('/pips/:id/publish', requireRoles('SUPER_ADMIN', 'HR'), async (re
   } catch (error: any) {
     console.error('Error publishing PIP:', error);
     res.status(500).json({ error: 'Failed to publish performance improvement plan.' });
+  }
+});
+
+/**
+ * POST /api/pips/:id/generate-review
+ * On-demand generation of the due periodic 7-day review or final PIP review.
+ */
+pipRouter.post('/pips/:id/generate-review', requireRoles('SUPER_ADMIN', 'HR'), async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { forceType, forceCycleNumber } = req.body || {};
+    if (forceType !== undefined && forceType !== 'PIP_WEEKLY' && forceType !== 'PIP_FINAL') {
+      return res.status(400).json({ error: "forceType must be 'PIP_WEEKLY' or 'PIP_FINAL'." });
+    }
+    if (forceCycleNumber !== undefined && !(Number.isInteger(forceCycleNumber) && forceCycleNumber >= 1)) {
+      return res.status(400).json({ error: 'forceCycleNumber must be a positive integer.' });
+    }
+    const result = await generatePipReviewForPlan(req.params.id, {
+      forceType,
+      forceCycleNumber,
+    });
+    if (!result.created && result.skipped) {
+      return res.status(200).json({ message: result.reason, review: result.review, created: false });
+    }
+    res.status(201).json(result);
+  } catch (error: any) {
+    console.error('Error generating PIP review:', error);
+    res.status(500).json({ error: error.message || 'Failed to generate PIP review.' });
   }
 });
 
@@ -539,7 +575,7 @@ pipRouter.post('/pips/:id/outcome', requireRoles('SUPER_ADMIN', 'HR'), validateB
         message:
           decision === 'SUCCEEDED'
             ? 'Your performance improvement plan has been marked as successfully completed.'
-            : `Your performance improvement plan has been extended to ${new Date(outcomeRecord.newEndDate!).toLocaleDateString()}.`,
+            : `Your performance improvement plan has been extended to ${formatPipDate(outcomeRecord.newEndDate!)}.`,
         isRead: false,
         metadata: { pipId: pip.id },
         createdAt: now,
@@ -692,7 +728,7 @@ async function notifyPipPublished(pip: PerformanceImprovementPlan) {
     userRole: 'EMPLOYEE',
     type: 'PIP_ASSIGNED',
     title: 'Performance Improvement Plan Started',
-    message: `A performance improvement plan has been started for you, running from ${new Date(pip.startDate).toLocaleDateString()} to ${new Date(pip.endDate).toLocaleDateString()}. Please review and acknowledge it.`,
+    message: `A performance improvement plan has been started for you, running from ${formatPipDate(pip.startDate)} to ${formatPipDate(pip.endDate)}. Please review and acknowledge it.`,
     isRead: false,
     priority: 'HIGH',
     metadata: { pipId: pip.id },
@@ -706,7 +742,7 @@ async function notifyPipPublished(pip: PerformanceImprovementPlan) {
       userId: targetId,
       type: 'PIP_ASSIGNED',
       title: `Improvement Plan Started: ${pip.employeeName}`,
-      message: `A performance improvement plan has been started for ${pip.employeeName} (${pip.employeeCode}), running until ${new Date(pip.endDate).toLocaleDateString()}.`,
+      message: `A performance improvement plan has been started for ${pip.employeeName} (${pip.employeeCode}), running until ${formatPipDate(pip.endDate)}.`,
       isRead: false,
       metadata: { pipId: pip.id },
       createdAt: now,

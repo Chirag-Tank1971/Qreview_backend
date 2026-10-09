@@ -49,6 +49,29 @@ import { RETURN_REASON_TEMPLATES } from '../../src/types/index.js';
 
 export const reviewRouter = express.Router();
 
+// The final PIP score doesn't decide the plan's outcome on its own — prompt HR to record it on the plan.
+async function notifyPipOutcomeDue(review: EmployeeReview) {
+  if (!review.pipId) return;
+  await getDbCollection('notifications').updateOne(
+    { id: `notif_pip_outcome_${review.pipId}` },
+    {
+      $set: {
+        id: `notif_pip_outcome_${review.pipId}`,
+        userId: 'ALL',
+        userRole: 'HR',
+        type: 'HR_COMPLETED',
+        title: `Record PIP outcome: ${review.employeeName}`,
+        message: `The final PIP review for ${review.employeeName} is complete (${review.finalScore ?? '-'}/5). Record the plan outcome on the Improvement plans page.`,
+        isRead: false,
+        priority: 'HIGH',
+        metadata: { reviewId: review.id, pipId: review.pipId },
+        createdAt: new Date().toISOString(),
+      },
+    },
+    { upsert: true }
+  );
+}
+
 // All review routes require authentication
 reviewRouter.use(authenticateToken);
 
@@ -1120,7 +1143,11 @@ reviewRouter.put(
     let submittedByManager = false;
     let skippedHodForHrReturn = false;
     if (isSubmitting) {
-      if (req.user?.role === 'HR' || req.user?.role === 'SUPER_ADMIN') {
+      if (existing.reviewType === 'PIP_WEEKLY') {
+        // 2-step fast flow: weekly PIP reviews close directly upon manager scoring without HOD/HR escalation
+        newStatus = 'CLOSED';
+        submittedByManager = true;
+      } else if (req.user?.role === 'HR' || req.user?.role === 'SUPER_ADMIN') {
         newStatus = 'HR_COMPLETED';
       } else if (wasReturnedByHrToManager) {
         newStatus = 'HR_PENDING';
@@ -1131,7 +1158,8 @@ reviewRouter.put(
         submittedByManager = true;
       }
     }
-    const managerSubmitHodMissing = submittedByManager && !existing.hodId;
+    // Weekly PIP reviews never route to HOD, so a missing HOD is not an alert-worthy gap there
+    const managerSubmitHodMissing = submittedByManager && !existing.hodId && existing.reviewType !== 'PIP_WEEKLY';
 
     // Merge ONLY the manager-owned fields onto the stored snapshot (matched by id). Self and
     // HOD fields, weights and targets always come from the stored review, never the client.
@@ -1239,12 +1267,45 @@ reviewRouter.put(
       employeeComments: employeeComments !== undefined ? employeeComments : existing.employeeComments,
       hrComments: hrComments !== undefined ? hrComments : existing.hrComments,
       status: newStatus,
+      isClosed: isSubmitting && existing.reviewType === 'PIP_WEEKLY' ? true : existing.isClosed,
+      completedAt: isSubmitting && existing.reviewType === 'PIP_WEEKLY' ? new Date().toISOString() : existing.completedAt,
       actionHistory: [...(existing.actionHistory || []), action],
       submittedAt: isSubmitting ? new Date().toISOString() : existing.submittedAt,
       updatedAt: new Date().toISOString(),
     };
 
     await reviewCol.updateOne({ id }, { $set: updatedReview });
+
+    // When a weekly PIP review completes, auto-record a check-in on the PIP document
+    if (isSubmitting && existing.pipId && existing.reviewType === 'PIP_WEEKLY') {
+      try {
+        const pipCol = getDbCollection('performanceImprovementPlans');
+        const pipDoc = await pipCol.findOne({ id: existing.pipId });
+        if (pipDoc) {
+          const autoCheckIn = {
+            id: `pipcheckin_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            date: new Date().toISOString(),
+            byId: req.user?.id || 'system',
+            byName: userName,
+            byRole: userRole,
+            notes: managerOverallComments || `Weekly evaluation (${existing.reviewPeriodName}) scored ${finalScore}/5`,
+            // Unrated goals are left out rather than recorded as a fake "3"
+            goalRatings: updatedSnapshot
+              .filter((k) => Number(k.rating) > 0)
+              .map((k) => ({
+                goalId: k.kraId || k.id,
+                rating: Math.max(1, Math.min(5, Math.round(Number(k.rating)))) as 1 | 2 | 3 | 4 | 5,
+              })),
+          };
+          await pipCol.updateOne(
+            { id: existing.pipId },
+            { $set: { checkIns: [...(pipDoc.checkIns || []), autoCheckIn], updatedAt: new Date().toISOString() } }
+          );
+        }
+      } catch (checkInErr) {
+        console.error('[Review] Failed to auto-log check-in on PIP:', checkInErr);
+      }
+    }
 
     if (req.user) {
       await recordAuditLog(
@@ -1265,6 +1326,10 @@ reviewRouter.put(
     if (isSubmitting) {
       const notifsCol = getDbCollection('notifications');
       const now = new Date().toISOString();
+
+      if (newStatus === 'HR_COMPLETED' && existing.reviewType === 'PIP_FINAL') {
+        await notifyPipOutcomeDue(updatedReview);
+      }
 
       if (submittedByManager && managerSubmitHodMissing) {
         // No HOD configured for this employee — alert HR instead of a non-existent HOD.
@@ -1330,29 +1395,45 @@ reviewRouter.put(
           { upsert: true }
         );
       } else if (submittedByManager) {
-        // Notify the assigned HOD
-        await notifsCol.updateOne(
-          { 'metadata.reviewId': id, type: 'HOD_PENDING', userId: existing.hodId },
-          {
-            $set: {
-              id: `notif_${id}_hod`,
-              userId: existing.hodId,
-              userRole: 'HOD',
-              type: 'HOD_PENDING',
-              title: resolvedReturn
-                ? `Returned KRAs Revised: ${existing.employeeName}`
-                : `Review Ready for Your Approval: ${existing.employeeName}`,
-              message: resolvedReturn
-                ? `${req.user?.name || 'Manager'} re-evaluated the ${resolvedReturn.kraIds.length} KRA${resolvedReturn.kraIds.length === 1 ? '' : 's'} you returned for ${existing.employeeName}: ${describeChanges(returnEdits.changes || [])}. Please re-score those KRAs.`
-                : `${req.user?.name || 'Manager'} submitted evaluation scores (${finalScore}) for ${existing.employeeName}. Ready for HOD review.`,
-              isRead: false,
-              priority: 'MEDIUM',
-              metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: newStatus },
-              createdAt: now,
+        if (existing.reviewType === 'PIP_WEEKLY') {
+          // 2-step fast flow: notify employee that their weekly check-in review has completed
+          await notifsCol.insertOne({
+            id: `notif_${id}_pip_weekly_done_${Date.now()}`,
+            userId: existing.employeeId,
+            userRole: 'EMPLOYEE',
+            type: 'REVIEW_WORKFLOW',
+            title: `Weekly PIP Review Completed`,
+            message: `${userName} completed and scored your weekly PIP review (${finalScore}/5).`,
+            isRead: false,
+            priority: 'MEDIUM',
+            metadata: { reviewId: id, pipId: existing.pipId },
+            createdAt: now,
+          });
+        } else {
+          // Notify the assigned HOD
+          await notifsCol.updateOne(
+            { 'metadata.reviewId': id, type: 'HOD_PENDING', userId: existing.hodId },
+            {
+              $set: {
+                id: `notif_${id}_hod`,
+                userId: existing.hodId,
+                userRole: 'HOD',
+                type: 'HOD_PENDING',
+                title: resolvedReturn
+                  ? `Returned KRAs Revised: ${existing.employeeName}`
+                  : `Review Ready for Your Approval: ${existing.employeeName}`,
+                message: resolvedReturn
+                  ? `${req.user?.name || 'Manager'} re-evaluated the ${resolvedReturn.kraIds.length} KRA${resolvedReturn.kraIds.length === 1 ? '' : 's'} you returned for ${existing.employeeName}: ${describeChanges(returnEdits.changes || [])}. Please re-score those KRAs.`
+                  : `${req.user?.name || 'Manager'} submitted evaluation scores (${finalScore}) for ${existing.employeeName}. Ready for HOD review.`,
+                isRead: false,
+                priority: 'MEDIUM',
+                metadata: { reviewId: id, periodId: existing.reviewPeriodId, status: newStatus },
+                createdAt: now,
+              },
             },
-          },
-          { upsert: true }
-        );
+            { upsert: true }
+          );
+        }
       }
 
       // Notify Employee
@@ -1519,6 +1600,10 @@ reviewRouter.put(
       // Workflow notification triggers
       const notifsCol = getDbCollection('notifications');
       const now = new Date().toISOString();
+
+      if (effectiveStatus === 'HR_COMPLETED' && existing.reviewType === 'PIP_FINAL') {
+        await notifyPipOutcomeDue(existing);
+      }
 
       if (effectiveStatus === 'HR_COMPLETED') {
         await notifsCol.updateOne(

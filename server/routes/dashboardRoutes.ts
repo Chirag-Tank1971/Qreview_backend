@@ -37,7 +37,7 @@ import {
   User,
 } from '../../src/types/index.js';
 import { buildQuarterlyRollup, computeAppraisalMatrix, EVALUATED_STATUSES } from '../services/appraisalScoring.js';
-import { ACTIVE_PIP_STATUSES } from '../services/pipService.js';
+import { ACTIVE_PIP_STATUSES, getActivePipForEmployee } from '../services/pipService.js';
 import { computeVisibleNotifications } from './mastersRoutes.js';
 
 export const dashboardRouter = express.Router();
@@ -124,6 +124,8 @@ function ratingFor(score: number): 1 | 2 | 3 | 4 | 5 {
 }
 
 const periodOrder = (p: ReviewPeriod) => Number(p.year) * 4 + Number(p.quarter);
+// PIP reviews have synthetic periods with no ReviewPeriod record; quarterly views must skip them.
+const isQuarterly = (r: EmployeeReview) => !r.reviewType || r.reviewType === 'QUARTERLY';
 
 function sortTasks(tasks: DashboardTask[]): DashboardTask[] {
   return tasks.sort((a, b) => {
@@ -386,7 +388,7 @@ async function buildMyReview(
     return p ? periodOrder(p) : new Date(r.createdAt).getTime();
   };
   const reviews = myReviews
-    .filter((r) => periodMap.get(r.reviewPeriodId)?.status !== 'UPCOMING')
+    .filter((r) => isQuarterly(r) && periodMap.get(r.reviewPeriodId)?.status !== 'UPCOMING')
     .sort((a, b) => byPeriod(a) - byPeriod(b));
 
   const current = reviews.find((r) => !isClosed(r)) || reviews[reviews.length - 1] || null;
@@ -538,6 +540,7 @@ async function buildMyReview(
     scoreHistory: evaluated.slice(-6).map((r) => ({ periodName: r.reviewPeriodName, score: r.finalScore || 0 })),
     kras,
     nextAppraisal,
+    activePip: await getActivePipForEmployee(employee.id),
   };
 }
 
@@ -547,7 +550,7 @@ function buildTeam(
   managedPips: PerformanceImprovementPlan[],
   periodMap: Map<string, ReviewPeriod>
 ): DashboardTeam {
-  const visibleReviews = teamReviews.filter((r) => periodMap.get(r.reviewPeriodId)?.status !== 'UPCOMING');
+  const visibleReviews = teamReviews.filter((r) => isQuarterly(r) && periodMap.get(r.reviewPeriodId)?.status !== 'UPCOMING');
   const teamPeriods = [...new Set(visibleReviews.map((r) => r.reviewPeriodId))]
     .map((id) => periodMap.get(id))
     .filter((p): p is ReviewPeriod => Boolean(p))
@@ -557,7 +560,8 @@ function buildTeam(
     teamPeriods.find((p) => visibleReviews.some((r) => r.reviewPeriodId === p.id && !isClosed(r))) ||
     teamPeriods[teamPeriods.length - 1];
   const focusReviews = focus ? visibleReviews.filter((r) => r.reviewPeriodId === focus.id) : [];
-  const onPip = new Set(managedPips.filter((p) => ACTIVE_PIP_STATUSES.includes(p.status)).map((p) => p.employeeId));
+  const activeManagedPips = managedPips.filter((p) => ACTIVE_PIP_STATUSES.includes(p.status));
+  const pipByEmpId = new Map(activeManagedPips.map((p) => [p.employeeId, p]));
 
   const ratingSpread = { outstanding: 0, exceeds: 0, meets: 0, needsImprovement: 0, unrated: 0 };
   const scores: number[] = [];
@@ -578,6 +582,8 @@ function buildTeam(
     else ratingSpread.unrated++;
     if (lastScore) scores.push(lastScore);
 
+    const empPip = pipByEmpId.get(member.id);
+
     return {
       employeeId: member.id,
       name: member.name,
@@ -588,7 +594,9 @@ function buildTeam(
       isSelfSubmitted: Boolean(review?.isSelfSubmitted),
       lastScore,
       previousScore,
-      onPip: onPip.has(member.id),
+      onPip: Boolean(empPip),
+      pipId: empPip?.id,
+      pipStatus: empPip?.status,
     };
   });
 
@@ -613,13 +621,12 @@ function buildTeam(
     });
   }
 
-  const pipsInTeam = rows.filter((r) => r.onPip);
-  if (pipsInTeam.length > 0) {
+  if (activeManagedPips.length > 0) {
     alerts.push({
       id: 'mgr_pips',
-      type: 'info',
-      title: `${pipsInTeam.length} active PIP${pipsInTeam.length > 1 ? 's' : ''} in your team`,
-      detail: `Track progress milestones for ${pipsInTeam.map((r) => r.name).join(', ')}`,
+      type: 'warn',
+      title: `${activeManagedPips.length} active PIP${activeManagedPips.length > 1 ? 's' : ''} in your team`,
+      detail: `Performance milestones in progress for ${activeManagedPips.map((p) => p.employeeName).join(', ')}`,
       actionLabel: 'View PIP',
       link: { view: 'pip' },
     });
@@ -647,6 +654,7 @@ function buildTeam(
     members: rows.sort((a, b) => a.name.localeCompare(b.name)),
     ratingSpread,
     alerts,
+    activePips: activeManagedPips,
   };
 }
 
@@ -777,7 +785,7 @@ async function buildHodOverview(
       : Promise.resolve([]),
   ]);
 
-  const visibleReviews = deptReviews.filter((r) => periodMap.get(r.reviewPeriodId)?.status !== 'UPCOMING');
+  const visibleReviews = deptReviews.filter((r) => isQuarterly(r) && periodMap.get(r.reviewPeriodId)?.status !== 'UPCOMING');
 
   // Focus on the active/most recent period
   const activePeriod = [...periodMap.values()].find((p) => p.status === 'ACTIVE')
@@ -801,9 +809,8 @@ async function buildHodOverview(
   const kraCoverageRate = deptEmployees.length > 0 ? Math.round((withKra / deptEmployees.length) * 100) : 0;
 
   // Rating/performance computation
-  const onPipSet = new Set(
-    deptPips.filter((p) => ACTIVE_PIP_STATUSES.includes(p.status)).map((p) => p.employeeId)
-  );
+  const activeDeptPips = deptPips.filter((p) => ACTIVE_PIP_STATUSES.includes(p.status));
+  const pipByEmpId = new Map(activeDeptPips.map((p) => [p.employeeId, p]));
 
   const ratingSpread = { outstanding: 0, exceeds: 0, meets: 0, needsImprovement: 0, unrated: 0 };
   const employeeScores = new Map<string, number>();
@@ -840,6 +847,7 @@ async function buildHodOverview(
   const departmentMembers = deptEmployees.map((emp) => {
     const review = employeeReviewMap.get(emp.id);
     const score = employeeScores.get(emp.id);
+    const empPip = pipByEmpId.get(emp.id);
     return {
       employeeId: emp.id,
       name: emp.name,
@@ -849,7 +857,9 @@ async function buildHodOverview(
       reviewStatus: review?.status,
       stage: review ? stageOf(review) : undefined,
       lastScore: score,
-      onPip: onPipSet.has(emp.id),
+      onPip: Boolean(empPip),
+      pipId: empPip?.id,
+      pipStatus: empPip?.status,
     };
   }).sort((a, b) => a.name.localeCompare(b.name));
 
@@ -863,6 +873,16 @@ async function buildHodOverview(
       detail: 'Submitted by managers. Awaiting your score.',
       actionLabel: 'Review',
       link: { view: 'reviews' },
+    });
+  }
+  if (activeDeptPips.length > 0) {
+    alerts.push({
+      id: 'hod_active_pips',
+      type: 'warn',
+      title: `${activeDeptPips.length} active PIP${activeDeptPips.length > 1 ? 's' : ''} in your department`,
+      detail: `Performance milestones in progress for ${activeDeptPips.map((p) => p.employeeName).join(', ')}`,
+      actionLabel: 'View PIPs',
+      link: { view: 'pip' },
     });
   }
   if (pendingAppraisals > 0) {
@@ -898,6 +918,7 @@ async function buildHodOverview(
     ratingSpread,
     departmentMembers,
     alerts,
+    activePips: activeDeptPips,
   };
 }
 
